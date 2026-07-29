@@ -63,6 +63,7 @@ ORG_SCOPED_TABLES = [
     "sdr_routing_rule_member",
     "sdr_routing_rule_state",
     "sdr_intelligence_settings",
+    "sdr_model_credential",
     "sdr_lead_inspection",
     # Tenant-owned external credentials. The companion Page route is
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.

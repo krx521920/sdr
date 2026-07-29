@@ -5,10 +5,13 @@ from rest_framework import serializers
 from common.models import Profile
 from common.utils import COUNTRIES
 from sdr.domain import LeadSource, QualificationBand
+from sdr.intelligence.registry import provider_catalog, provider_registry
 from sdr.models import (
     LeadInspection,
     LeadIntakeSource,
     SDRIntelligenceSettings,
+    SDRModelCredential,
+    SDRModelProvider,
     SDRRoutingRule,
     SDRRoutingRuleMember,
 )
@@ -144,6 +147,26 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
     openai_configured = serializers.SerializerMethodField()
     allowed_models = serializers.SerializerMethodField()
     allowed_reasoning_efforts = serializers.SerializerMethodField()
+    provider_catalog = serializers.SerializerMethodField()
+    tenant_keys_allowed = serializers.SerializerMethodField()
+    openai_api_key = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, max_length=8192
+    )
+    doubao_api_key = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, max_length=8192
+    )
+    deepseek_api_key = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, max_length=8192
+    )
+    clear_openai_api_key = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
+    clear_doubao_api_key = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
+    clear_deepseek_api_key = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
 
     class Meta:
         model = SDRIntelligenceSettings
@@ -151,8 +174,12 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
             "is_enabled",
             "research_enabled",
             "ai_scoring_enabled",
+            "provider",
             "model",
             "reasoning_effort",
+            "fallback_provider",
+            "fallback_model",
+            "fallback_reasoning_effort",
             "icp_description",
             "positive_signals",
             "negative_signals",
@@ -161,46 +188,153 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
             "openai_configured",
             "allowed_models",
             "allowed_reasoning_efforts",
+            "provider_catalog",
+            "tenant_keys_allowed",
+            "openai_api_key",
+            "doubao_api_key",
+            "deepseek_api_key",
+            "clear_openai_api_key",
+            "clear_doubao_api_key",
+            "clear_deepseek_api_key",
             "updated_at",
         )
         read_only_fields = (
             "openai_configured",
             "allowed_models",
             "allowed_reasoning_efforts",
+            "provider_catalog",
+            "tenant_keys_allowed",
             "updated_at",
         )
 
     def get_openai_configured(self, obj):
-        return bool(settings.OPENAI_API_KEY)
+        return self.get_provider_catalog(obj)["openai"]["configured"]
 
     def get_allowed_models(self, obj):
-        return settings.OPENAI_ALLOWED_MODELS
+        definition = provider_registry().get(obj.provider)
+        return list(definition.models) if definition else []
 
     def get_allowed_reasoning_efforts(self, obj):
-        return settings.OPENAI_ALLOWED_REASONING_EFFORTS
+        return settings.AI_GATEWAY_ALLOWED_REASONING_EFFORTS
 
-    def validate_model(self, value):
-        value = value.strip()
-        if value not in settings.OPENAI_ALLOWED_MODELS:
-            raise serializers.ValidationError(
-                "This model is not allowed by the platform deployment."
-            )
-        return value
+    def get_provider_catalog(self, obj):
+        catalog = provider_catalog()
+        credentials = {}
+        if settings.AI_GATEWAY_ALLOW_TENANT_KEYS:
+            credentials = {
+                credential.provider: credential
+                for credential in SDRModelCredential.objects.filter(
+                    org_id=obj.org_id,
+                    is_active=True,
+                )
+            }
+        for provider, item in catalog.items():
+            credential = credentials.get(provider)
+            if credential:
+                item["configured"] = True
+                item["credential_source"] = "tenant"
+                item["key_hint"] = credential.api_key_hint
+            elif item["platform_configured"]:
+                item["configured"] = True
+                item["credential_source"] = "platform"
+                item["key_hint"] = ""
+            else:
+                item["configured"] = False
+                item["credential_source"] = "none"
+                item["key_hint"] = ""
+        return catalog
+
+    def get_tenant_keys_allowed(self, obj):
+        return settings.AI_GATEWAY_ALLOW_TENANT_KEYS
 
     def validate_reasoning_effort(self, value):
-        if value not in settings.OPENAI_ALLOWED_REASONING_EFFORTS:
+        if value not in settings.AI_GATEWAY_ALLOWED_REASONING_EFFORTS:
             raise serializers.ValidationError(
                 "This reasoning effort is not allowed by the platform deployment."
             )
         return value
 
+    def validate_fallback_reasoning_effort(self, value):
+        if value not in settings.AI_GATEWAY_ALLOWED_REASONING_EFFORTS:
+            raise serializers.ValidationError(
+                "This fallback reasoning effort is not allowed by the deployment."
+            )
+        return value
+
     def validate(self, attrs):
+        registry = provider_registry()
+        current = self.instance
+        provider = attrs.get(
+            "provider", getattr(current, "provider", SDRModelProvider.OPENAI)
+        )
+        model = attrs.get("model", getattr(current, "model", ""))
+        errors = {}
+        if provider not in registry or model not in registry[provider].models:
+            errors["model"] = "This model is not allowed for the selected provider."
+
+        fallback_provider = attrs.get(
+            "fallback_provider", getattr(current, "fallback_provider", "")
+        )
+        fallback_model = attrs.get(
+            "fallback_model", getattr(current, "fallback_model", "")
+        )
+        if fallback_provider:
+            if (
+                fallback_provider not in registry
+                or fallback_model not in registry[fallback_provider].models
+            ):
+                errors["fallback_model"] = (
+                    "Select an allowed model for the fallback provider."
+                )
+        else:
+            attrs["fallback_model"] = ""
+
+        credential_fields = [
+            f"{provider_name}_api_key" for provider_name in SDRModelProvider.values
+        ] + [
+            f"clear_{provider_name}_api_key"
+            for provider_name in SDRModelProvider.values
+        ]
+        if not settings.AI_GATEWAY_ALLOW_TENANT_KEYS and any(
+            attrs.get(field) for field in credential_fields
+        ):
+            errors["api_keys"] = "Tenant-owned model API keys are disabled."
+
         for field in ("icp_description", "positive_signals", "negative_signals"):
             if len(attrs.get(field, getattr(self.instance, field, ""))) > 5000:
-                raise serializers.ValidationError(
-                    {field: "Keep this guidance under 5,000 characters."}
-                )
+                errors[field] = "Keep this guidance under 5,000 characters."
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        key_updates = {}
+        clear_updates = {}
+        for provider in SDRModelProvider.values:
+            key_updates[provider] = validated_data.pop(f"{provider}_api_key", "")
+            clear_updates[provider] = validated_data.pop(
+                f"clear_{provider}_api_key", False
+            )
+        instance = super().update(instance, validated_data)
+        if settings.AI_GATEWAY_ALLOW_TENANT_KEYS:
+            for provider in SDRModelProvider.values:
+                api_key = key_updates[provider].strip()
+                if clear_updates[provider] and not api_key:
+                    SDRModelCredential.objects.filter(
+                        org_id=instance.org_id,
+                        provider=provider,
+                    ).delete()
+                elif api_key:
+                    credential, _ = SDRModelCredential.objects.get_or_create(
+                        org_id=instance.org_id,
+                        provider=provider,
+                        defaults={"api_key_ciphertext": "pending"},
+                    )
+                    credential.set_api_key(api_key)
+                    credential.is_active = True
+                    credential.save()
+        return instance
 
 
 class LeadInspectionSerializer(serializers.ModelSerializer):
@@ -240,6 +374,8 @@ class LeadInspectionSerializer(serializers.ModelSerializer):
             "qualification_band",
             "qualification_reasons",
             "used_fallback",
+            "fallback_kind",
+            "provider_attempts",
             "error_code",
             "error_message",
             "input_tokens",

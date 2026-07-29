@@ -177,8 +177,8 @@ class SDRIntelligenceSettingsView(APIView):
         )
         default_effort = (
             "low"
-            if "low" in settings.OPENAI_ALLOWED_REASONING_EFFORTS
-            else settings.OPENAI_ALLOWED_REASONING_EFFORTS[0]
+            if "low" in settings.AI_GATEWAY_ALLOWED_REASONING_EFFORTS
+            else settings.AI_GATEWAY_ALLOWED_REASONING_EFFORTS[0]
         )
         configuration, _ = SDRIntelligenceSettings.objects.get_or_create(
             org=request.org,

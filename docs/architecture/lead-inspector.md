@@ -17,9 +17,11 @@ normalized lead
     |
     +--> deterministic baseline score
     |
-    +--> OpenAI structured qualification (optional)
+    +--> multi-model gateway qualification (optional)
     |         |
-    |         +-- failure / invalid output --> baseline score
+    |         +-- failure / invalid output --> fallback model (optional)
+    |                                             |
+    |                                             +-- failure --> baseline score
     |
     +--> country/source/score routing
     |
@@ -31,13 +33,13 @@ website intake endpoint performs inspection before returning so its caller gets
 the completed CRM handoff; administrators can cap page count and per-page
 website timeout for latency control.
 
-## OpenAI contract
+## Model gateway contract
 
-The adapter uses the Responses API with `store: false` and strict JSON Schema.
-The default model is `gpt-5.6-luna`, selected for a high-volume, cost-sensitive
-classification workload. Organizations may choose another GPT model and
-reasoning effort from deployment-owned allow-lists. The deployment owns the API
-key; a tenant can never read or replace it.
+The inspector calls the tenant's primary model route and optionally a fallback
+route through the [SDR model gateway](model-gateway.md). OpenAI and Doubao use
+Responses adapters; DeepSeek uses a Chat Completions adapter. Provider output is
+normalized into one qualification contract and validated locally before it can
+affect routing or CRM data.
 
 The model receives no contact name, email address, or phone number. It receives
 the job title, whether contact methods exist, company data, the tenant ICP, the
@@ -68,7 +70,8 @@ and a safe error code/message.
 ## Failure semantics
 
 - Missing API key, rate limit, provider failure, refusal, invalid JSON, or a
-  score/band mismatch falls back to deterministic `rules-v1` scoring.
+  score/band mismatch tries the configured model fallback and then deterministic
+  `rules-v1` scoring.
 - Website DNS, network, redirect, size, and content errors skip that research
   while still allowing qualification from submitted lead data.
 - A fallback produces a `partial` inspection and never prevents CRM creation or
@@ -78,10 +81,10 @@ and a safe error code/message.
 
 ## Tenant isolation and administration
 
-`sdr_intelligence_settings` and `sdr_lead_inspection` carry `org_id` and are
-protected by PostgreSQL row-level security. The REST endpoints additionally
-require an organization administrator and filter every lookup by the current
-organization.
+`sdr_intelligence_settings`, `sdr_model_credential`, and
+`sdr_lead_inspection` carry `org_id` and are protected by PostgreSQL row-level
+security. The REST endpoints additionally require an organization administrator
+and filter every lookup by the current organization.
 
 Administration UI: `/settings/sdr-intelligence`
 
@@ -93,14 +96,10 @@ GET           /api/sdr/intelligence/inspections/<inspection-id>/
 
 ## Deployment
 
-Apply `sdr.0003_lead_inspector` and configure:
+Apply `sdr.0004_multi_model_gateway` and configure:
 
 ```dotenv
-OPENAI_API_KEY=""
-OPENAI_API_BASE_URL="https://api.openai.com/v1"
-OPENAI_API_TIMEOUT_SECONDS="30"
-OPENAI_ALLOWED_MODELS="gpt-5.6-luna,gpt-5.6-terra,gpt-5.6-sol"
-OPENAI_ALLOWED_REASONING_EFFORTS="none,low,medium"
+# See model-gateway.md for OpenAI, Doubao, DeepSeek, and BYOK settings.
 ```
 
 The inspector is disabled for every organization by default. An administrator

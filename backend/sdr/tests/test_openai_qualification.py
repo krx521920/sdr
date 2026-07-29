@@ -133,3 +133,26 @@ def test_openai_qualifier_rejects_inconsistent_band():
         )
 
     assert caught.value.code == "openai_invalid_response"
+
+
+def test_openai_qualifier_rejects_values_outside_the_shared_contract():
+    client = OpenAILeadQualifier(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        reasoning_effort="low",
+        session=FakeSession(structured_result(company_size="huge")),
+    )
+    candidate = lead_candidate()
+
+    with pytest.raises(OpenAIQualificationError) as caught:
+        client.qualify(
+            org_id=candidate.org_id,
+            candidate=candidate,
+            baseline=QualificationResult(55, QualificationBand.MEDIUM),
+            research=None,
+            icp_description="",
+            positive_signals="",
+            negative_signals="",
+        )
+
+    assert caught.value.code == "openai_invalid_response"

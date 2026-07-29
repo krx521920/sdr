@@ -2,7 +2,7 @@ import pytest
 from django.test import override_settings
 
 from sdr.domain import QualificationBand, QualificationResult
-from sdr.intelligence.openai_client import AIQualification
+from sdr.intelligence.contracts import AIQualification
 from sdr.intelligence.research import ResearchResult
 from sdr.models import LeadInspection, SDRIntelligenceSettings
 
@@ -34,7 +34,7 @@ def test_inspector_enriches_scores_and_audits_real_intake(
         ),
     )
     monkeypatch.setattr(
-        "sdr.intelligence.service.OpenAILeadQualifier.qualify",
+        "sdr.intelligence.gateway.OpenAILeadQualifier.qualify",
         lambda self, **kwargs: AIQualification(
             qualification=QualificationResult(
                 score=91,
@@ -75,6 +75,15 @@ def test_inspector_enriches_scores_and_audits_real_intake(
     assert response.json()["qualification_band"] == "high"
     assert inspection.status == "completed"
     assert inspection.provider == "openai"
+    assert inspection.fallback_kind == ""
+    assert inspection.provider_attempts == [
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "status": "completed",
+            "credential_source": "platform",
+        }
+    ]
     assert inspection.provider_response_id == "resp_inspector_1"
     assert len(inspection.configuration_sha256) == 64
     assert inspection.research_facts["company_size"] == "mid_market"
@@ -118,5 +127,8 @@ def test_missing_openai_key_falls_back_without_losing_lead(admin_client, org_a):
     assert inspection.status == "partial"
     assert inspection.provider == "rules"
     assert inspection.used_fallback is True
+    assert inspection.fallback_kind == "rules"
+    assert inspection.provider_attempts[0]["provider"] == "openai"
+    assert inspection.provider_attempts[0]["status"] == "failed"
     assert inspection.error_code == "openai_not_configured"
     assert inspection.qualification_score == response.json()["qualification_score"]

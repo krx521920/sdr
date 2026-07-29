@@ -1,5 +1,7 @@
 """Company research and AI-assisted lead qualification."""
 
+from sdr.intelligence.contracts import AIQualification, ModelProviderError
+from sdr.intelligence.gateway import ModelGateway, ModelGatewayError
 from sdr.intelligence.research import (
     ResearchResult,
     WebsiteResearcher,
@@ -8,6 +10,10 @@ from sdr.intelligence.research import (
 )
 
 __all__ = [
+    "AIQualification",
+    "ModelGateway",
+    "ModelGatewayError",
+    "ModelProviderError",
     "ResearchResult",
     "WebsiteResearchError",
     "WebsiteResearcher",

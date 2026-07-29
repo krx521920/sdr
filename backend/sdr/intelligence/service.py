@@ -4,17 +4,16 @@ import hashlib
 import json
 from dataclasses import replace
 
-from django.conf import settings as django_settings
 from django.utils import timezone
 
 from sdr.domain import LeadCandidate, QualificationResult
 from sdr.enrichment import EmailDomainEnricher
-from sdr.intelligence.openai_client import (
+from sdr.intelligence.contracts import (
     PROMPT_VERSION,
     AIQualification,
-    OpenAILeadQualifier,
-    OpenAIQualificationError,
+    ModelProviderError,
 )
+from sdr.intelligence.gateway import ModelGateway, ModelGatewayError
 from sdr.intelligence.research import (
     ResearchResult,
     WebsiteResearcher,
@@ -22,6 +21,7 @@ from sdr.intelligence.research import (
 )
 from sdr.models import (
     LeadInspection,
+    LeadInspectionFallbackKind,
     LeadInspectionStatus,
     SDRIntelligenceSettings,
 )
@@ -49,6 +49,7 @@ class LeadInspector:
         self.research: ResearchResult | None = None
         self.ai_result: AIQualification | None = None
         self.errors: list[tuple[str, str]] = []
+        self.provider_attempts: list[dict] = []
         self.inspection: LeadInspection | None = None
 
         if configuration and configuration.is_enabled:
@@ -71,6 +72,8 @@ class LeadInspector:
                     "qualification_band": "",
                     "qualification_reasons": [],
                     "used_fallback": False,
+                    "fallback_kind": "",
+                    "provider_attempts": [],
                     "input_tokens": None,
                     "output_tokens": None,
                     "started_at": timezone.now(),
@@ -127,25 +130,7 @@ class LeadInspector:
         config = self.configuration
         if not self.enabled or not config.ai_scoring_enabled:
             return baseline
-        if (
-            config.model not in django_settings.OPENAI_ALLOWED_MODELS
-            or config.reasoning_effort
-            not in django_settings.OPENAI_ALLOWED_REASONING_EFFORTS
-        ):
-            self.errors.append(
-                (
-                    "openai_configuration_not_allowed",
-                    "The configured model or reasoning effort is not allowed by the platform.",
-                )
-            )
-            return baseline
-        qualifier = self.qualifier or OpenAILeadQualifier(
-            api_key=django_settings.OPENAI_API_KEY,
-            model=config.model,
-            reasoning_effort=config.reasoning_effort,
-            base_url=django_settings.OPENAI_API_BASE_URL,
-            timeout_seconds=django_settings.OPENAI_API_TIMEOUT_SECONDS,
-        )
+        qualifier = self.qualifier or ModelGateway.for_configuration(config)
         try:
             self.ai_result = qualifier.qualify(
                 org_id=candidate.org_id,
@@ -156,16 +141,52 @@ class LeadInspector:
                 positive_signals=config.positive_signals,
                 negative_signals=config.negative_signals,
             )
-        except OpenAIQualificationError as exc:
+        except ModelGatewayError as exc:
+            self.provider_attempts = list(exc.attempts)
+            self._record_provider_failures()
+            return baseline
+        except ModelProviderError as exc:
+            self.provider_attempts = [
+                {
+                    "provider": config.provider,
+                    "model": config.model,
+                    "status": "failed",
+                    "error_code": exc.code,
+                    "retryable": exc.retryable,
+                }
+            ]
             self.errors.append((exc.code, str(exc)))
             return baseline
+        self.provider_attempts = list(self.ai_result.attempts)
+        if not self.provider_attempts:
+            self.provider_attempts = [
+                {
+                    "provider": self.ai_result.provider,
+                    "model": self.ai_result.model or config.model,
+                    "status": "completed",
+                }
+            ]
+        self._record_provider_failures()
         return self.ai_result.qualification
+
+    def _record_provider_failures(self) -> None:
+        for attempt in self.provider_attempts:
+            if attempt.get("status") != "failed":
+                continue
+            code = str(attempt.get("error_code") or "model_provider_failed")
+            provider = str(attempt.get("provider") or "model provider")
+            self.errors.append((code, f"{provider} qualification route failed."))
 
     def complete(self, qualification: QualificationResult) -> None:
         if self.inspection is None:
             return
         ai_enabled = bool(self.configuration.ai_scoring_enabled)
-        used_fallback = ai_enabled and self.ai_result is None
+        if ai_enabled and self.ai_result is None:
+            fallback_kind = LeadInspectionFallbackKind.RULES
+        elif self.ai_result and self.ai_result.gateway_fallback_used:
+            fallback_kind = LeadInspectionFallbackKind.MODEL
+        else:
+            fallback_kind = LeadInspectionFallbackKind.NONE
         metadata = dict(qualification.metadata)
         facts = dict(self.research.facts) if self.research else {}
         facts.update(metadata)
@@ -197,9 +218,13 @@ class LeadInspector:
         self.inspection.content_sha256 = (
             self.research.content_sha256 if self.research else ""
         )
-        self.inspection.provider = "openai" if self.ai_result else "rules"
+        self.inspection.provider = (
+            self.ai_result.provider if self.ai_result else "rules"
+        )
         self.inspection.model = (
-            self.configuration.model if self.ai_result else "rules-v1"
+            self.ai_result.model or self.configuration.model
+            if self.ai_result
+            else "rules-v1"
         )
         self.inspection.prompt_version = PROMPT_VERSION if self.ai_result else ""
         self.inspection.configuration_sha256 = self._configuration_fingerprint()
@@ -209,7 +234,9 @@ class LeadInspector:
         self.inspection.qualification_score = qualification.score
         self.inspection.qualification_band = qualification.band.value
         self.inspection.qualification_reasons = list(qualification.reasons)
-        self.inspection.used_fallback = used_fallback
+        self.inspection.used_fallback = bool(fallback_kind)
+        self.inspection.fallback_kind = fallback_kind
+        self.inspection.provider_attempts = self.provider_attempts
         self.inspection.error_code = error_code
         self.inspection.error_message = error_message[:1000]
         self.inspection.input_tokens = (
@@ -226,8 +253,12 @@ class LeadInspector:
         payload = {
             "research_enabled": config.research_enabled,
             "ai_scoring_enabled": config.ai_scoring_enabled,
+            "provider": config.provider,
             "model": config.model,
             "reasoning_effort": config.reasoning_effort,
+            "fallback_provider": config.fallback_provider,
+            "fallback_model": config.fallback_model,
+            "fallback_reasoning_effort": config.fallback_reasoning_effort,
             "icp_description": config.icp_description,
             "positive_signals": config.positive_signals,
             "negative_signals": config.negative_signals,
@@ -249,6 +280,8 @@ class LeadInspector:
         self.inspection.error_code = "pipeline_failed"
         self.inspection.error_message = (str(exc) or exc.__class__.__name__)[:1000]
         self.inspection.used_fallback = True
+        self.inspection.fallback_kind = LeadInspectionFallbackKind.RULES
+        self.inspection.provider_attempts = self.provider_attempts
         self.inspection.configuration_sha256 = self._configuration_fingerprint()
         self.inspection.completed_at = timezone.now()
         self.inspection.save(
@@ -257,6 +290,8 @@ class LeadInspector:
                 "error_code",
                 "error_message",
                 "used_fallback",
+                "fallback_kind",
+                "provider_attempts",
                 "configuration_sha256",
                 "completed_at",
                 "updated_at",

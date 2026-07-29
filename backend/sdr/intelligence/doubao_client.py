@@ -1,8 +1,7 @@
-"""OpenAI Responses API adapter for structured lead qualification."""
+"""Volcengine Ark Responses API adapter for Doubao models."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 from uuid import UUID
 
@@ -22,12 +21,12 @@ from sdr.intelligence.contracts import (
 from sdr.intelligence.research import ResearchResult
 
 
-class OpenAIQualificationError(ModelProviderError):
+class DoubaoQualificationError(ModelProviderError):
     pass
 
 
-class OpenAILeadQualifier:
-    provider = "openai"
+class DoubaoLeadQualifier:
+    provider = "doubao"
 
     def __init__(
         self,
@@ -35,7 +34,7 @@ class OpenAILeadQualifier:
         api_key: str,
         model: str,
         reasoning_effort: str,
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str,
         timeout_seconds: int = 30,
         session=None,
     ):
@@ -58,9 +57,9 @@ class OpenAILeadQualifier:
         negative_signals: str,
     ) -> AIQualification:
         if not self.api_key:
-            raise OpenAIQualificationError(
-                "OpenAI API key is not configured.",
-                code="openai_not_configured",
+            raise DoubaoQualificationError(
+                "Doubao API key is not configured.",
+                code="doubao_not_configured",
             )
         context = build_lead_context(
             candidate=candidate,
@@ -74,21 +73,19 @@ class OpenAILeadQualifier:
             "model": self.model,
             "instructions": qualification_instructions(),
             "input": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
-            "reasoning": {"effort": self.reasoning_effort},
+            "thinking": {
+                "type": "disabled" if self.reasoning_effort == "none" else "enabled"
+            },
             "text": {
-                "verbosity": "low",
                 "format": {
                     "type": "json_schema",
                     "name": "lead_qualification",
                     "strict": True,
                     "schema": OUTPUT_SCHEMA,
-                },
+                }
             },
             "max_output_tokens": 1200,
             "store": False,
-            "safety_identifier": hashlib.sha256(
-                f"sdr-org:{org_id}".encode()
-            ).hexdigest(),
         }
         try:
             response = self.session.post(
@@ -101,15 +98,15 @@ class OpenAILeadQualifier:
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
-            raise OpenAIQualificationError(
-                "OpenAI qualification request failed.",
-                code="openai_request_failed",
+            raise DoubaoQualificationError(
+                "Doubao qualification request failed.",
+                code="doubao_request_failed",
                 retryable=True,
             ) from exc
         if response.status_code >= 400:
-            raise OpenAIQualificationError(
-                f"OpenAI qualification returned HTTP {response.status_code}.",
-                code="openai_http_error",
+            raise DoubaoQualificationError(
+                f"Doubao qualification returned HTTP {response.status_code}.",
+                code="doubao_http_error",
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
         try:
@@ -121,9 +118,9 @@ class OpenAILeadQualifier:
                 model=self.model,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise OpenAIQualificationError(
-                "OpenAI qualification returned an invalid structured result.",
-                code="openai_invalid_response",
+            raise DoubaoQualificationError(
+                "Doubao qualification returned an invalid structured result.",
+                code="doubao_invalid_response",
             ) from exc
         usage = body.get("usage") or {}
         return AIQualification(

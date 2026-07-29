@@ -4,6 +4,7 @@ from sdr.models import (
     LeadInspection,
     LeadIntake,
     SDRIntelligenceSettings,
+    SDRModelCredential,
     SDRRoutingRule,
     SDRRoutingRuleMember,
 )
@@ -16,9 +17,28 @@ class SDRIntelligenceSettingsAdmin(admin.ModelAdmin):
         "is_enabled",
         "research_enabled",
         "ai_scoring_enabled",
+        "provider",
         "model",
+        "fallback_provider",
     )
-    list_filter = ("is_enabled", "research_enabled", "ai_scoring_enabled")
+    list_filter = (
+        "is_enabled",
+        "research_enabled",
+        "ai_scoring_enabled",
+        "provider",
+        "fallback_provider",
+    )
+
+
+@admin.register(SDRModelCredential)
+class SDRModelCredentialAdmin(admin.ModelAdmin):
+    list_display = ("org", "provider", "api_key_hint", "is_active", "updated_at")
+    list_filter = ("provider", "is_active")
+    exclude = ("api_key_ciphertext",)
+    readonly_fields = ("api_key_hint",)
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(LeadInspection)
@@ -32,14 +52,22 @@ class LeadInspectionAdmin(admin.ModelAdmin):
         "provider",
         "model",
         "used_fallback",
+        "fallback_kind",
         "created_at",
     )
-    list_filter = ("status", "qualification_band", "provider", "used_fallback")
+    list_filter = (
+        "status",
+        "qualification_band",
+        "provider",
+        "used_fallback",
+        "fallback_kind",
+    )
     search_fields = ("intake__source_record_id", "website_url")
     readonly_fields = (
         "source_urls",
         "research_facts",
         "qualification_reasons",
+        "provider_attempts",
         "provider_response_id",
         "configuration_sha256",
     )

@@ -4,6 +4,7 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
 from common.base import BaseOrgModel
+from common.secrets import decrypt_secret, encrypt_secret
 
 
 class LeadIntakeStatus(models.TextChoices):
@@ -110,6 +111,18 @@ class LeadInspectionStatus(models.TextChoices):
     FAILED = "failed", "Failed"
 
 
+class SDRModelProvider(models.TextChoices):
+    OPENAI = "openai", "OpenAI"
+    DOUBAO = "doubao", "Doubao / Volcengine Ark"
+    DEEPSEEK = "deepseek", "DeepSeek"
+
+
+class LeadInspectionFallbackKind(models.TextChoices):
+    NONE = "", "None"
+    MODEL = "model", "Model provider"
+    RULES = "rules", "Deterministic rules"
+
+
 class SDRIntelligenceSettings(BaseOrgModel):
     """Tenant ICP and cost/latency controls for the lead inspector."""
 
@@ -121,8 +134,31 @@ class SDRIntelligenceSettings(BaseOrgModel):
     is_enabled = models.BooleanField(default=False)
     research_enabled = models.BooleanField(default=True)
     ai_scoring_enabled = models.BooleanField(default=True)
+    provider = models.CharField(
+        max_length=24,
+        choices=SDRModelProvider.choices,
+        default=SDRModelProvider.OPENAI,
+    )
     model = models.CharField(max_length=100, default="gpt-5.6-luna")
     reasoning_effort = models.CharField(
+        max_length=16,
+        choices=[
+            ("none", "None"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("xhigh", "Extra high"),
+            ("max", "Maximum"),
+        ],
+        default="low",
+    )
+    fallback_provider = models.CharField(
+        max_length=24,
+        choices=SDRModelProvider.choices,
+        blank=True,
+    )
+    fallback_model = models.CharField(max_length=100, blank=True)
+    fallback_reasoning_effort = models.CharField(
         max_length=16,
         choices=[
             ("none", "None"),
@@ -148,6 +184,41 @@ class SDRIntelligenceSettings(BaseOrgModel):
 
     class Meta:
         db_table = "sdr_intelligence_settings"
+
+
+class SDRModelCredential(BaseOrgModel):
+    """Encrypted tenant BYOK credential for one allow-listed model provider."""
+
+    provider = models.CharField(max_length=24, choices=SDRModelProvider.choices)
+    api_key_ciphertext = models.TextField()
+    api_key_hint = models.CharField(max_length=12, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "sdr_model_credential"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "provider"],
+                name="unique_sdr_model_credential_per_org",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "provider", "is_active"],
+                name="sdr_credential_org_provider_idx",
+            )
+        ]
+
+    def set_api_key(self, api_key: str) -> None:
+        cleaned = api_key.strip()
+        self.api_key_ciphertext = encrypt_secret(cleaned)
+        self.api_key_hint = cleaned[-8:]
+
+    def get_api_key(self) -> str:
+        return decrypt_secret(self.api_key_ciphertext)
+
+    def __str__(self) -> str:
+        return f"{self.org_id}:{self.provider}"
 
 
 class LeadInspection(BaseOrgModel):
@@ -177,6 +248,12 @@ class LeadInspection(BaseOrgModel):
     qualification_band = models.CharField(max_length=32, blank=True)
     qualification_reasons = models.JSONField(default=list, blank=True)
     used_fallback = models.BooleanField(default=False)
+    fallback_kind = models.CharField(
+        max_length=16,
+        choices=LeadInspectionFallbackKind.choices,
+        blank=True,
+    )
+    provider_attempts = models.JSONField(default=list, blank=True)
     error_code = models.CharField(max_length=80, blank=True)
     error_message = models.CharField(max_length=1000, blank=True)
     input_tokens = models.PositiveIntegerField(null=True, blank=True)

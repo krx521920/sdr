@@ -81,3 +81,5 @@ Country/source/qualification assignment is implemented inside the `sdr`
 boundary as described in [sdr-routing.md](sdr-routing.md).
 Public company research and AI-assisted qualification remain behind the SDR
 ports described in [lead-inspector.md](lead-inspector.md).
+Provider protocol translation, encrypted BYOK credentials, and failover are
+isolated behind the [SDR model gateway](model-gateway.md).

@@ -402,8 +402,8 @@ META_OAUTH_SCOPES = tuple(
     if scope.strip()
 )
 
-# OpenAI-backed SDR lead inspection. The API key is deployment-owned; tenant
-# administrators control only their ICP, model, and per-lead research limits.
+# OpenAI defaults for the SDR model gateway. Provider URLs and allow-lists are
+# deployment-owned; optional tenant keys are handled separately and encrypted.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_API_BASE_URL = os.environ.get(
     "OPENAI_API_BASE_URL", "https://api.openai.com/v1"
@@ -423,6 +423,51 @@ OPENAI_ALLOWED_REASONING_EFFORTS = tuple(
     value.strip()
     for value in os.environ.get(
         "OPENAI_ALLOWED_REASONING_EFFORTS", "none,low,medium"
+    ).split(",")
+    if value.strip() in {"none", "low", "medium", "high", "xhigh", "max"}
+) or ("low",)
+
+# The gateway owns provider URLs and model allow-lists. Tenant administrators
+# can select only from these values and can never redirect credentials to an
+# arbitrary host.
+DOUBAO_API_KEY = os.environ.get("DOUBAO_API_KEY", os.environ.get("ARK_API_KEY", ""))
+DOUBAO_API_BASE_URL = os.environ.get(
+    "DOUBAO_API_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
+).rstrip("/")
+DOUBAO_API_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("DOUBAO_API_TIMEOUT_SECONDS", "30"))
+)
+DOUBAO_ALLOWED_MODELS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "DOUBAO_ALLOWED_MODELS", "doubao-seed-2-0-lite-260215"
+    ).split(",")
+    if value.strip()
+) or ("doubao-seed-2-0-lite-260215",)
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_BASE_URL = os.environ.get(
+    "DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"
+).rstrip("/")
+DEEPSEEK_API_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("DEEPSEEK_API_TIMEOUT_SECONDS", "30"))
+)
+DEEPSEEK_ALLOWED_MODELS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "DEEPSEEK_ALLOWED_MODELS", "deepseek-v4-flash,deepseek-v4-pro"
+    ).split(",")
+    if value.strip()
+) or ("deepseek-v4-flash",)
+
+AI_GATEWAY_ALLOW_TENANT_KEYS = (
+    os.environ.get("AI_GATEWAY_ALLOW_TENANT_KEYS", "True").lower() == "true"
+)
+AI_GATEWAY_ALLOWED_REASONING_EFFORTS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "AI_GATEWAY_ALLOWED_REASONING_EFFORTS",
+        ",".join(OPENAI_ALLOWED_REASONING_EFFORTS),
     ).split(",")
     if value.strip() in {"none", "low", "medium", "high", "xhigh", "max"}
 ) or ("low",)

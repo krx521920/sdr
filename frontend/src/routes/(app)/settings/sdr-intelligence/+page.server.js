@@ -27,13 +27,23 @@ export const actions = {
       is_enabled: formData.has('is_enabled'),
       research_enabled: formData.has('research_enabled'),
       ai_scoring_enabled: formData.has('ai_scoring_enabled'),
+      provider: String(formData.get('provider') || 'openai'),
       model: String(formData.get('model') || '').trim(),
       reasoning_effort: String(formData.get('reasoning_effort') || 'low'),
+      fallback_provider: String(formData.get('fallback_provider') || ''),
+      fallback_model: String(formData.get('fallback_model') || '').trim(),
+      fallback_reasoning_effort: String(formData.get('fallback_reasoning_effort') || 'low'),
       icp_description: String(formData.get('icp_description') || '').trim(),
       positive_signals: String(formData.get('positive_signals') || '').trim(),
       negative_signals: String(formData.get('negative_signals') || '').trim(),
       max_research_pages: Number(formData.get('max_research_pages') || 2),
-      website_timeout_seconds: Number(formData.get('website_timeout_seconds') || 5)
+      website_timeout_seconds: Number(formData.get('website_timeout_seconds') || 5),
+      openai_api_key: String(formData.get('openai_api_key') || '').trim(),
+      doubao_api_key: String(formData.get('doubao_api_key') || '').trim(),
+      deepseek_api_key: String(formData.get('deepseek_api_key') || '').trim(),
+      clear_openai_api_key: formData.has('clear_openai_api_key'),
+      clear_doubao_api_key: formData.has('clear_doubao_api_key'),
+      clear_deepseek_api_key: formData.has('clear_deepseek_api_key')
     };
     try {
       await apiRequest(

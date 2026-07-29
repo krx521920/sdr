@@ -1,7 +1,7 @@
 import pytest
 from django.test import override_settings
 
-from sdr.models import LeadInspection, LeadIntake
+from sdr.models import LeadInspection, LeadIntake, SDRModelCredential
 
 
 @pytest.mark.django_db
@@ -38,6 +38,7 @@ def test_intelligence_settings_are_admin_only_and_tenant_scoped(
     assert denied.status_code == 403
     assert initial.status_code == 200
     assert initial.json()["is_enabled"] is False
+    assert initial.json()["provider"] == "openai"
     assert initial.json()["model"] == "gpt-5.6-luna"
     assert initial.json()["reasoning_effort"] == "low"
     assert initial.json()["openai_configured"] is True
@@ -46,6 +47,14 @@ def test_intelligence_settings_are_admin_only_and_tenant_scoped(
         "gpt-5.6-terra",
         "gpt-5.6-sol",
     ]
+    assert set(initial.json()["provider_catalog"]) == {
+        "openai",
+        "doubao",
+        "deepseek",
+    }
+    assert initial.json()["provider_catalog"]["openai"]["credential_source"] == (
+        "platform"
+    )
     assert updated.status_code == 200
     assert updated.json()["is_enabled"] is True
     assert updated.json()["max_research_pages"] == 3
@@ -53,6 +62,70 @@ def test_intelligence_settings_are_admin_only_and_tenant_scoped(
     assert blocked_effort.status_code == 400
     assert other_tenant.status_code == 200
     assert other_tenant.json()["is_enabled"] is False
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="sdr.tests.urls",
+    DEEPSEEK_API_KEY="",
+    AI_GATEWAY_ALLOW_TENANT_KEYS=True,
+)
+def test_tenant_can_store_and_clear_an_encrypted_provider_key(
+    admin_client,
+    org_b_client,
+    org_a,
+):
+    stored = admin_client.patch(
+        "/api/sdr/intelligence/settings/",
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "deepseek_api_key": "tenant-deepseek-secret",
+        },
+        format="json",
+    )
+
+    assert stored.status_code == 200
+    body = stored.json()
+    assert "deepseek_api_key" not in body
+    assert body["provider_catalog"]["deepseek"]["configured"] is True
+    assert body["provider_catalog"]["deepseek"]["credential_source"] == "tenant"
+    assert body["provider_catalog"]["deepseek"]["key_hint"] == "k-secret"
+
+    credential = SDRModelCredential.objects.get(org=org_a, provider="deepseek")
+    assert "tenant-deepseek-secret" not in credential.api_key_ciphertext
+    assert credential.get_api_key() == "tenant-deepseek-secret"
+
+    isolated = org_b_client.get("/api/sdr/intelligence/settings/")
+    assert isolated.status_code == 200
+    assert isolated.json()["provider_catalog"]["deepseek"]["configured"] is False
+
+    cleared = admin_client.patch(
+        "/api/sdr/intelligence/settings/",
+        {"clear_deepseek_api_key": True},
+        format="json",
+    )
+    assert cleared.status_code == 200
+    assert not SDRModelCredential.objects.filter(
+        org=org_a,
+        provider="deepseek",
+    ).exists()
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="sdr.tests.urls",
+    AI_GATEWAY_ALLOW_TENANT_KEYS=False,
+)
+def test_tenant_key_updates_can_be_disabled(admin_client):
+    response = admin_client.patch(
+        "/api/sdr/intelligence/settings/",
+        {"doubao_api_key": "not-allowed"},
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert "api_keys" in response.json()
 
 
 @pytest.mark.django_db
