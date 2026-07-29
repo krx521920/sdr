@@ -1,6 +1,7 @@
 from django.urls import include, path
 
 from cases.csat_views import PublicCsatView
+from integrations.api.website_views import WebsiteLeadIntakeView
 from tasks.urls import board_urlpatterns
 
 app_name = "common_urls"
@@ -9,7 +10,16 @@ urlpatterns = [
     path("accounts/", include("accounts.urls", namespace="api_accounts")),
     path("contacts/", include("contacts.urls", namespace="api_contacts")),
     path("leads/", include("leads.urls", namespace="api_leads")),
+    path(
+        "sdr/intake/website/",
+        WebsiteLeadIntakeView.as_view(),
+        name="website_intake",
+    ),
     path("sdr/", include("sdr.urls", namespace="api_sdr")),
+    path(
+        "integrations/",
+        include("integrations.urls", namespace="api_integrations"),
+    ),
     path("opportunities/", include("opportunity.urls", namespace="api_opportunities")),
     # Teams URLs are now in common app at /api/teams/
     path("tasks/", include("tasks.urls", namespace="api_tasks")),
@@ -30,7 +40,5 @@ urlpatterns = [
     # Public CSAT (Tier 2 csat) — anonymous, token-scoped. Lives outside
     # any app namespace because the customer reaches it from an emailed
     # link with no auth context.
-    path(
-        "public/csat/<str:token>/", PublicCsatView.as_view(), name="public_csat"
-    ),
+    path("public/csat/<str:token>/", PublicCsatView.as_view(), name="public_csat"),
 ]

@@ -1,5 +1,6 @@
 from django.urls import path
 
+from integrations.api.website_views import WebsiteLeadIntakeView
 from leads.views.kanban_views import (
     LeadKanbanView,
     LeadMoveView,
@@ -15,7 +16,6 @@ from leads.views.lead_interactions import (
     LeadUploadView,
 )
 from leads.views.lead_views import LeadDetailView, LeadListView
-from sdr.api.views import WebsiteLeadIntakeView
 
 app_name = "api_leads"
 

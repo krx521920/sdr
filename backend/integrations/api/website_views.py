@@ -7,15 +7,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.permissions import HasOrgContext
-from sdr.api.serializers import (
+from integrations.api.website_serializers import (
     WebsiteLeadIntakeResponseSerializer,
     WebsiteLeadIntakeSerializer,
 )
-from sdr.services import (
-    IntakeAlreadyProcessing,
-    IntakeProcessingFailed,
-    process_website_intake,
-)
+from integrations.providers.website.service import process_website_intake
+from sdr.services import IntakeAlreadyProcessing, IntakeProcessingFailed
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +43,7 @@ class WebsiteLeadIntakeView(APIView):
             )
         except IntakeAlreadyProcessing as exc:
             return Response(
-                {
-                    "intake_id": exc.intake_id,
-                    "status": "processing",
-                },
+                {"intake_id": exc.intake_id, "status": "processing"},
                 status=status.HTTP_202_ACCEPTED,
             )
         except IntakeProcessingFailed as exc:

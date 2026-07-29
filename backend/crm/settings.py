@@ -10,11 +10,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-dev-key-please-change-in-production")
+SECRET_KEY = os.environ.get(
+    "SECRET_KEY", "django-insecure-dev-key-please-change-in-production"
+)
 
 if not SECRET_KEY or SECRET_KEY.startswith("django-insecure"):
     if os.environ.get("ENV_TYPE", "dev") != "dev":
-        raise ValueError("SECRET_KEY must be set to a secure value in non-dev environments")
+        raise ValueError(
+            "SECRET_KEY must be set to a secure value in non-dev environments"
+        )
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
@@ -39,8 +43,8 @@ INSTALLED_APPS = [
     "django_ses",
     "drf_spectacular",
     "common",
-    # New bounded contexts. They intentionally contain no database models yet;
-    # existing CRM tables stay in their original apps during the migration.
+    # New bounded contexts. Existing CRM tables stay in their original apps
+    # while provider-owned configuration lives with its integration module.
     "sdr.apps.SDRConfig",
     "integrations.apps.IntegrationsConfig",
     "automation.apps.AutomationConfig",
@@ -171,7 +175,9 @@ if "django_ses" in EMAIL_BACKEND:
 
 # celery Tasks
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = os.environ.get(
+    "CELERY_RESULT_BACKEND", "redis://localhost:6379/0"
+)
 
 
 LOGGING = {
@@ -363,3 +369,19 @@ SWAGGER_ROOT_URL = os.environ.get("SWAGGER_ROOT_URL", "http://localhost:8000")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
+
+# Meta Lead Ads integration. Pin the Graph version so provider changes are
+# deployed intentionally rather than arriving implicitly.
+META_APP_ID = os.environ.get("META_APP_ID", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
+META_GRAPH_API_VERSION = os.environ.get("META_GRAPH_API_VERSION", "v25.0")
+META_GRAPH_API_BASE_URL = os.environ.get(
+    "META_GRAPH_API_BASE_URL", "https://graph.facebook.com"
+)
+META_GRAPH_API_TIMEOUT = float(os.environ.get("META_GRAPH_API_TIMEOUT", "10"))
+
+# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# When omitted, dev falls back to a key derived from SECRET_KEY. Production
+# should always use a dedicated value so Django key rotation is independent.
+INTEGRATION_ENCRYPTION_KEY = os.environ.get("INTEGRATION_ENCRYPTION_KEY", "")

@@ -118,7 +118,7 @@ class DjangoCRMWriter:
             or " ".join(filter(None, [identity.first_name, identity.last_name]))
             or identity.email
             or identity.phone
-            or "Website inquiry",
+            or "Inbound lead",
             "first_name": identity.first_name,
             "last_name": identity.last_name,
             "email": identity.email,

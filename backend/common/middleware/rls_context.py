@@ -121,6 +121,9 @@ class RequireOrgContext:
         # Public CSAT survey link (Tier 2 csat) — anonymous, sets RLS
         # context manually inside the view from the survey's own org_id.
         "/api/public/csat/",
+        # Meta signs the request body; the Page id is then resolved to an org
+        # and RLS context is set explicitly by the background integration job.
+        "/api/integrations/facebook/webhook/",
     ]
 
     def __init__(self, get_response):

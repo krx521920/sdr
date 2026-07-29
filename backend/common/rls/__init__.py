@@ -59,6 +59,9 @@ ORG_SCOPED_TABLES = [
     "routing_rule_state",
     # SDR intake ledger
     "sdr_lead_intake",
+    # Tenant-owned external credentials. The companion Page route is
+    # intentionally a non-RLS bootstrap table and contains no token or lead PII.
+    "integration_facebook_page_connection",
     # Boards (Kanban)
     "board",
     "board_column",

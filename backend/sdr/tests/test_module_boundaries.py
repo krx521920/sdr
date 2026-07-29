@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 
 DOMAIN_ROOT = Path(__file__).resolve().parents[1] / "domain"
+SDR_ROOT = DOMAIN_ROOT.parent
 FORBIDDEN_IMPORT_ROOTS = {
     "accounts",
     "automation",
@@ -35,5 +36,14 @@ def test_domain_does_not_depend_on_framework_or_adapters():
         path.name: sorted(_import_roots(path) & FORBIDDEN_IMPORT_ROOTS)
         for path in DOMAIN_ROOT.glob("*.py")
         if _import_roots(path) & FORBIDDEN_IMPORT_ROOTS
+    }
+    assert violations == {}
+
+
+def test_sdr_does_not_import_concrete_integrations():
+    violations = {
+        str(path.relative_to(SDR_ROOT)): sorted(_import_roots(path) & {"integrations"})
+        for path in SDR_ROOT.rglob("*.py")
+        if "tests" not in path.parts and _import_roots(path) & {"integrations"}
     }
     assert violations == {}

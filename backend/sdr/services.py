@@ -8,7 +8,6 @@ from uuid import UUID
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from integrations.providers.website.adapter import WebsiteFormNormalizer
 from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator, LeastLoadedSalesRouter
 from sdr.application import LeadIntakePipeline
 from sdr.domain import LeadCandidate
@@ -18,7 +17,7 @@ from sdr.scoring import RuleBasedLeadScorer
 
 
 @dataclass(frozen=True, slots=True)
-class WebsiteIntakeResult:
+class LeadIntakeResult:
     intake_id: UUID
     lead_id: UUID | None
     crm_created: bool | None
@@ -44,10 +43,11 @@ class IntakeProcessingFailed(RuntimeError):
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 
 
-def process_website_intake(*, org_id: UUID, payload: Mapping[str, Any]):
-    normalizer = WebsiteFormNormalizer()
-    candidate = normalizer.normalize(org_id=org_id, payload=payload)
-    intake, replayed = _claim_intake(candidate=candidate, raw_payload=payload)
+def process_candidate_intake(
+    *, candidate: LeadCandidate, raw_payload: Mapping[str, Any]
+) -> LeadIntakeResult:
+    """Run any normalized provider lead through the durable SDR pipeline."""
+    intake, replayed = _claim_intake(candidate=candidate, raw_payload=raw_payload)
     if replayed:
         return _result_from_intake(intake, replayed=True)
 
@@ -61,13 +61,13 @@ def process_website_intake(*, org_id: UUID, payload: Mapping[str, Any]):
     try:
         result = pipeline.process(candidate)
     except Exception as exc:
-        LeadIntake.objects.filter(id=intake.id, org_id=org_id).update(
+        LeadIntake.objects.filter(id=intake.id, org_id=candidate.org_id).update(
             status=LeadIntakeStatus.FAILED,
             error_message=str(exc)[:2000],
         )
         raise IntakeProcessingFailed(intake.id) from exc
 
-    LeadIntake.objects.filter(id=intake.id, org_id=org_id).update(
+    LeadIntake.objects.filter(id=intake.id, org_id=candidate.org_id).update(
         normalized_payload=_normalized_payload(result.crm.lead_id, result.candidate),
         status=LeadIntakeStatus.COMPLETED,
         error_message="",
@@ -153,7 +153,7 @@ def _normalized_payload(lead_id: UUID, candidate: LeadCandidate) -> dict[str, An
 
 
 def _result_from_intake(intake: LeadIntake, *, replayed: bool = False):
-    return WebsiteIntakeResult(
+    return LeadIntakeResult(
         intake_id=intake.id,
         lead_id=intake.crm_lead_id,
         crm_created=intake.crm_created,

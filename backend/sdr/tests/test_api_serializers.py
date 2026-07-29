@@ -1,4 +1,4 @@
-from sdr.api.serializers import WebsiteLeadIntakeSerializer
+from integrations.api.website_serializers import WebsiteLeadIntakeSerializer
 
 
 def test_website_intake_requires_email_or_phone():
