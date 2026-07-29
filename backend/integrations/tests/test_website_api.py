@@ -1,12 +1,21 @@
 import pytest
 from django.test import override_settings
 
+from automation.models import AutomationJob
+from automation.tasks import run_automation_job
 from sdr.models import LeadIntake, SDRRoutingRule, SDRRoutingRuleMember
+
+
+def run_intake_job(response, org):
+    job_id = response.json()["job_id"]
+    result = run_automation_job.apply(args=[job_id, str(org.id)]).get()
+    assert result["status"] == "succeeded"
+    return job_id
 
 
 @pytest.mark.django_db
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
-def test_website_endpoint_keeps_contract_after_module_move(admin_client):
+def test_website_endpoint_keeps_contract_after_module_move(admin_client, org_a):
     payload = {
         "source_record_id": "website-42",
         "first_name": "Ada",
@@ -17,10 +26,18 @@ def test_website_endpoint_keeps_contract_after_module_move(admin_client):
     created = admin_client.post("/api/sdr/intake/website/", payload, format="json")
     replayed = admin_client.post("/api/sdr/intake/website/", payload, format="json")
 
-    assert created.status_code == 201
-    assert replayed.status_code == 200
+    assert created.status_code == 202
+    assert replayed.status_code == 202
     assert replayed.json()["replayed"] is True
-    assert replayed.json()["lead_id"] == created.json()["lead_id"]
+    assert replayed.json()["intake_id"] == created.json()["intake_id"]
+    assert replayed.json()["job_id"] == created.json()["job_id"]
+    assert AutomationJob.objects.filter(name="sdr.process_intake").count() == 1
+
+    run_intake_job(created, org_a)
+    completed = admin_client.post("/api/sdr/intake/website/", payload, format="json")
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["lead_id"] is not None
 
 
 @pytest.mark.django_db
@@ -42,7 +59,7 @@ def test_website_endpoint_persists_explainable_routing(
         profile=admin_profile,
     )
 
-    response = admin_client.post(
+    accepted = admin_client.post(
         "/api/sdr/intake/website/",
         {
             "source_record_id": "website-routed-1",
@@ -52,8 +69,12 @@ def test_website_endpoint_persists_explainable_routing(
         format="json",
     )
 
+    assert accepted.status_code == 202
+    run_intake_job(accepted, org_a)
+
     intake = LeadIntake.objects.get(source_record_id="website-routed-1")
-    assert response.status_code == 201
+    response = admin_client.get(f"/api/sdr/intakes/{intake.id}/")
+    assert response.status_code == 200
     assert response.json()["assigned_profile_id"] == str(admin_profile.id)
     assert response.json()["routing_rule_id"] == str(rule.id)
     assert 'rule="US website leads"' in response.json()["routing_reason"]

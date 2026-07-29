@@ -479,6 +479,12 @@ AUTOMATION_JOB_HANDLERS = {
     "facebook.process_lead": (
         "integrations.providers.facebook.jobs.process_facebook_lead_job"
     ),
+    "sdr.process_intake": (
+        "integrations.providers.website.jobs.process_website_intake_job"
+    ),
+    "sdr.send_acknowledgement": "sdr.response.process_acknowledgement_email_job",
+    "sdr.notify_sales_in_app": "sdr.response.process_sales_in_app_job",
+    "sdr.notify_sales_feishu": "sdr.response.process_sales_feishu_job",
 }
 AUTOMATION_RETRY_BASE_SECONDS = max(
     1, int(os.environ.get("AUTOMATION_RETRY_BASE_SECONDS", "5"))
@@ -492,6 +498,9 @@ AUTOMATION_JOB_LEASE_SECONDS = max(
 )
 AUTOMATION_MANUAL_RETRY_ATTEMPTS = max(
     1, int(os.environ.get("AUTOMATION_MANUAL_RETRY_ATTEMPTS", "3"))
+)
+SDR_FEISHU_TIMEOUT_SECONDS = max(
+    1, min(15, int(os.environ.get("SDR_FEISHU_TIMEOUT_SECONDS", "5")))
 )
 
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"

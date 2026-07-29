@@ -40,3 +40,12 @@ class WebsiteLeadIntakeResponseSerializer(serializers.Serializer):
     routing_rule_id = serializers.UUIDField(allow_null=True)
     routing_reason = serializers.CharField(allow_blank=True)
     replayed = serializers.BooleanField()
+
+
+class WebsiteLeadAcceptedSerializer(serializers.Serializer):
+    intake_id = serializers.UUIDField()
+    job_id = serializers.UUIDField()
+    status = serializers.CharField()
+    lead_id = serializers.UUIDField(allow_null=True)
+    replayed = serializers.BooleanField()
+    status_url = serializers.CharField()

@@ -20,11 +20,23 @@ export async function load({ cookies, url }) {
   if (status) query.set('status', status);
 
   try {
-    const jobs = await apiRequest(`/automation/jobs/?${query}`, {}, { cookies });
-    return { jobs, selectedStatus: status, loadError: '' };
+    const [jobs, intakes, responseSettings] = await Promise.all([
+      apiRequest(`/automation/jobs/?${query}`, {}, { cookies }),
+      apiRequest('/sdr/intakes/?limit=50', {}, { cookies }),
+      apiRequest('/sdr/response-settings/', {}, { cookies })
+    ]);
+    return { jobs, intakes, responseSettings, selectedStatus: status, loadError: '' };
   } catch (error) {
     return {
       jobs: { count: 0, summary: {}, results: [] },
+      intakes: {
+        count: 0,
+        summary: {},
+        delivery_summary: {},
+        response_metrics: {},
+        results: []
+      },
+      responseSettings: {},
       selectedStatus: status,
       loadError: error?.message || 'Could not load automation jobs.'
     };
@@ -45,6 +57,34 @@ export const actions = {
     } catch (error) {
       return fail(400, {
         actionError: error?.message || 'Could not retry the automation job.'
+      });
+    }
+  },
+  saveResponse: async ({ request, cookies }) => {
+    const formData = await request.formData();
+    const body = {
+      acknowledgement_email_enabled: formData.has('acknowledgement_email_enabled'),
+      acknowledgement_subject: String(formData.get('acknowledgement_subject') || '').trim(),
+      acknowledgement_body: String(formData.get('acknowledgement_body') || '').trim(),
+      acknowledgement_from_email: String(
+        formData.get('acknowledgement_from_email') || ''
+      ).trim(),
+      sales_in_app_enabled: formData.has('sales_in_app_enabled'),
+      feishu_enabled: formData.has('feishu_enabled'),
+      feishu_webhook_url: String(formData.get('feishu_webhook_url') || '').trim(),
+      clear_feishu_webhook: formData.has('clear_feishu_webhook'),
+      response_sla_seconds: Number(formData.get('response_sla_seconds') || 60)
+    };
+    try {
+      await apiRequest(
+        '/sdr/response-settings/',
+        { method: 'PUT', body },
+        { cookies }
+      );
+      return { responseSaved: true };
+    } catch (error) {
+      return fail(400, {
+        actionError: error?.message || 'Could not save lead response settings.'
       });
     }
   }

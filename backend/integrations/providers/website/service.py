@@ -1,4 +1,4 @@
-"""Website provider orchestration into the shared SDR intake service."""
+"""Synchronous website provider execution used by the durable job handler."""
 
 from collections.abc import Mapping
 from typing import Any

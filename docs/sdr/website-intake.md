@@ -1,9 +1,9 @@
 # Website lead intake
 
-The first SDR vertical slice accepts a server-to-server website form, retains
-the original submission, deduplicates it, enriches known fields, assigns an
-explainable qualification score, routes it to sales, and writes the resulting
-Lead and Contact into BottleCRM.
+The website channel accepts a server-to-server form and persists it before
+returning. Durable background jobs then deduplicate it, enrich known fields,
+assign an explainable qualification score, route it to sales, write the Lead
+and Contact, and run the configured customer/sales response policy.
 
 ## Endpoint
 
@@ -38,19 +38,38 @@ serverless backend.
 ```
 
 `source_record_id` is the idempotency key within one organization and source.
-Submitting it again returns the completed intake instead of creating a second
-lead. A processing attempt older than five minutes can be reclaimed safely.
+Submitting it again returns the same intake and processing job instead of
+creating a second lead. A completed replay includes the existing CRM lead id.
+
+The normal response is `202 Accepted`:
+
+```json
+{
+  "intake_id": "...",
+  "job_id": "...",
+  "status": "received",
+  "lead_id": null,
+  "replayed": false,
+  "status_url": "/api/sdr/intakes/<intake-id>/"
+}
+```
+
+Poll `GET /api/sdr/intakes/<intake-id>/` when the submitting system needs the
+completed CRM, qualification, assignment, lifecycle, and delivery result.
 
 ## Processing order
 
 1. Store the raw request in `sdr_lead_intake`.
-2. Match an active Lead by tenant-scoped email or phone.
-3. Enrich business-email and website-domain information.
-4. Calculate a transparent 0-100 baseline score.
-5. Select the least-loaded active sales profile, falling back to an admin.
-6. Create or update the Lead and Contact in one database transaction.
-7. Mark the intake completed with its CRM IDs, score, band, and assignment.
+2. Persist the `sdr.process_intake` job and, when enabled, an immediate
+   acknowledgement email job.
+3. Return `202` without waiting for email, website research, or a model provider.
+4. Match an active Lead by tenant-scoped email or phone.
+5. Enrich, research, and calculate a transparent 0-100 qualification score.
+6. Apply tenant routing and create or update the CRM Lead and Contact.
+7. Record lifecycle milestones and mark the intake completed.
+8. Persist independent sales notification jobs; acknowledgement scheduling is
+   idempotently reconciled in case it was not created during acceptance.
 
-Failures are retained with an error and attempt count so a retry does not lose
-the original submission.
-
+Broker, model, email, and notification failures are retained with attempt
+history and exponential backoff. Exhausted jobs enter the dead-letter ledger
+and can be replayed without duplicating the intake, CRM record, or delivery.

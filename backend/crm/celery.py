@@ -80,4 +80,8 @@ app.conf.beat_schedule = {
         "task": "automation.dispatch_due_jobs",
         "schedule": crontab(minute="*"),
     },
+    "reconcile-sdr-response-jobs": {
+        "task": "sdr.reconcile_response_jobs",
+        "schedule": crontab(minute="*"),
+    },
 }

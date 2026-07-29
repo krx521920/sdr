@@ -65,6 +65,9 @@ ORG_SCOPED_TABLES = [
     "sdr_intelligence_settings",
     "sdr_model_credential",
     "sdr_lead_inspection",
+    "sdr_response_settings",
+    "sdr_lead_lifecycle_event",
+    "sdr_lead_delivery",
     # Tenant-owned external credentials. The companion Page route is
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.
     "integration_facebook_page_connection",

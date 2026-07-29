@@ -1,5 +1,3 @@
-import logging
-
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -8,13 +6,11 @@ from rest_framework.views import APIView
 
 from common.permissions import HasOrgContext
 from integrations.api.website_serializers import (
-    WebsiteLeadIntakeResponseSerializer,
+    WebsiteLeadAcceptedSerializer,
     WebsiteLeadIntakeSerializer,
 )
-from integrations.providers.website.service import process_website_intake
-from sdr.services import IntakeAlreadyProcessing, IntakeProcessingFailed
-
-logger = logging.getLogger(__name__)
+from integrations.providers.website.jobs import enqueue_website_intake
+from sdr.models import LeadIntakeStatus
 
 
 class WebsiteLeadIntakeView(APIView):
@@ -24,43 +20,35 @@ class WebsiteLeadIntakeView(APIView):
         tags=["SDR"],
         request=WebsiteLeadIntakeSerializer,
         responses={
-            200: WebsiteLeadIntakeResponseSerializer,
-            201: WebsiteLeadIntakeResponseSerializer,
-            202: WebsiteLeadIntakeResponseSerializer,
+            200: WebsiteLeadAcceptedSerializer,
+            202: WebsiteLeadAcceptedSerializer,
         },
         description=(
             "Submit a server-side website lead using the organization API key "
-            "in the Token request header. source_record_id is the idempotency key."
+            "in the Token request header. The lead is persisted before a 202 response "
+            "and processed asynchronously. source_record_id is the idempotency key."
         ),
     )
     def post(self, request):
         serializer = WebsiteLeadIntakeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        try:
-            result = process_website_intake(
-                org_id=request.org.id,
-                payload=serializer.validated_data,
-            )
-        except IntakeAlreadyProcessing as exc:
-            return Response(
-                {"intake_id": exc.intake_id, "status": "processing"},
-                status=status.HTTP_202_ACCEPTED,
-            )
-        except IntakeProcessingFailed as exc:
-            logger.exception("Website lead intake failed for org=%s", request.org.id)
-            return Response(
-                {
-                    "detail": "Lead intake failed and was retained for retry.",
-                    "intake_id": exc.intake_id,
-                    "status": "failed",
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        response = WebsiteLeadIntakeResponseSerializer(result).data
+        result = enqueue_website_intake(
+            org_id=request.org.id,
+            payload=serializer.validated_data,
+        )
+        response = WebsiteLeadAcceptedSerializer(
+            {
+                "intake_id": result.intake_id,
+                "job_id": result.job_id,
+                "status": result.status,
+                "lead_id": result.lead_id,
+                "replayed": result.replayed,
+                "status_url": f"/api/sdr/intakes/{result.intake_id}/",
+            }
+        ).data
         response_status = (
-            status.HTTP_201_CREATED
-            if result.crm_created and not result.replayed
-            else status.HTTP_200_OK
+            status.HTTP_200_OK
+            if result.status == LeadIntakeStatus.COMPLETED
+            else status.HTTP_202_ACCEPTED
         )
         return Response(response, status=response_status)

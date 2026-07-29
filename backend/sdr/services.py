@@ -1,5 +1,6 @@
 """Django application services for durable SDR intake processing."""
 
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Mapping
@@ -12,8 +13,14 @@ from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
 from sdr.domain import LeadCandidate
 from sdr.intelligence.service import LeadInspector
-from sdr.models import LeadIntake, LeadIntakeStatus
+from sdr.models import LeadIntake, LeadIntakeStatus, LeadLifecycleEventType
+from sdr.response import (
+    record_lifecycle_event,
+    schedule_post_handoff_jobs,
+)
 from sdr.routing import RuleBasedSalesRouter
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +35,14 @@ class LeadIntakeResult:
     routing_rule_id: UUID | None
     routing_reason: str
     replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LeadIntakeAcceptance:
+    intake_id: UUID
+    status: str
+    lead_id: UUID | None
+    replayed: bool
 
 
 class IntakeAlreadyProcessing(RuntimeError):
@@ -45,13 +60,72 @@ class IntakeProcessingFailed(RuntimeError):
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 
 
+def accept_candidate_intake(
+    *, candidate: LeadCandidate, raw_payload: Mapping[str, Any]
+) -> LeadIntakeAcceptance:
+    """Persist an inbound lead before scheduling any external work."""
+
+    lookup = {
+        "org_id": candidate.org_id,
+        "source": candidate.source.value,
+        "source_record_id": candidate.source_record_id,
+    }
+    with transaction.atomic():
+        try:
+            intake = LeadIntake.objects.select_for_update().get(**lookup)
+            created = False
+        except LeadIntake.DoesNotExist:
+            try:
+                with transaction.atomic():
+                    intake = LeadIntake.objects.create(
+                        **lookup,
+                        raw_payload=dict(raw_payload),
+                    )
+                created = True
+            except IntegrityError:
+                intake = LeadIntake.objects.select_for_update().get(**lookup)
+                created = False
+
+        record_lifecycle_event(
+            intake=intake,
+            event_type=LeadLifecycleEventType.RECEIVED,
+            event_key="received",
+            data={"source": candidate.source.value},
+        )
+        return LeadIntakeAcceptance(
+            intake_id=intake.id,
+            status=intake.status,
+            lead_id=intake.crm_lead_id,
+            replayed=not created,
+        )
+
+
 def process_candidate_intake(
     *, candidate: LeadCandidate, raw_payload: Mapping[str, Any]
 ) -> LeadIntakeResult:
     """Run any normalized provider lead through the durable SDR pipeline."""
     intake, replayed = _claim_intake(candidate=candidate, raw_payload=raw_payload)
+    record_lifecycle_event(
+        intake=intake,
+        event_type=LeadLifecycleEventType.RECEIVED,
+        event_key="received",
+        data={"source": candidate.source.value},
+    )
     if replayed:
+        try:
+            schedule_post_handoff_jobs(intake)
+        except Exception:
+            logger.exception(
+                "Could not reconcile response jobs for intake %s", intake.id
+            )
         return _result_from_intake(intake, replayed=True)
+
+    record_lifecycle_event(
+        intake=intake,
+        event_type=LeadLifecycleEventType.PROCESSING,
+        event_key=f"processing:{intake.attempt_count}",
+        data={"attempt": intake.attempt_count},
+    )
 
     inspector = LeadInspector.for_intake(intake)
     pipeline = LeadIntakePipeline(
@@ -70,6 +144,12 @@ def process_candidate_intake(
             status=LeadIntakeStatus.FAILED,
             error_message=str(exc)[:2000],
         )
+        record_lifecycle_event(
+            intake=intake,
+            event_type=LeadLifecycleEventType.FAILED,
+            event_key=f"failed:{intake.attempt_count}",
+            data={"error": (str(exc) or exc.__class__.__name__)[:500]},
+        )
         raise IntakeProcessingFailed(intake.id) from exc
 
     LeadIntake.objects.filter(id=intake.id, org_id=candidate.org_id).update(
@@ -87,6 +167,47 @@ def process_candidate_intake(
         processed_at=timezone.now(),
     )
     intake.refresh_from_db()
+    record_lifecycle_event(
+        intake=intake,
+        event_type=LeadLifecycleEventType.QUALIFIED,
+        event_key="qualified",
+        data={
+            "score": result.qualification.score,
+            "band": result.qualification.band.value,
+        },
+    )
+    if result.assignment.profile_id:
+        record_lifecycle_event(
+            intake=intake,
+            event_type=LeadLifecycleEventType.ASSIGNED,
+            event_key="assigned",
+            data={
+                "profile_id": str(result.assignment.profile_id),
+                "routing_rule_id": (
+                    str(result.assignment.rule_id)
+                    if result.assignment.rule_id
+                    else None
+                ),
+            },
+        )
+    record_lifecycle_event(
+        intake=intake,
+        event_type=LeadLifecycleEventType.CRM_HANDOFF,
+        event_key="crm_handoff",
+        data={
+            "lead_id": str(result.crm.lead_id),
+            "created": result.crm.created,
+        },
+    )
+    record_lifecycle_event(
+        intake=intake,
+        event_type=LeadLifecycleEventType.COMPLETED,
+        event_key="completed",
+    )
+    try:
+        schedule_post_handoff_jobs(intake)
+    except Exception:
+        logger.exception("Could not schedule response jobs for intake %s", intake.id)
     return _result_from_intake(intake)
 
 

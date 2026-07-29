@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
 from common.models import Profile
@@ -7,14 +8,21 @@ from common.utils import COUNTRIES
 from sdr.domain import LeadSource, QualificationBand
 from sdr.intelligence.registry import provider_catalog, provider_registry
 from sdr.models import (
+    LeadDelivery,
+    LeadDeliveryKind,
+    LeadDeliveryStatus,
     LeadInspection,
+    LeadIntake,
     LeadIntakeSource,
+    LeadLifecycleEvent,
     SDRIntelligenceSettings,
     SDRModelCredential,
     SDRModelProvider,
+    SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingRuleMember,
 )
+from sdr.response import validate_feishu_webhook_url, validate_message_template
 from sdr.routing.service import normalize_country
 
 VALID_COUNTRY_CODES = {code for code, _ in COUNTRIES}
@@ -385,3 +393,227 @@ class LeadInspectionSerializer(serializers.ModelSerializer):
             "created_at",
         )
         read_only_fields = fields
+
+
+class SDRResponseSettingsSerializer(serializers.ModelSerializer):
+    feishu_webhook_url = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=2000,
+    )
+    clear_feishu_webhook = serializers.BooleanField(
+        write_only=True,
+        required=False,
+        default=False,
+    )
+    feishu_configured = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SDRResponseSettings
+        fields = (
+            "acknowledgement_email_enabled",
+            "acknowledgement_subject",
+            "acknowledgement_body",
+            "acknowledgement_from_email",
+            "sales_in_app_enabled",
+            "feishu_enabled",
+            "feishu_webhook_url",
+            "clear_feishu_webhook",
+            "feishu_configured",
+            "feishu_webhook_hint",
+            "response_sla_seconds",
+            "updated_at",
+        )
+        read_only_fields = (
+            "feishu_configured",
+            "feishu_webhook_hint",
+            "updated_at",
+        )
+
+    def get_feishu_configured(self, obj):
+        return bool(obj.feishu_webhook_ciphertext)
+
+    def validate_acknowledgement_subject(self, value):
+        try:
+            return validate_message_template(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_acknowledgement_body(self, value):
+        try:
+            return validate_message_template(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_feishu_webhook_url(self, value):
+        if not value.strip():
+            return ""
+        try:
+            return validate_feishu_webhook_url(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        enabled = attrs.get(
+            "feishu_enabled",
+            getattr(self.instance, "feishu_enabled", False),
+        )
+        supplied = bool(attrs.get("feishu_webhook_url", "").strip())
+        clearing = attrs.get("clear_feishu_webhook", False)
+        configured = bool(
+            self.instance and self.instance.feishu_webhook_ciphertext and not clearing
+        )
+        if enabled and not (supplied or configured):
+            raise serializers.ValidationError(
+                {"feishu_webhook_url": "Configure a webhook before enabling Feishu."}
+            )
+        return attrs
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        webhook_url = validated_data.pop("feishu_webhook_url", "").strip()
+        clear_webhook = validated_data.pop("clear_feishu_webhook", False)
+        instance = super().update(instance, validated_data)
+        if webhook_url:
+            instance.set_feishu_webhook(webhook_url)
+            instance.save(
+                update_fields=[
+                    "feishu_webhook_ciphertext",
+                    "feishu_webhook_hint",
+                    "updated_at",
+                ]
+            )
+        elif clear_webhook:
+            instance.clear_feishu_webhook()
+            instance.feishu_enabled = False
+            instance.save(
+                update_fields=[
+                    "feishu_webhook_ciphertext",
+                    "feishu_webhook_hint",
+                    "feishu_enabled",
+                    "updated_at",
+                ]
+            )
+        return instance
+
+
+class LeadLifecycleEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadLifecycleEvent
+        fields = ("id", "event_type", "event_key", "data", "occurred_at")
+        read_only_fields = fields
+
+
+class LeadDeliverySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadDelivery
+        fields = (
+            "id",
+            "kind",
+            "recipient",
+            "status",
+            "attempt_count",
+            "last_error_code",
+            "last_error_message",
+            "sent_at",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
+class LeadIntakeOperationsSerializer(serializers.ModelSerializer):
+    lead_id = serializers.UUIDField(source="crm_lead_id", read_only=True)
+    assigned_profile_id = serializers.UUIDField(read_only=True, allow_null=True)
+    routing_rule_id = serializers.UUIDField(read_only=True, allow_null=True)
+    assigned_sales = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
+    contact_email = serializers.SerializerMethodField()
+    deliveries = LeadDeliverySerializer(many=True, read_only=True)
+    lifecycle_events = LeadLifecycleEventSerializer(many=True, read_only=True)
+    response_seconds = serializers.SerializerMethodField()
+    sla_breached = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeadIntake
+        fields = (
+            "id",
+            "source",
+            "source_record_id",
+            "status",
+            "attempt_count",
+            "lead_id",
+            "company_name",
+            "contact_email",
+            "assigned_profile_id",
+            "assigned_sales",
+            "qualification_score",
+            "qualification_band",
+            "routing_rule_id",
+            "routing_reason",
+            "error_message",
+            "response_seconds",
+            "sla_breached",
+            "deliveries",
+            "lifecycle_events",
+            "processed_at",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_assigned_sales(self, obj):
+        profile = obj.assigned_profile
+        if profile is None:
+            return None
+        return {
+            "id": str(profile.id),
+            "name": profile.user.name,
+            "email": profile.user.email,
+        }
+
+    def get_company_name(self, obj):
+        if obj.crm_lead:
+            return obj.crm_lead.company_name or obj.crm_lead.title or ""
+        return obj.normalized_payload.get("company", {}).get("name", "")
+
+    def get_contact_email(self, obj):
+        if obj.crm_lead and obj.crm_lead.email:
+            return obj.crm_lead.email
+        return (
+            obj.normalized_payload.get("identity", {}).get("email")
+            or obj.raw_payload.get("email")
+            or ""
+        )
+
+    def get_response_seconds(self, obj):
+        delivery = self._ack_delivery(obj)
+        if not delivery or not delivery.sent_at:
+            return None
+        return max(0, int((delivery.sent_at - obj.created_at).total_seconds()))
+
+    def get_sla_breached(self, obj):
+        configuration = self.context.get("response_settings")
+        if not configuration or not configuration.acknowledgement_email_enabled:
+            return False
+        if not self.get_contact_email(obj):
+            return False
+        response_seconds = self.get_response_seconds(obj)
+        if response_seconds is not None:
+            return response_seconds > configuration.response_sla_seconds
+        return (
+            timezone.now() - obj.created_at
+        ).total_seconds() > configuration.response_sla_seconds
+
+    @staticmethod
+    def _ack_delivery(obj):
+        return next(
+            (
+                delivery
+                for delivery in obj.deliveries.all()
+                if delivery.kind == LeadDeliveryKind.ACKNOWLEDGEMENT_EMAIL
+                and delivery.status == LeadDeliveryStatus.SENT
+            ),
+            None,
+        )

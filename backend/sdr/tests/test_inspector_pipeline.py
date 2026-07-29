@@ -1,10 +1,20 @@
 import pytest
 from django.test import override_settings
 
+from automation.tasks import run_automation_job
 from sdr.domain import QualificationBand, QualificationResult
 from sdr.intelligence.contracts import AIQualification
 from sdr.intelligence.research import ResearchResult
 from sdr.models import LeadInspection, SDRIntelligenceSettings
+
+
+def complete_accepted_intake(response, org, client):
+    assert response.status_code == 202
+    run_result = run_automation_job.apply(
+        args=[response.json()["job_id"], str(org.id)]
+    ).get()
+    assert run_result["status"] == "succeeded"
+    return client.get(f"/api/sdr/intakes/{response.json()['intake_id']}/")
 
 
 @pytest.mark.django_db
@@ -56,7 +66,7 @@ def test_inspector_enriches_scores_and_audits_real_intake(
         ),
     )
 
-    response = admin_client.post(
+    accepted = admin_client.post(
         "/api/sdr/intake/website/",
         {
             "source_record_id": "inspected-1",
@@ -67,10 +77,11 @@ def test_inspector_enriches_scores_and_audits_real_intake(
         },
         format="json",
     )
+    response = complete_accepted_intake(accepted, org_a, admin_client)
 
     inspection = LeadInspection.objects.select_related("intake__crm_lead").get()
     lead = inspection.intake.crm_lead
-    assert response.status_code == 201
+    assert response.status_code == 200
     assert response.json()["qualification_score"] == 91
     assert response.json()["qualification_band"] == "high"
     assert inspection.status == "completed"
@@ -111,7 +122,7 @@ def test_missing_openai_key_falls_back_without_losing_lead(admin_client, org_a):
         ai_scoring_enabled=True,
     )
 
-    response = admin_client.post(
+    accepted = admin_client.post(
         "/api/sdr/intake/website/",
         {
             "source_record_id": "inspected-fallback",
@@ -120,9 +131,10 @@ def test_missing_openai_key_falls_back_without_losing_lead(admin_client, org_a):
         },
         format="json",
     )
+    response = complete_accepted_intake(accepted, org_a, admin_client)
 
     inspection = LeadInspection.objects.select_related("intake").get()
-    assert response.status_code == 201
+    assert response.status_code == 200
     assert response.json()["lead_id"] is not None
     assert inspection.status == "partial"
     assert inspection.provider == "rules"

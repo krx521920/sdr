@@ -3,7 +3,10 @@ from django.urls import path
 from sdr.api.views import (
     LeadInspectionDetailView,
     LeadInspectionListView,
+    LeadIntakeDetailView,
+    LeadIntakeListView,
     SDRIntelligenceSettingsView,
+    SDRResponseSettingsView,
     SDRRoutingPreviewView,
     SDRRoutingRuleDetailView,
     SDRRoutingRuleListCreateView,
@@ -12,6 +15,17 @@ from sdr.api.views import (
 app_name = "api_sdr"
 
 urlpatterns = [
+    path(
+        "response-settings/",
+        SDRResponseSettingsView.as_view(),
+        name="response_settings",
+    ),
+    path("intakes/", LeadIntakeListView.as_view(), name="intake_list"),
+    path(
+        "intakes/<uuid:intake_id>/",
+        LeadIntakeDetailView.as_view(),
+        name="intake_detail",
+    ),
     path(
         "intelligence/settings/",
         SDRIntelligenceSettingsView.as_view(),

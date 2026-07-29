@@ -83,3 +83,5 @@ Public company research and AI-assisted qualification remain behind the SDR
 ports described in [lead-inspector.md](lead-inspector.md).
 Provider protocol translation, encrypted BYOK credentials, and failover are
 isolated behind the [SDR model gateway](model-gateway.md).
+Immediate website acceptance, lifecycle audit, acknowledgement, and sales
+handoff delivery are described in [lead-response-loop.md](lead-response-loop.md).

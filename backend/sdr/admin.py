@@ -1,13 +1,54 @@
 from django.contrib import admin
 
 from sdr.models import (
+    LeadDelivery,
     LeadInspection,
     LeadIntake,
+    LeadLifecycleEvent,
     SDRIntelligenceSettings,
     SDRModelCredential,
+    SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingRuleMember,
 )
+
+
+@admin.register(SDRResponseSettings)
+class SDRResponseSettingsAdmin(admin.ModelAdmin):
+    list_display = (
+        "org",
+        "acknowledgement_email_enabled",
+        "sales_in_app_enabled",
+        "feishu_enabled",
+        "response_sla_seconds",
+        "updated_at",
+    )
+    exclude = ("feishu_webhook_ciphertext",)
+    readonly_fields = ("feishu_webhook_hint",)
+
+
+@admin.register(LeadLifecycleEvent)
+class LeadLifecycleEventAdmin(admin.ModelAdmin):
+    list_display = ("intake", "org", "event_type", "event_key", "occurred_at")
+    list_filter = ("event_type",)
+    search_fields = ("intake__source_record_id", "event_key")
+    readonly_fields = ("data",)
+
+
+@admin.register(LeadDelivery)
+class LeadDeliveryAdmin(admin.ModelAdmin):
+    list_display = (
+        "intake",
+        "org",
+        "kind",
+        "recipient",
+        "status",
+        "attempt_count",
+        "sent_at",
+    )
+    list_filter = ("kind", "status")
+    search_fields = ("intake__source_record_id", "recipient")
+    readonly_fields = ("last_error_code", "last_error_message", "sent_at")
 
 
 @admin.register(SDRIntelligenceSettings)

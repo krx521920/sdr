@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from django.conf import settings
+from django.db.models import Count
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -11,7 +12,9 @@ from common.permissions import HasOrgContext, IsOrgAdmin
 from common.utils import COUNTRIES
 from sdr.api.serializers import (
     LeadInspectionSerializer,
+    LeadIntakeOperationsSerializer,
     SDRIntelligenceSettingsSerializer,
+    SDRResponseSettingsSerializer,
     SDRRoutingPreviewSerializer,
     SDRRoutingRuleSerializer,
 )
@@ -26,8 +29,11 @@ from sdr.domain import (
 from sdr.models import (
     LeadInspection,
     LeadInspectionStatus,
+    LeadIntake,
     LeadIntakeSource,
+    LeadIntakeStatus,
     SDRIntelligenceSettings,
+    SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingStrategy,
 )
@@ -265,3 +271,159 @@ class LeadInspectionDetailView(APIView):
         if inspection is None:
             return Response(status=status.HTTP_404_NOT_FOUND)
         return Response(LeadInspectionSerializer(inspection).data)
+
+
+class SDRResponseSettingsView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _get_configuration(request):
+        configuration, _ = SDRResponseSettings.objects.get_or_create(org=request.org)
+        return configuration
+
+    @extend_schema(
+        tags=["SDR Response"],
+        responses={200: SDRResponseSettingsSerializer},
+    )
+    def get(self, request):
+        return Response(
+            SDRResponseSettingsSerializer(self._get_configuration(request)).data
+        )
+
+    @extend_schema(
+        tags=["SDR Response"],
+        request=SDRResponseSettingsSerializer,
+        responses={200: SDRResponseSettingsSerializer},
+    )
+    def put(self, request):
+        return self._update(request, partial=False)
+
+    def patch(self, request):
+        return self._update(request, partial=True)
+
+    def _update(self, request, *, partial):
+        configuration = self._get_configuration(request)
+        serializer = SDRResponseSettingsSerializer(
+            configuration,
+            data=request.data,
+            partial=partial,
+        )
+        serializer.is_valid(raise_exception=True)
+        return Response(SDRResponseSettingsSerializer(serializer.save()).data)
+
+
+class LeadIntakeListView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["SDR Response"],
+        responses={200: LeadIntakeOperationsSerializer(many=True)},
+    )
+    def get(self, request):
+        base = LeadIntake.objects.filter(org=request.org)
+        summary = {
+            row["status"]: row["count"]
+            for row in base.values("status").annotate(count=Count("id"))
+        }
+        delivery_summary = {}
+        for row in (
+            base.values("deliveries__kind", "deliveries__status")
+            .exclude(deliveries__kind__isnull=True)
+            .annotate(count=Count("deliveries__id"))
+        ):
+            kind = row["deliveries__kind"]
+            delivery_summary.setdefault(kind, {})[row["deliveries__status"]] = row[
+                "count"
+            ]
+
+        queryset = base
+        status_filter = request.query_params.get("status", "").strip()
+        if status_filter in LeadIntakeStatus.values:
+            queryset = queryset.filter(status=status_filter)
+        source_filter = request.query_params.get("source", "").strip()
+        if source_filter in LeadIntakeSource.values:
+            queryset = queryset.filter(source=source_filter)
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 50)), 100))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            offset = max(0, int(request.query_params.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
+
+        count = queryset.count()
+        intakes = list(
+            queryset.select_related(
+                "crm_lead",
+                "assigned_profile__user",
+                "routing_rule",
+            )
+            .prefetch_related("deliveries", "lifecycle_events")
+            .order_by("-created_at")[offset : offset + limit]
+        )
+        response_configuration, _ = SDRResponseSettings.objects.get_or_create(
+            org=request.org
+        )
+        serialized = LeadIntakeOperationsSerializer(
+            intakes,
+            many=True,
+            context={"response_settings": response_configuration},
+        ).data
+        response_values = [
+            item["response_seconds"]
+            for item in serialized
+            if item["response_seconds"] is not None
+        ]
+        return Response(
+            {
+                "count": count,
+                "summary": summary,
+                "delivery_summary": delivery_summary,
+                "response_metrics": {
+                    "sample_size": len(serialized),
+                    "responded": len(response_values),
+                    "average_response_seconds": (
+                        round(sum(response_values) / len(response_values))
+                        if response_values
+                        else None
+                    ),
+                    "sla_breached": sum(
+                        1 for item in serialized if item["sla_breached"]
+                    ),
+                    "sla_seconds": response_configuration.response_sla_seconds,
+                },
+                "results": serialized,
+            }
+        )
+
+
+class LeadIntakeDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext)
+
+    @extend_schema(
+        tags=["SDR Response"],
+        responses={200: LeadIntakeOperationsSerializer},
+    )
+    def get(self, request, intake_id):
+        intake = (
+            LeadIntake.objects.filter(id=intake_id, org=request.org)
+            .select_related(
+                "crm_lead",
+                "assigned_profile__user",
+                "routing_rule",
+            )
+            .prefetch_related("deliveries", "lifecycle_events")
+            .first()
+        )
+        if intake is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        response_configuration, _ = SDRResponseSettings.objects.get_or_create(
+            org=request.org
+        )
+        return Response(
+            LeadIntakeOperationsSerializer(
+                intake,
+                context={"response_settings": response_configuration},
+            ).data
+        )
