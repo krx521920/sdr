@@ -147,6 +147,7 @@ class DjangoCRMWriter:
             "qualification_band": package.qualification.band.value,
             "qualification_reasons": list(package.qualification.reasons),
             "model_version": package.qualification.model_version,
+            "metadata": dict(package.qualification.metadata),
             "attributes": dict(candidate.attributes),
         }
         lead.custom_fields = custom_fields

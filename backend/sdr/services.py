@@ -11,10 +11,9 @@ from django.utils import timezone
 from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
 from sdr.domain import LeadCandidate
-from sdr.enrichment import EmailDomainEnricher
+from sdr.intelligence.service import LeadInspector
 from sdr.models import LeadIntake, LeadIntakeStatus
 from sdr.routing import RuleBasedSalesRouter
-from sdr.scoring import RuleBasedLeadScorer
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,16 +53,19 @@ def process_candidate_intake(
     if replayed:
         return _result_from_intake(intake, replayed=True)
 
+    inspector = LeadInspector.for_intake(intake)
     pipeline = LeadIntakePipeline(
         deduplicator=DjangoLeadDeduplicator(),
-        enricher=EmailDomainEnricher(),
-        scorer=RuleBasedLeadScorer(),
+        enricher=inspector,
+        scorer=inspector,
         router=RuleBasedSalesRouter(),
         writer=DjangoCRMWriter(),
     )
     try:
         result = pipeline.process(candidate)
+        inspector.complete(result.qualification)
     except Exception as exc:
+        inspector.fail(exc)
         LeadIntake.objects.filter(id=intake.id, org_id=candidate.org_id).update(
             status=LeadIntakeStatus.FAILED,
             error_message=str(exc)[:2000],

@@ -1,5 +1,6 @@
 """Durable intake records for reliable, tenant-scoped SDR processing."""
 
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
 from common.base import BaseOrgModel
@@ -100,6 +101,98 @@ class SDRRoutingRuleState(BaseOrgModel):
 
     class Meta:
         db_table = "sdr_routing_rule_state"
+
+
+class LeadInspectionStatus(models.TextChoices):
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+    PARTIAL = "partial", "Partial"
+    FAILED = "failed", "Failed"
+
+
+class SDRIntelligenceSettings(BaseOrgModel):
+    """Tenant ICP and cost/latency controls for the lead inspector."""
+
+    org = models.OneToOneField(
+        "common.Org",
+        on_delete=models.CASCADE,
+        related_name="sdr_intelligence_settings",
+    )
+    is_enabled = models.BooleanField(default=False)
+    research_enabled = models.BooleanField(default=True)
+    ai_scoring_enabled = models.BooleanField(default=True)
+    model = models.CharField(max_length=100, default="gpt-5.6-luna")
+    reasoning_effort = models.CharField(
+        max_length=16,
+        choices=[
+            ("none", "None"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("xhigh", "Extra high"),
+            ("max", "Maximum"),
+        ],
+        default="low",
+    )
+    icp_description = models.TextField(blank=True)
+    positive_signals = models.TextField(blank=True)
+    negative_signals = models.TextField(blank=True)
+    max_research_pages = models.PositiveSmallIntegerField(
+        default=2,
+        validators=[MinValueValidator(1), MaxValueValidator(3)],
+    )
+    website_timeout_seconds = models.PositiveSmallIntegerField(
+        default=5,
+        validators=[MinValueValidator(1), MaxValueValidator(15)],
+    )
+
+    class Meta:
+        db_table = "sdr_intelligence_settings"
+
+
+class LeadInspection(BaseOrgModel):
+    """Auditable research and qualification outcome for one intake."""
+
+    intake = models.OneToOneField(
+        "sdr.LeadIntake",
+        on_delete=models.CASCADE,
+        related_name="inspection",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=LeadInspectionStatus.choices,
+        default=LeadInspectionStatus.RUNNING,
+    )
+    website_url = models.URLField(max_length=1000, blank=True)
+    source_urls = models.JSONField(default=list, blank=True)
+    research_summary = models.TextField(blank=True)
+    research_facts = models.JSONField(default=dict, blank=True)
+    content_sha256 = models.CharField(max_length=64, blank=True)
+    provider = models.CharField(max_length=32, blank=True)
+    model = models.CharField(max_length=100, blank=True)
+    prompt_version = models.CharField(max_length=64, blank=True)
+    configuration_sha256 = models.CharField(max_length=64, blank=True)
+    provider_response_id = models.CharField(max_length=255, blank=True)
+    qualification_score = models.PositiveSmallIntegerField(null=True, blank=True)
+    qualification_band = models.CharField(max_length=32, blank=True)
+    qualification_reasons = models.JSONField(default=list, blank=True)
+    used_fallback = models.BooleanField(default=False)
+    error_code = models.CharField(max_length=80, blank=True)
+    error_message = models.CharField(max_length=1000, blank=True)
+    input_tokens = models.PositiveIntegerField(null=True, blank=True)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sdr_lead_inspection"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(
+                fields=["org", "status", "-created_at"],
+                name="sdr_inspect_org_status_idx",
+            )
+        ]
 
 
 class LeadIntake(BaseOrgModel):

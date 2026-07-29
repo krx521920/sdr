@@ -65,6 +65,7 @@ class QualificationResult:
     band: QualificationBand
     reasons: tuple[str, ...] = ()
     model_version: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not 0 <= self.score <= 100:

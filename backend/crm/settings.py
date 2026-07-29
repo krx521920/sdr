@@ -402,6 +402,31 @@ META_OAUTH_SCOPES = tuple(
     if scope.strip()
 )
 
+# OpenAI-backed SDR lead inspection. The API key is deployment-owned; tenant
+# administrators control only their ICP, model, and per-lead research limits.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_BASE_URL = os.environ.get(
+    "OPENAI_API_BASE_URL", "https://api.openai.com/v1"
+).rstrip("/")
+OPENAI_API_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("OPENAI_API_TIMEOUT_SECONDS", "30"))
+)
+OPENAI_ALLOWED_MODELS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "OPENAI_ALLOWED_MODELS",
+        "gpt-5.6-luna,gpt-5.6-terra,gpt-5.6-sol",
+    ).split(",")
+    if value.strip()
+) or ("gpt-5.6-luna",)
+OPENAI_ALLOWED_REASONING_EFFORTS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "OPENAI_ALLOWED_REASONING_EFFORTS", "none,low,medium"
+    ).split(",")
+    if value.strip() in {"none", "low", "medium", "high", "xhigh", "max"}
+) or ("low",)
+
 # Durable automation jobs are persisted before broker dispatch. Handlers are
 # deployment-owned allow-list entries rather than arbitrary dotted paths from
 # user input.

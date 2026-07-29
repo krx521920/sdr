@@ -1171,6 +1171,14 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/sdr-intelligence')}
+                class="gap-2.5"
+              >
+                <Sparkles class="size-4" />
+                <span>AI Lead Inspector</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >
