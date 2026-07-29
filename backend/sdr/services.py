@@ -8,11 +8,12 @@ from uuid import UUID
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator, LeastLoadedSalesRouter
+from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
 from sdr.domain import LeadCandidate
 from sdr.enrichment import EmailDomainEnricher
 from sdr.models import LeadIntake, LeadIntakeStatus
+from sdr.routing import RuleBasedSalesRouter
 from sdr.scoring import RuleBasedLeadScorer
 
 
@@ -25,6 +26,8 @@ class LeadIntakeResult:
     qualification_score: int | None
     qualification_band: str
     assigned_profile_id: UUID | None
+    routing_rule_id: UUID | None
+    routing_reason: str
     replayed: bool = False
 
 
@@ -55,7 +58,7 @@ def process_candidate_intake(
         deduplicator=DjangoLeadDeduplicator(),
         enricher=EmailDomainEnricher(),
         scorer=RuleBasedLeadScorer(),
-        router=LeastLoadedSalesRouter(),
+        router=RuleBasedSalesRouter(),
         writer=DjangoCRMWriter(),
     )
     try:
@@ -77,6 +80,8 @@ def process_candidate_intake(
         crm_created=result.crm.created,
         crm_lead_id=result.crm.lead_id,
         assigned_profile_id=result.assignment.profile_id,
+        routing_rule_id=result.assignment.rule_id,
+        routing_reason=result.assignment.reason,
         processed_at=timezone.now(),
     )
     intake.refresh_from_db()
@@ -161,5 +166,7 @@ def _result_from_intake(intake: LeadIntake, *, replayed: bool = False):
         qualification_score=intake.qualification_score,
         qualification_band=intake.qualification_band,
         assigned_profile_id=intake.assigned_profile_id,
+        routing_rule_id=intake.routing_rule_id,
+        routing_reason=intake.routing_reason,
         replayed=replayed,
     )

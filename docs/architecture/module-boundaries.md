@@ -77,3 +77,5 @@ CRM adapters may translate domain values into these Django models.
 
 The durable execution work in step 3 is implemented by the tenant-scoped job
 ledger described in [durable-automation-jobs.md](durable-automation-jobs.md).
+Country/source/qualification assignment is implemented inside the `sdr`
+boundary as described in [sdr-routing.md](sdr-routing.md).

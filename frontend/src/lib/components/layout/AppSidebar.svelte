@@ -1163,6 +1163,14 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/sdr-routing')}
+                class="gap-2.5"
+              >
+                <Route class="size-4" />
+                <span>SDR Routing</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >

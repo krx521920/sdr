@@ -37,4 +37,6 @@ class WebsiteLeadIntakeResponseSerializer(serializers.Serializer):
     qualification_score = serializers.IntegerField(allow_null=True)
     qualification_band = serializers.CharField(allow_blank=True)
     assigned_profile_id = serializers.UUIDField(allow_null=True)
+    routing_rule_id = serializers.UUIDField(allow_null=True)
+    routing_reason = serializers.CharField(allow_blank=True)
     replayed = serializers.BooleanField()
