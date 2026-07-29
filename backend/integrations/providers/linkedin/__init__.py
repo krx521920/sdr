@@ -1,0 +1,1 @@
+"""LinkedIn lead adapter boundary."""

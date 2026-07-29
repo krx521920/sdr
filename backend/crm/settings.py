@@ -39,6 +39,11 @@ INSTALLED_APPS = [
     "django_ses",
     "drf_spectacular",
     "common",
+    # New bounded contexts. They intentionally contain no database models yet;
+    # existing CRM tables stay in their original apps during the migration.
+    "sdr.apps.SDRConfig",
+    "integrations.apps.IntegrationsConfig",
+    "automation.apps.AutomationConfig",
     "accounts",
     "cases",
     "contacts",
@@ -149,7 +154,7 @@ if ENV_TYPE == "dev":
     MEDIA_ROOT = os.path.join(BASE_DIR, "media")
     MEDIA_URL = "/media/"
 elif ENV_TYPE == "prod":
-    from .server_settings import *  # noqa: F401
+    from .server_settings import *  # noqa: F401,F403
 
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@localhost")

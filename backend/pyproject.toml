@@ -95,28 +95,34 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = [
     "accounts",
+    "automation",
     "cases",
     "common",
     "contacts",
     "crm",
+    "integrations",
     "invoices",
     "leads",
     "opportunity",
     "orders",
+    "sdr",
     "tasks",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "accounts/",
+    "automation/",
     "cases/",
     "common/",
     "contacts/",
     "crm/",
+    "integrations/",
     "invoices/",
     "leads/",
     "opportunity/",
     "orders/",
+    "sdr/",
     "tasks/",
     "static/",
     "templates/",
