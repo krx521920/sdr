@@ -57,6 +57,8 @@ ORG_SCOPED_TABLES = [
     "email_message",
     "routing_rule",
     "routing_rule_state",
+    # SDR intake ledger
+    "sdr_lead_intake",
     # Boards (Kanban)
     "board",
     "board_column",

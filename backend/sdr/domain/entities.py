@@ -85,3 +85,19 @@ class HandoffPackage:
     qualification: QualificationResult
     assignment: AssignmentDecision
     existing_lead_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CRMWriteResult:
+    lead_id: UUID
+    created: bool
+    contact_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineResult:
+    candidate: LeadCandidate
+    crm: CRMWriteResult
+    qualification: QualificationResult
+    assignment: AssignmentDecision
+    existing_lead_id: UUID | None = None

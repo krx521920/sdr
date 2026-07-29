@@ -9,6 +9,7 @@ urlpatterns = [
     path("accounts/", include("accounts.urls", namespace="api_accounts")),
     path("contacts/", include("contacts.urls", namespace="api_contacts")),
     path("leads/", include("leads.urls", namespace="api_leads")),
+    path("sdr/", include("sdr.urls", namespace="api_sdr")),
     path("opportunities/", include("opportunity.urls", namespace="api_opportunities")),
     # Teams URLs are now in common app at /api/teams/
     path("tasks/", include("tasks.urls", namespace="api_tasks")),

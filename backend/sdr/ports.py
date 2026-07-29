@@ -5,6 +5,7 @@ from uuid import UUID
 
 from sdr.domain import (
     AssignmentDecision,
+    CRMWriteResult,
     HandoffPackage,
     IngestionBatch,
     LeadCandidate,
@@ -35,4 +36,4 @@ class RoutingPort(Protocol):
 
 
 class CRMWriterPort(Protocol):
-    def write_handoff(self, package: HandoffPackage) -> UUID: ...
+    def write_handoff(self, package: HandoffPackage) -> CRMWriteResult: ...

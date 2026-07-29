@@ -186,17 +186,6 @@ class LeadCreateSwaggerSerializer(serializers.ModelSerializer):
         ]
 
 
-class CreateLeadFromSiteSwaggerSerializer(serializers.Serializer):
-    apikey = serializers.CharField()
-    title = serializers.CharField()
-    first_name = serializers.CharField()
-    last_name = serializers.CharField()
-    phone = serializers.CharField()
-    email = serializers.CharField()
-    source = serializers.CharField()
-    description = serializers.CharField()
-
-
 class LeadDetailEditSwaggerSerializer(serializers.Serializer):
     comment = serializers.CharField()
     lead_attachment = serializers.FileField()

@@ -1,21 +1,21 @@
 from django.urls import path
 
+from leads.views.kanban_views import (
+    LeadKanbanView,
+    LeadMoveView,
+    LeadPipelineDetailView,
+    LeadPipelineListCreateView,
+    LeadStageCreateView,
+    LeadStageDetailView,
+    LeadStageReorderView,
+)
 from leads.views.lead_interactions import (
-    CreateLeadFromSite,
     LeadAttachmentView,
     LeadCommentView,
     LeadUploadView,
 )
 from leads.views.lead_views import LeadDetailView, LeadListView
-from leads.views.kanban_views import (
-    LeadKanbanView,
-    LeadMoveView,
-    LeadPipelineListCreateView,
-    LeadPipelineDetailView,
-    LeadStageCreateView,
-    LeadStageDetailView,
-    LeadStageReorderView,
-)
+from sdr.api.views import WebsiteLeadIntakeView
 
 app_name = "api_leads"
 
@@ -23,7 +23,7 @@ urlpatterns = [
     # Lead from external site
     path(
         "create-from-site/",
-        CreateLeadFromSite.as_view(),
+        WebsiteLeadIntakeView.as_view(),
         name="create_lead_from_site",
     ),
     # Lead list and bulk operations
