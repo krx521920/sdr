@@ -5,6 +5,8 @@ import json
 import pytest
 from django.test import override_settings
 
+from integrations.models import FacebookOAuthSessionStatus
+
 
 @override_settings(
     ROOT_URLCONF="integrations.tests.urls",
@@ -117,3 +119,56 @@ def test_only_org_admin_can_connect_page(
     assert "page_access_token" not in created.json()
     assert "access_token_ciphertext" not in created.json()
     assert org_b_client.get("/api/integrations/facebook/pages/").json() == []
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    META_APP_ID="app-123",
+    META_APP_SECRET="app-secret",
+    META_OAUTH_DIALOG_URL="https://www.facebook.com/v25.0/dialog/oauth",
+    META_OAUTH_REDIRECT_URI="https://api.example.com/api/integrations/facebook/oauth/callback/",
+    META_OAUTH_FRONTEND_REDIRECT_URL="https://app.example.com/settings/facebook",
+    META_OAUTH_STATE_TTL=900,
+    META_OAUTH_SCOPES=("pages_show_list", "pages_manage_metadata", "leads_retrieval"),
+)
+def test_admin_can_start_oauth_but_regular_user_cannot(admin_client, user_client):
+    denied = user_client.post("/api/integrations/facebook/oauth/start/")
+    created = admin_client.post("/api/integrations/facebook/oauth/start/")
+
+    assert denied.status_code == 403
+    assert created.status_code == 201
+    assert created.json()["authorization_url"].startswith("https://www.facebook.com/")
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    META_OAUTH_FRONTEND_REDIRECT_URL="https://app.example.com/settings/facebook",
+)
+def test_oauth_callback_redirects_to_page_selection(
+    unauthenticated_client, monkeypatch
+):
+    oauth_session = type(
+        "OAuthSession",
+        (),
+        {
+            "id": "7ea3d47b-6079-4bdb-9498-fce5ec13352a",
+            "status": FacebookOAuthSessionStatus.READY,
+        },
+    )()
+    monkeypatch.setattr(
+        "integrations.api.views.finish_facebook_oauth",
+        lambda code, state: oauth_session,
+    )
+
+    response = unauthenticated_client.get(
+        "/api/integrations/facebook/oauth/callback/",
+        {"code": "oauth-code", "state": "signed-state"},
+    )
+
+    assert response.status_code == 302
+    assert response.url == (
+        "https://app.example.com/settings/facebook?"
+        "facebook_oauth_session=7ea3d47b-6079-4bdb-9498-fce5ec13352a"
+    )

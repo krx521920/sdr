@@ -1147,6 +1147,14 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/facebook')}
+                class="gap-2.5"
+              >
+                <Megaphone class="size-4" />
+                <span>Facebook Leads</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >

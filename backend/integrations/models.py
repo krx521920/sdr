@@ -1,5 +1,6 @@
 """Tenant connections and global webhook routing metadata."""
 
+import json
 import uuid
 
 from django.core.exceptions import ValidationError
@@ -68,3 +69,58 @@ class FacebookPageConnection(BaseOrgModel):
 
     def __str__(self) -> str:
         return self.page_name or self.page_id
+
+
+class FacebookOAuthSessionStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    EXCHANGING = "exchanging", "Exchanging"
+    READY = "ready", "Ready"
+    SELECTING = "selecting", "Selecting"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+    EXPIRED = "expired", "Expired"
+
+
+class FacebookOAuthSession(BaseOrgModel):
+    """Short-lived encrypted handoff between Meta OAuth and Page selection."""
+
+    initiated_by_profile = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.CASCADE,
+        related_name="facebook_oauth_sessions",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=FacebookOAuthSessionStatus.choices,
+        default=FacebookOAuthSessionStatus.PENDING,
+    )
+    pages_snapshot = models.JSONField(default=list)
+    page_tokens_ciphertext = models.TextField(blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error_message = models.TextField(blank=True)
+    expires_at = models.DateTimeField()
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "integration_facebook_oauth_session"
+        ordering = ("-created_at",)
+        indexes = [models.Index(fields=["org", "status", "-created_at"])]
+
+    def set_page_credentials(self, pages: list[dict]) -> None:
+        self.page_tokens_ciphertext = encrypt_secret(
+            json.dumps(pages, separators=(",", ":"), ensure_ascii=False)
+        )
+
+    def get_page_credentials(self) -> list[dict]:
+        if not self.page_tokens_ciphertext:
+            return []
+        pages = json.loads(decrypt_secret(self.page_tokens_ciphertext))
+        if not isinstance(pages, list):
+            raise ValueError("stored Facebook Page credentials are invalid")
+        return pages
+
+    def clear_page_credentials(self) -> None:
+        self.page_tokens_ciphertext = ""
+
+    def __str__(self) -> str:
+        return f"{self.org_id}:{self.status}"

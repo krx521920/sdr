@@ -124,6 +124,9 @@ class RequireOrgContext:
         # Meta signs the request body; the Page id is then resolved to an org
         # and RLS context is set explicitly by the background integration job.
         "/api/integrations/facebook/webhook/",
+        # Signed state binds the public Meta OAuth callback to the tenant; the
+        # callback sets that tenant's RLS context before reading its session.
+        "/api/integrations/facebook/oauth/callback/",
     ]
 
     def __init__(self, get_response):

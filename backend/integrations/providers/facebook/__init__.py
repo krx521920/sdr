@@ -8,6 +8,7 @@ from integrations.providers.facebook.adapter import (
 from integrations.providers.facebook.client import (
     FacebookGraphAPIError,
     FacebookGraphClient,
+    FacebookOAuthToken,
 )
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "FacebookGraphClient",
     "FacebookLeadAdsAdapter",
     "FacebookLeadEvent",
+    "FacebookOAuthToken",
     "FacebookWebhookError",
 ]

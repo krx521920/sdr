@@ -33,6 +33,7 @@ class FacebookConnectionUnavailable(LookupError):
 
 def graph_client() -> FacebookGraphClient:
     return FacebookGraphClient(
+        app_id=settings.META_APP_ID,
         app_secret=settings.META_APP_SECRET,
         api_version=settings.META_GRAPH_API_VERSION,
         base_url=settings.META_GRAPH_API_BASE_URL,

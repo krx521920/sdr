@@ -20,12 +20,12 @@ class FakeResponse:
 
 class FakeSession:
     def __init__(self, response):
-        self.response = response
+        self.responses = response if isinstance(response, list) else [response]
         self.calls = []
 
     def request(self, method, url, *, params, timeout):
         self.calls.append((method, url, params, timeout))
-        return self.response
+        return self.responses.pop(0)
 
 
 def test_graph_client_pins_version_and_sends_appsecret_proof():
@@ -79,3 +79,61 @@ def test_graph_client_marks_rate_limits_for_retry():
 
     assert error.value.retryable is True
     assert error.value.status_code == 429
+
+
+def test_graph_client_exchanges_code_for_long_lived_user_token():
+    session = FakeSession(
+        [
+            FakeResponse(200, {"access_token": "short-token", "expires_in": 3600}),
+            FakeResponse(200, {"access_token": "long-token", "expires_in": 5_184_000}),
+        ]
+    )
+    client = FacebookGraphClient(
+        app_id="app-123",
+        app_secret="secret",
+        api_version="v25.0",
+        session=session,
+    )
+
+    token = client.exchange_oauth_code(
+        code="authorization-code",
+        redirect_uri="https://crm.example.com/callback",
+    )
+
+    assert token.access_token == "long-token"
+    assert token.expires_in == 5_184_000
+    assert len(session.calls) == 2
+    assert session.calls[0][2]["code"] == "authorization-code"
+    assert session.calls[1][2]["fb_exchange_token"] == "short-token"
+
+
+def test_graph_client_fetches_all_managed_page_pages():
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": [{"id": "page-1", "access_token": "token-1"}],
+                    "paging": {
+                        "cursors": {"after": "cursor-2"},
+                        "next": "https://graph.facebook.com/next",
+                    },
+                },
+            ),
+            FakeResponse(
+                200,
+                {"data": [{"id": "page-2", "access_token": "token-2"}]},
+            ),
+        ]
+    )
+    client = FacebookGraphClient(
+        app_id="app-123",
+        app_secret="secret",
+        api_version="v25.0",
+        session=session,
+    )
+
+    pages = client.fetch_managed_pages(user_access_token="user-token")
+
+    assert [page["id"] for page in pages] == ["page-1", "page-2"]
+    assert session.calls[1][2]["after"] == "cursor-2"

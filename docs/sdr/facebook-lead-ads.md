@@ -7,9 +7,10 @@ used by website forms.
 
 ## Delivered scope
 
-- Organization administrators can connect a Facebook Page with a Page access
-  token. The backend validates the token against Meta and subscribes the Page
-  to the `leadgen` webhook field.
+- Organization administrators can authorize Meta from the CRM settings page,
+  review the Pages they manage, and choose which Pages belong to the company
+  workspace. A manual Page-token endpoint remains available as an operations
+  fallback.
 - Page tokens are encrypted at rest and never returned by the API.
 - The public webhook supports Meta's verification challenge and validates
   `X-Hub-Signature-256` against the raw request body.
@@ -19,9 +20,10 @@ used by website forms.
   company fields are mapped into the shared SDR domain before scoring and CRM
   handoff.
 
-This slice intentionally uses an administrator-supplied Page token. The
-customer-facing Meta Login/OAuth selection screen is a separate UI/onboarding
-slice; it can call the same connection service after obtaining Page tokens.
+- OAuth state is signed, expires after 15 minutes by default, and can be used
+  only once. Discovered Page tokens are encrypted in a short-lived server-side
+  session, never sent to the browser, and destroyed immediately after Page
+  selection.
 
 ## Environment
 
@@ -32,6 +34,11 @@ META_WEBHOOK_VERIFY_TOKEN="a-long-random-verification-token"
 META_GRAPH_API_VERSION="v25.0"
 META_GRAPH_API_BASE_URL="https://graph.facebook.com"
 META_GRAPH_API_TIMEOUT="10"
+META_OAUTH_DIALOG_URL="https://www.facebook.com/v25.0/dialog/oauth"
+META_OAUTH_REDIRECT_URI="https://api.example.com/api/integrations/facebook/oauth/callback/"
+META_OAUTH_FRONTEND_REDIRECT_URL="https://app.example.com/settings/facebook"
+META_OAUTH_STATE_TTL="900"
+META_OAUTH_SCOPES="pages_show_list,pages_manage_metadata,leads_retrieval"
 INTEGRATION_ENCRYPTION_KEY="a-valid-fernet-key"
 ```
 
@@ -48,21 +55,45 @@ development only, an omitted value falls back to a key derived from Django's
 ## Meta configuration
 
 1. Create a Meta Business app and add the Webhooks/Lead Ads products.
-2. Configure this HTTPS callback URL:
+2. Add the exact OAuth redirect URL from `META_OAUTH_REDIRECT_URI` to the Meta
+   app's valid OAuth redirect URIs.
+3. Configure this HTTPS webhook callback URL:
    `https://<api-host>/api/integrations/facebook/webhook/`.
-3. Enter the exact value configured as `META_WEBHOOK_VERIFY_TOKEN`.
-4. Request the permissions Meta requires for Page discovery, Page webhook
+4. Enter the exact value configured as `META_WEBHOOK_VERIFY_TOKEN`.
+5. Request the permissions Meta requires for Page discovery, Page webhook
    subscription, and lead retrieval. At the time this connector was built,
    those commonly include `pages_show_list`, `pages_manage_metadata`, and
    `leads_retrieval`; production access is subject to Meta App Review and
    business verification.
-5. Run a Celery worker connected to the configured broker.
+6. Run a Celery worker connected to the configured broker.
 
 The Graph API version is explicit because Meta versions and permission rules
 change. Upgrade `META_GRAPH_API_VERSION` only after running the provider tests
 against a Meta test Page.
 
-## Connect a Page
+## Customer self-service connection
+
+An organization administrator opens `/settings/facebook` and selects
+**Connect with Facebook**. The application then performs this flow:
+
+1. `POST /api/integrations/facebook/oauth/start/` creates a tenant-owned,
+   expiring authorization session and returns the Meta authorization URL.
+2. Meta returns to `GET /api/integrations/facebook/oauth/callback/`. The
+   backend validates the signed state, exchanges the code, discovers managed
+   Pages, and redirects back to the CRM settings page.
+3. The settings page reads the sanitized Page list from
+   `GET /api/integrations/facebook/oauth/sessions/<session-id>/`.
+4. The administrator chooses Pages and submits
+   `POST /api/integrations/facebook/oauth/sessions/<session-id>/select/` with
+   `{"page_ids": ["..."]}`. Each Page is validated, subscribed to `leadgen`,
+   and stored with its token encrypted at rest.
+
+The callback is public because Meta calls it, but it cannot select a tenant
+from query parameters alone: the signed state binds the session, organization,
+and initiating administrator. Session lookup and Page selection remain
+tenant-scoped and administrator-only.
+
+## Manual operations fallback
 
 Only an organization administrator may call this endpoint:
 

@@ -380,6 +380,27 @@ META_GRAPH_API_BASE_URL = os.environ.get(
     "META_GRAPH_API_BASE_URL", "https://graph.facebook.com"
 )
 META_GRAPH_API_TIMEOUT = float(os.environ.get("META_GRAPH_API_TIMEOUT", "10"))
+META_OAUTH_DIALOG_URL = os.environ.get(
+    "META_OAUTH_DIALOG_URL",
+    f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth",
+)
+META_OAUTH_REDIRECT_URI = os.environ.get(
+    "META_OAUTH_REDIRECT_URI",
+    f"{DOMAIN_NAME.rstrip('/')}/api/integrations/facebook/oauth/callback/",
+)
+META_OAUTH_FRONTEND_REDIRECT_URL = os.environ.get(
+    "META_OAUTH_FRONTEND_REDIRECT_URL",
+    f"{FRONTEND_URL.rstrip('/')}/settings/facebook",
+)
+META_OAUTH_STATE_TTL = int(os.environ.get("META_OAUTH_STATE_TTL", "900"))
+META_OAUTH_SCOPES = tuple(
+    scope.strip()
+    for scope in os.environ.get(
+        "META_OAUTH_SCOPES",
+        "pages_show_list,pages_manage_metadata,leads_retrieval",
+    ).split(",")
+    if scope.strip()
+)
 
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # When omitted, dev falls back to a key derived from SECRET_KEY. Production

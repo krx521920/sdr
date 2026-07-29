@@ -62,6 +62,7 @@ ORG_SCOPED_TABLES = [
     # Tenant-owned external credentials. The companion Page route is
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.
     "integration_facebook_page_connection",
+    "integration_facebook_oauth_session",
     # Boards (Kanban)
     "board",
     "board_column",

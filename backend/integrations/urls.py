@@ -1,6 +1,10 @@
 from django.urls import path
 
 from integrations.api.views import (
+    FacebookOAuthCallbackView,
+    FacebookOAuthPageSelectionView,
+    FacebookOAuthSessionView,
+    FacebookOAuthStartView,
     FacebookPageConnectionDetailView,
     FacebookPageConnectionListCreateView,
     FacebookWebhookView,
@@ -9,6 +13,26 @@ from integrations.api.views import (
 app_name = "api_integrations"
 
 urlpatterns = [
+    path(
+        "facebook/oauth/start/",
+        FacebookOAuthStartView.as_view(),
+        name="facebook_oauth_start",
+    ),
+    path(
+        "facebook/oauth/callback/",
+        FacebookOAuthCallbackView.as_view(),
+        name="facebook_oauth_callback",
+    ),
+    path(
+        "facebook/oauth/sessions/<uuid:session_id>/",
+        FacebookOAuthSessionView.as_view(),
+        name="facebook_oauth_session",
+    ),
+    path(
+        "facebook/oauth/sessions/<uuid:session_id>/select/",
+        FacebookOAuthPageSelectionView.as_view(),
+        name="facebook_oauth_select_pages",
+    ),
     path(
         "facebook/pages/",
         FacebookPageConnectionListCreateView.as_view(),
