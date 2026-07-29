@@ -74,4 +74,10 @@ app.conf.beat_schedule = {
         "task": "common.tasks.flush_expired_refresh_tokens",
         "schedule": crontab(hour=3, minute=30),
     },
+    # Recover persisted automation jobs if a broker publish or worker lease was
+    # lost. Idempotent claims make duplicate deliveries safe.
+    "dispatch-due-automation-jobs": {
+        "task": "automation.dispatch_due_jobs",
+        "schedule": crontab(minute="*"),
+    },
 }

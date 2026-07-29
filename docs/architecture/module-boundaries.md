@@ -75,3 +75,5 @@ CRM adapters may translate domain values into these Django models.
 5. Split large route/view files behind application services without changing
    public API contracts.
 
+The durable execution work in step 3 is implemented by the tenant-scoped job
+ledger described in [durable-automation-jobs.md](durable-automation-jobs.md).

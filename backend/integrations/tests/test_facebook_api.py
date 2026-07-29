@@ -54,7 +54,7 @@ def test_signed_webhook_is_enqueued(unauthenticated_client, monkeypatch):
     signature = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
     queued = []
     monkeypatch.setattr(
-        "integrations.api.views.process_facebook_lead.delay", queued.append
+        "integrations.api.views.enqueue_facebook_lead_event", queued.append
     )
 
     response = unauthenticated_client.generic(

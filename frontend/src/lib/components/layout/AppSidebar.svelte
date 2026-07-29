@@ -1155,6 +1155,14 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/automation')}
+                class="gap-2.5"
+              >
+                <Activity class="size-4" />
+                <span>Automation Jobs</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >

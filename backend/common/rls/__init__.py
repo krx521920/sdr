@@ -63,6 +63,9 @@ ORG_SCOPED_TABLES = [
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.
     "integration_facebook_page_connection",
     "integration_facebook_oauth_session",
+    # Durable tenant workflow state and attempt audit history.
+    "automation_job",
+    "automation_job_attempt",
     # Boards (Kanban)
     "board",
     "board_column",

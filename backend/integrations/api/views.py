@@ -23,6 +23,7 @@ from integrations.providers.facebook.adapter import (
     FacebookWebhookError,
 )
 from integrations.providers.facebook.client import FacebookGraphAPIError
+from integrations.providers.facebook.jobs import enqueue_facebook_lead_event
 from integrations.providers.facebook.oauth import (
     FacebookOAuthConfigurationError,
     FacebookOAuthSelectionError,
@@ -32,11 +33,11 @@ from integrations.providers.facebook.oauth import (
     start_facebook_oauth,
 )
 from integrations.providers.facebook.service import (
+    FacebookConnectionUnavailable,
     FacebookPageAlreadyConnected,
     FacebookPageIdentityMismatch,
     connect_facebook_page,
 )
-from integrations.tasks import process_facebook_lead
 
 logger = logging.getLogger(__name__)
 
@@ -289,9 +290,15 @@ class FacebookWebhookView(APIView):
 
         try:
             for event in events:
-                process_facebook_lead.delay(event.as_payload())
+                try:
+                    enqueue_facebook_lead_event(event.as_payload())
+                except FacebookConnectionUnavailable:
+                    logger.warning(
+                        "Ignoring Facebook lead webhook for an unconnected Page: %s",
+                        event.page_id,
+                    )
         except Exception:
-            logger.exception("Could not enqueue Facebook lead webhook")
+            logger.exception("Could not persist or dispatch Facebook lead webhook")
             return Response(
                 {"detail": "Lead processing queue is unavailable."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,

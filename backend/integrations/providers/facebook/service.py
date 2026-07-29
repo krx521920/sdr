@@ -9,13 +9,13 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from automation.tenant_context import database_org_context
 from integrations.models import FacebookPageConnection, FacebookPageRoute
 from integrations.providers.facebook.adapter import (
     FacebookLeadAdsAdapter,
     FacebookLeadEvent,
 )
 from integrations.providers.facebook.client import FacebookGraphClient
-from integrations.tenant_context import database_org_context
 from sdr.services import LeadIntakeResult, process_candidate_intake
 
 
@@ -117,6 +117,7 @@ def _store_facebook_page(
 def process_facebook_lead_event(
     *,
     event_payload: Mapping[str, Any],
+    expected_org_id: UUID | None = None,
     client: FacebookGraphClient | None = None,
 ) -> LeadIntakeResult:
     """Resolve the tenant, fetch the lead, and run the shared SDR pipeline."""
@@ -141,6 +142,10 @@ def process_facebook_lead_event(
         raise FacebookConnectionUnavailable(
             "No organization is connected to this Facebook Page"
         ) from exc
+    if expected_org_id is not None and route.org_id != expected_org_id:
+        raise FacebookConnectionUnavailable(
+            "The Facebook Page is no longer connected to the job's organization"
+        )
 
     with database_org_context(route.org_id):
         try:

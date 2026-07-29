@@ -17,6 +17,10 @@ urlpatterns = [
     ),
     path("sdr/", include("sdr.urls", namespace="api_sdr")),
     path(
+        "automation/",
+        include("automation.urls", namespace="api_automation"),
+    ),
+    path(
         "integrations/",
         include("integrations.urls", namespace="api_integrations"),
     ),

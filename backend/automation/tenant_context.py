@@ -1,4 +1,4 @@
-"""Explicit database tenant context for background and webhook processing."""
+"""PostgreSQL RLS context for jobs running outside request middleware."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,8 +9,6 @@ from django.db import connection
 
 @contextmanager
 def database_org_context(org_id: UUID) -> Iterator[None]:
-    """Temporarily set the PostgreSQL RLS tenant outside request middleware."""
-
     if connection.vendor != "postgresql":
         yield
         return

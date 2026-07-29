@@ -402,6 +402,28 @@ META_OAUTH_SCOPES = tuple(
     if scope.strip()
 )
 
+# Durable automation jobs are persisted before broker dispatch. Handlers are
+# deployment-owned allow-list entries rather than arbitrary dotted paths from
+# user input.
+AUTOMATION_JOB_HANDLERS = {
+    "facebook.process_lead": (
+        "integrations.providers.facebook.jobs.process_facebook_lead_job"
+    ),
+}
+AUTOMATION_RETRY_BASE_SECONDS = max(
+    1, int(os.environ.get("AUTOMATION_RETRY_BASE_SECONDS", "5"))
+)
+AUTOMATION_RETRY_MAX_SECONDS = max(
+    AUTOMATION_RETRY_BASE_SECONDS,
+    int(os.environ.get("AUTOMATION_RETRY_MAX_SECONDS", "900")),
+)
+AUTOMATION_JOB_LEASE_SECONDS = max(
+    60, int(os.environ.get("AUTOMATION_JOB_LEASE_SECONDS", "600"))
+)
+AUTOMATION_MANUAL_RETRY_ATTEMPTS = max(
+    1, int(os.environ.get("AUTOMATION_MANUAL_RETRY_ATTEMPTS", "3"))
+)
+
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # When omitted, dev falls back to a key derived from SECRET_KEY. Production
 # should always use a dedicated value so Django key rotation is independent.

@@ -12,6 +12,7 @@ from django.core import signing
 from django.db import transaction
 from django.utils import timezone
 
+from automation.tenant_context import database_org_context
 from integrations.models import (
     FacebookOAuthSession,
     FacebookOAuthSessionStatus,
@@ -25,7 +26,6 @@ from integrations.providers.facebook.service import (
     connect_facebook_page,
     graph_client,
 )
-from integrations.tenant_context import database_org_context
 
 STATE_SALT = "integrations.facebook.oauth-state.v1"
 

@@ -1,7 +1,10 @@
 import pytest
 
+from automation.models import AutomationJob
 from integrations.models import FacebookPageConnection, FacebookPageRoute
+from integrations.providers.facebook.jobs import enqueue_facebook_lead_event
 from integrations.providers.facebook.service import (
+    FacebookConnectionUnavailable,
     FacebookPageAlreadyConnected,
     connect_facebook_page,
     process_facebook_lead_event,
@@ -103,3 +106,48 @@ def test_facebook_lead_runs_shared_pipeline_idempotently(org_a, admin_profile):
         ("lead-7", "page-token"),
         ("lead-7", "page-token"),
     ]
+
+
+@pytest.mark.django_db
+def test_facebook_event_is_persisted_before_dispatch(org_a, monkeypatch):
+    connect_facebook_page(
+        org_id=org_a.id,
+        page_access_token="page-token",
+        client=FakeGraphClient(),
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        "integrations.providers.facebook.jobs.dispatch_job",
+        lambda job: dispatched.append(job.id),
+    )
+    event = {"page_id": "page-42", "leadgen_id": "lead-durable"}
+
+    first = enqueue_facebook_lead_event(event)
+    replay = enqueue_facebook_lead_event(event)
+
+    assert first.id == replay.id
+    assert (
+        AutomationJob.objects.filter(
+            org=org_a,
+            name="facebook.process_lead",
+            idempotency_key="leadgen:lead-durable",
+        ).count()
+        == 1
+    )
+    assert dispatched == [first.id, first.id]
+
+
+@pytest.mark.django_db
+def test_durable_facebook_job_cannot_cross_tenants(org_a, org_b):
+    connect_facebook_page(
+        org_id=org_a.id,
+        page_access_token="page-token",
+        client=FakeGraphClient(),
+    )
+
+    with pytest.raises(FacebookConnectionUnavailable, match="job's organization"):
+        process_facebook_lead_event(
+            event_payload={"page_id": "page-42", "leadgen_id": "lead-tenant"},
+            expected_org_id=org_b.id,
+            client=FakeGraphClient(),
+        )
