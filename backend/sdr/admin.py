@@ -5,12 +5,72 @@ from sdr.models import (
     LeadInspection,
     LeadIntake,
     LeadLifecycleEvent,
+    LeadNurtureDelivery,
+    LeadNurtureEnrollment,
+    LeadNurtureInteraction,
+    SDREmailProviderEvent,
+    SDREmailSuppression,
     SDRIntelligenceSettings,
     SDRModelCredential,
+    SDRNurtureSequence,
+    SDRNurtureStep,
+    SDROutboundCampaign,
+    SDROutboundProspect,
     SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingRuleMember,
 )
+
+
+class SDROutboundProspectInline(admin.TabularInline):
+    model = SDROutboundProspect
+    extra = 0
+    fields = ("company_name", "email", "job_title", "status", "intake")
+    readonly_fields = fields
+    show_change_link = True
+
+
+@admin.register(SDROutboundCampaign)
+class SDROutboundCampaignAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "org",
+        "status",
+        "sequence",
+        "daily_send_limit",
+        "run_count",
+        "owner",
+        "created_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("name", "description", "icp_description", "org__name")
+    inlines = (SDROutboundProspectInline,)
+
+
+@admin.register(SDROutboundProspect)
+class SDROutboundProspectAdmin(admin.ModelAdmin):
+    list_display = (
+        "company_name",
+        "email",
+        "job_title",
+        "campaign",
+        "org",
+        "status",
+        "attempt_count",
+        "promoted_at",
+        "queued_at",
+        "queued_run",
+    )
+    list_filter = ("status", "country", "industry")
+    search_fields = ("company_name", "email", "first_name", "last_name")
+    readonly_fields = (
+        "dedupe_key",
+        "attempt_count",
+        "last_error_code",
+        "last_error_message",
+        "intake",
+        "promoted_at",
+    )
 
 
 @admin.register(SDRResponseSettings)
@@ -49,6 +109,148 @@ class LeadDeliveryAdmin(admin.ModelAdmin):
     list_filter = ("kind", "status")
     search_fields = ("intake__source_record_id", "recipient")
     readonly_fields = ("last_error_code", "last_error_message", "sent_at")
+
+
+class SDRNurtureStepInline(admin.StackedInline):
+    model = SDRNurtureStep
+    extra = 0
+
+
+@admin.register(SDRNurtureSequence)
+class SDRNurtureSequenceAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "org",
+        "priority",
+        "is_active",
+        "auto_enroll",
+        "updated_at",
+    )
+    list_filter = ("is_active", "auto_enroll")
+    search_fields = ("name", "org__name")
+    inlines = (SDRNurtureStepInline,)
+
+
+@admin.register(LeadNurtureEnrollment)
+class LeadNurtureEnrollmentAdmin(admin.ModelAdmin):
+    list_display = (
+        "sequence",
+        "intake",
+        "org",
+        "status",
+        "current_step_position",
+        "next_run_at",
+        "enrolled_at",
+    )
+    list_filter = ("status", "sequence")
+    search_fields = ("intake__source_record_id", "lead__email")
+    readonly_fields = ("completed_at", "stop_reason")
+
+
+@admin.register(LeadNurtureDelivery)
+class LeadNurtureDeliveryAdmin(admin.ModelAdmin):
+    list_display = (
+        "enrollment",
+        "step_position",
+        "variant",
+        "recipient",
+        "status",
+        "scheduled_for",
+        "sent_at",
+        "delivered_at",
+        "bounced_at",
+        "complained_at",
+        "opened_at",
+        "clicked_at",
+        "reply_sentiment",
+    )
+    list_filter = ("status", "variant", "reply_sentiment")
+    search_fields = ("recipient", "enrollment__intake__source_record_id")
+    readonly_fields = (
+        "subject_template",
+        "body_template",
+        "last_error_code",
+        "last_error_message",
+        "sent_at",
+        "provider_message_id",
+        "delivered_at",
+        "bounced_at",
+        "complained_at",
+        "bounce_type",
+        "bounce_subtype",
+        "opened_at",
+        "clicked_at",
+        "open_count",
+        "click_count",
+        "last_clicked_url",
+        "replied_at",
+        "reply_message_id",
+    )
+
+
+@admin.register(LeadNurtureInteraction)
+class LeadNurtureInteractionAdmin(admin.ModelAdmin):
+    list_display = (
+        "delivery",
+        "event_type",
+        "target_url",
+        "occurred_at",
+    )
+    list_filter = ("event_type",)
+    search_fields = ("delivery__recipient", "target_url")
+    readonly_fields = (
+        "delivery",
+        "org",
+        "event_type",
+        "target_url",
+        "target_hash",
+        "visitor_hash",
+        "occurred_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(SDREmailSuppression)
+class SDREmailSuppressionAdmin(admin.ModelAdmin):
+    list_display = (
+        "email",
+        "org",
+        "reason",
+        "source",
+        "is_active",
+        "suppressed_at",
+        "released_at",
+    )
+    list_filter = ("is_active", "reason", "source")
+    search_fields = ("email", "org__name")
+    readonly_fields = ("suppressed_at", "released_at", "source_delivery", "details")
+
+
+@admin.register(SDREmailProviderEvent)
+class SDREmailProviderEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "delivery",
+        "provider",
+        "event_type",
+        "provider_event_id",
+        "event_at",
+    )
+    list_filter = ("provider", "event_type")
+    search_fields = ("provider_event_id", "delivery__recipient")
+    readonly_fields = (
+        "delivery",
+        "org",
+        "provider",
+        "provider_event_id",
+        "event_type",
+        "event_at",
+        "details",
+    )
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(SDRIntelligenceSettings)

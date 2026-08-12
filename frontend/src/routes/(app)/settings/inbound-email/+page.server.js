@@ -41,6 +41,7 @@ function buildBody(formData) {
   return {
     address: String(formData.get('address') || '').trim(),
     provider: String(formData.get('provider') || 'ses'),
+    route_target: String(formData.get('route_target') || 'case'),
     default_priority: String(formData.get('default_priority') || 'Normal'),
     default_case_type: String(formData.get('default_case_type') || '') || null,
     default_assignee_id: String(formData.get('default_assignee_id') || '') || null,

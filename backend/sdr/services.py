@@ -14,6 +14,7 @@ from sdr.application import LeadIntakePipeline
 from sdr.domain import LeadCandidate
 from sdr.intelligence.service import LeadInspector
 from sdr.models import LeadIntake, LeadIntakeStatus, LeadLifecycleEventType
+from sdr.nurture import auto_enroll_intake
 from sdr.response import (
     record_lifecycle_event,
     schedule_post_handoff_jobs,
@@ -118,6 +119,12 @@ def process_candidate_intake(
             logger.exception(
                 "Could not reconcile response jobs for intake %s", intake.id
             )
+        try:
+            auto_enroll_intake(intake)
+        except Exception:
+            logger.exception(
+                "Could not reconcile nurture enrollment for intake %s", intake.id
+            )
         return _result_from_intake(intake, replayed=True)
 
     record_lifecycle_event(
@@ -208,6 +215,10 @@ def process_candidate_intake(
         schedule_post_handoff_jobs(intake)
     except Exception:
         logger.exception("Could not schedule response jobs for intake %s", intake.id)
+    try:
+        auto_enroll_intake(intake)
+    except Exception:
+        logger.exception("Could not schedule nurture for intake %s", intake.id)
     return _result_from_intake(intake)
 
 

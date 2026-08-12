@@ -23,12 +23,14 @@
   let dialogPriority = $state('Normal');
   let dialogTicketType = $state('');
   let dialogAssigneeId = $state('');
+  let dialogRouteTarget = $state('case');
 
   function openCreate() {
     dialogAddress = '';
     dialogPriority = 'Normal';
     dialogTicketType = '';
     dialogAssigneeId = '';
+    dialogRouteTarget = 'case';
     dialogOpen = true;
   }
 
@@ -65,7 +67,7 @@
 
 <PageHeader
   title="Inbound Email"
-  subtitle="Customers email these addresses; replies thread back to the same ticket automatically"
+  subtitle="Route verified inboxes to support tickets or the SDR lead and reply pipeline"
 >
   {#snippet actions()}
     <Button onclick={openCreate} class="gap-2">
@@ -85,12 +87,11 @@
         <div>
           <p class="font-medium">AWS SES setup required.</p>
           <p>
-            Create an SES Receipt Rule on a verified domain that publishes to an
-            SNS Topic with action <strong>"SNS Notification with full content"</strong>.
-            Subscribe the topic to the webhook URL shown below for each mailbox.
-            The first POST will be a <code>SubscriptionConfirmation</code> — we
-            confirm it automatically. Other providers (Mailgun, Postmark, IMAP)
-            will be enabled in a follow-up.
+            Create an SES Receipt Rule on a verified domain that publishes to an SNS Topic with
+            action <strong>"SNS Notification with full content"</strong>. Subscribe the topic to the
+            webhook URL shown below for each mailbox. The first POST will be a
+            <code>SubscriptionConfirmation</code> — we confirm it automatically. Other providers (Mailgun,
+            Postmark, IMAP) will be enabled in a follow-up.
           </p>
         </div>
       </div>
@@ -113,9 +114,10 @@
             <form
               method="POST"
               action="?/update"
-              use:enhance={() => async ({ update }) => {
-                await update();
-              }}
+              use:enhance={() =>
+                async ({ update }) => {
+                  await update();
+                }}
               class="space-y-3"
             >
               <input type="hidden" name="id" value={mailbox.id} />
@@ -127,12 +129,19 @@
                     {mailbox.address}
                   </span>
                   <span
-                    class="rounded-full bg-[var(--surface-muted)] px-2 py-0.5 text-xs uppercase text-[var(--text-secondary)]"
+                    class="rounded-full bg-[var(--surface-muted)] px-2 py-0.5 text-xs text-[var(--text-secondary)] uppercase"
                   >
                     {mailbox.provider}
                   </span>
+                  <span
+                    class="rounded-full bg-violet-100 px-2 py-0.5 text-xs text-violet-700 dark:bg-violet-900/30 dark:text-violet-300"
+                  >
+                    {mailbox.route_target === 'sdr' ? 'SDR' : 'Support'}
+                  </span>
                   {#if !mailbox.is_active}
-                    <span class="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700 dark:bg-slate-700 dark:text-slate-200">
+                    <span
+                      class="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700 dark:bg-slate-700 dark:text-slate-200"
+                    >
                       Inactive
                     </span>
                   {/if}
@@ -146,10 +155,27 @@
               </header>
 
               <div class="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
+                <div class="space-y-1 sm:col-span-2">
+                  <Label class="text-xs">Mailbox purpose</Label>
+                  <select
+                    name="route_target"
+                    value={mailbox.route_target || 'case'}
+                    class="w-full rounded-md border border-[var(--border-default)] bg-[var(--surface-default)] px-3 py-2 text-sm"
+                  >
+                    <option value="case">Support tickets</option>
+                    <option value="sdr">SDR leads and nurture replies</option>
+                  </select>
+                  <p class="text-[11px] text-[var(--text-secondary)]">
+                    SDR mailboxes turn new senders into leads and match known senders to active
+                    nurture enrollments.
+                  </p>
+                </div>
                 <div class="space-y-1">
                   <Label class="text-xs">Webhook URL</Label>
                   <div class="flex items-center gap-1">
-                    <code class="flex-1 truncate rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]">
+                    <code
+                      class="flex-1 truncate rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]"
+                    >
                       {webhookUrl(mailbox.id)}
                     </code>
                     <Button
@@ -166,7 +192,9 @@
                 <div class="space-y-1">
                   <Label class="text-xs">Webhook secret</Label>
                   <div class="flex items-center gap-1">
-                    <code class="flex-1 truncate rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]">
+                    <code
+                      class="flex-1 truncate rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]"
+                    >
                       {mailbox.webhook_secret}
                     </code>
                     <Button
@@ -221,11 +249,7 @@
                   </select>
                 </div>
 
-                <input
-                  type="hidden"
-                  name="address"
-                  value={mailbox.address}
-                />
+                <input type="hidden" name="address" value={mailbox.address} />
                 <input type="hidden" name="provider" value={mailbox.provider} />
                 <input
                   type="hidden"
@@ -261,20 +285,34 @@
     <Dialog.Header>
       <Dialog.Title>New inbound mailbox</Dialog.Title>
       <Dialog.Description>
-        Configure an address customers can email to open tickets.
+        Configure an address for support tickets or SDR lead conversations.
       </Dialog.Description>
     </Dialog.Header>
 
     <form
       method="POST"
       action="?/create"
-      use:enhance={() => async ({ update }) => {
-        await update();
-      }}
+      use:enhance={() =>
+        async ({ update }) => {
+          await update();
+        }}
       class="space-y-4"
     >
       <input type="hidden" name="provider" value="ses" />
       <input type="hidden" name="is_active" value="true" />
+
+      <div class="space-y-1.5">
+        <Label for="route_target">Mailbox purpose</Label>
+        <select
+          id="route_target"
+          name="route_target"
+          bind:value={dialogRouteTarget}
+          class="w-full rounded-md border border-[var(--border-default)] bg-[var(--surface-default)] px-3 py-2 text-sm"
+        >
+          <option value="case">Support tickets</option>
+          <option value="sdr">SDR leads and nurture replies</option>
+        </select>
+      </div>
 
       <div class="space-y-1.5">
         <Label for="address">Email address *</Label>
@@ -335,9 +373,7 @@
       </div>
 
       <Dialog.Footer>
-        <Button type="button" variant="outline" onclick={() => (dialogOpen = false)}>
-          Cancel
-        </Button>
+        <Button type="button" variant="outline" onclick={() => (dialogOpen = false)}>Cancel</Button>
         <Button type="submit">Create</Button>
       </Dialog.Footer>
     </form>

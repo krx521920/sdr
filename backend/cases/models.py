@@ -12,7 +12,6 @@ from common.models import Org, Profile, Tags, Teams
 from common.utils import CASE_TYPE, CURRENCY_CODES, PRIORITY_CHOICE, STATUS_CHOICE
 from contacts.models import Contact
 
-
 # Cleanup notes:
 # - Removed 'created_on_arrow' property from Case and Solution (frontend computes its own timestamps)
 # - Fixed case_type default from "" to None (empty string is bad default for nullable field)
@@ -692,7 +691,7 @@ class EscalationPolicy(BaseModel):
 
 
 class InboundMailbox(BaseModel):
-    """Per-org inbound email address configuration. See docs/cases/tier1/email-to-ticket.md.
+    """Per-org inbound email address routed to support or SDR.
 
     Tier 1 ships only the SES (SNS direct delivery) provider; the model carries
     the IMAP fields nullable so a follow-up can wire in IMAP without a schema
@@ -705,6 +704,10 @@ class InboundMailbox(BaseModel):
         ("postmark", "Postmark"),
         ("imap", "IMAP"),
     ]
+    ROUTE_TARGET_CHOICES = [
+        ("case", "Support tickets"),
+        ("sdr", "SDR leads and replies"),
+    ]
 
     org = models.ForeignKey(
         Org, on_delete=models.CASCADE, related_name="inbound_mailboxes"
@@ -712,6 +715,12 @@ class InboundMailbox(BaseModel):
     address = models.EmailField(_("Inbound Address"))
     provider = models.CharField(
         max_length=16, choices=PROVIDER_CHOICES, default="ses"
+    )
+    route_target = models.CharField(
+        max_length=16,
+        choices=ROUTE_TARGET_CHOICES,
+        default="case",
+        help_text="Choose whether accepted messages create tickets or enter SDR.",
     )
     webhook_secret = models.CharField(
         max_length=128,
@@ -786,6 +795,13 @@ class EmailMessage(BaseModel):
         help_text="Null when the message was dropped (spam/bounce/auto-reply) "
         "but we still want an audit trail.",
     )
+    mailbox = models.ForeignKey(
+        InboundMailbox,
+        on_delete=models.SET_NULL,
+        related_name="email_messages",
+        null=True,
+        blank=True,
+    )
     direction = models.CharField(
         max_length=16, choices=DIRECTION_CHOICES, default="inbound"
     )
@@ -800,6 +816,7 @@ class EmailMessage(BaseModel):
         "References header.",
     )
     from_address = models.EmailField()
+    from_display_name = models.CharField(max_length=255, blank=True, default="")
     to_addresses = models.TextField(blank=True, default="")
     cc_addresses = models.TextField(blank=True, default="")
     subject = models.CharField(max_length=512, blank=True, default="")

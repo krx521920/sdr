@@ -15,7 +15,6 @@ from cases.models import (
     TimeEntry,
 )
 from common.models import Profile, Teams
-from common.utils import STATUS_CHOICE
 from common.serializer import (
     OrganizationSerializer,
     ProfileSerializer,
@@ -23,8 +22,8 @@ from common.serializer import (
     TeamsSerializer,
     UserSerializer,
 )
+from common.utils import STATUS_CHOICE
 from contacts.serializer import ContactSerializer
-
 
 # Note: Removed unused serializer property:
 # - created_on_arrow (frontend computes its own humanized timestamps)
@@ -455,7 +454,7 @@ class EscalationPolicySerializer(serializers.ModelSerializer):
 
 
 class InboundMailboxSerializer(serializers.ModelSerializer):
-    """Per-org inbound mailbox config. See docs/cases/tier1/email-to-ticket.md."""
+    """Per-org inbound mailbox configuration."""
 
     default_assignee = ProfileSerializer(read_only=True)
     default_assignee_id = serializers.PrimaryKeyRelatedField(
@@ -472,6 +471,7 @@ class InboundMailboxSerializer(serializers.ModelSerializer):
             "id",
             "address",
             "provider",
+            "route_target",
             "webhook_secret",
             "default_priority",
             "default_case_type",
@@ -519,7 +519,9 @@ class EmailMessageSerializer(serializers.ModelSerializer):
             "direction",
             "message_id",
             "in_reply_to",
+            "mailbox",
             "from_address",
+            "from_display_name",
             "to_addresses",
             "cc_addresses",
             "subject",

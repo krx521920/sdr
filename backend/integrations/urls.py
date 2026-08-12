@@ -1,6 +1,8 @@
 from django.urls import path
 
 from integrations.api.views import (
+    FacebookConversionSettingsView,
+    FacebookMessengerConversationView,
     FacebookOAuthCallbackView,
     FacebookOAuthPageSelectionView,
     FacebookOAuthSessionView,
@@ -42,6 +44,16 @@ urlpatterns = [
         "facebook/pages/<uuid:connection_id>/",
         FacebookPageConnectionDetailView.as_view(),
         name="facebook_page_detail",
+    ),
+    path(
+        "facebook/conversions/",
+        FacebookConversionSettingsView.as_view(),
+        name="facebook_conversion_settings",
+    ),
+    path(
+        "facebook/conversations/leads/<uuid:lead_id>/",
+        FacebookMessengerConversationView.as_view(),
+        name="facebook_messenger_conversation",
     ),
     path(
         "facebook/webhook/",

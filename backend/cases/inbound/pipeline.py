@@ -18,8 +18,10 @@ from typing import Optional
 from django.db import transaction
 
 from cases.models import Case, EmailMessage, InboundMailbox
+
 from .contacts import resolve_contact
 from .parser import ParsedEmail
+from .routing_targets import dispatch_to_route_target
 from .spam import should_drop
 from .threading import find_existing_case, short_case_id
 
@@ -47,10 +49,12 @@ def _record_email_message(
     """Create the audit row for this email. Idempotent on (org, message_id)."""
     defaults = {
         "case": case,
+        "mailbox": mailbox,
         "direction": "inbound",
         "in_reply_to": parsed.in_reply_to[:512],
         "references": " ".join(parsed.references)[:65535],
         "from_address": parsed.from_address,
+        "from_display_name": parsed.from_display_name[:255],
         "to_addresses": ", ".join(parsed.to_addresses)[:65535],
         "cc_addresses": ", ".join(parsed.cc_addresses)[:65535],
         "subject": (parsed.subject or "")[:512],
@@ -121,6 +125,16 @@ def ingest(parsed: ParsedEmail, mailbox: InboundMailbox) -> IngestResult:
                 created_case=False,
                 dropped=bool(prior.drop_reason),
                 drop_reason=prior.drop_reason,
+            )
+
+        if mailbox.route_target != "case":
+            row = _record_email_message(parsed=parsed, mailbox=mailbox, case=None)
+            dispatch_to_route_target(mailbox=mailbox, email_message=row)
+            return IngestResult(
+                email_message=row,
+                case=None,
+                created_case=False,
+                dropped=False,
             )
 
         existing_case = find_existing_case(parsed, mailbox.org)

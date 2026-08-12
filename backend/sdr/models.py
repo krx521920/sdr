@@ -2,6 +2,7 @@
 
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.functions import Lower
 from django.utils import timezone
 
 from common.base import BaseOrgModel
@@ -17,11 +18,13 @@ class LeadIntakeStatus(models.TextChoices):
 
 class LeadIntakeSource(models.TextChoices):
     FACEBOOK_AD = "facebook_ad", "Facebook Lead Ad"
+    FACEBOOK_MESSENGER = "facebook_messenger", "Facebook Messenger"
     WEBSITE_FORM = "website_form", "Website Form"
     LINKEDIN = "linkedin", "LinkedIn"
     EMAIL = "email", "Email"
     API = "api", "API"
     MANUAL = "manual", "Manual"
+    OUTBOUND = "outbound", "Outbound Prospect"
 
 
 DEFAULT_ACKNOWLEDGEMENT_SUBJECT = "Thanks for contacting {{ organization_name }}"
@@ -390,6 +393,16 @@ class LeadLifecycleEventType(models.TextChoices):
     CRM_HANDOFF = "crm_handoff", "CRM handoff"
     ACKNOWLEDGEMENT_SENT = "acknowledgement_sent", "Acknowledgement sent"
     SALES_NOTIFIED = "sales_notified", "Sales notified"
+    NURTURE_ENROLLED = "nurture_enrolled", "Nurture enrolled"
+    NURTURE_EMAIL_SENT = "nurture_email_sent", "Nurture email sent"
+    NURTURE_EMAIL_OPENED = "nurture_email_opened", "Nurture email opened"
+    NURTURE_LINK_CLICKED = "nurture_link_clicked", "Nurture link clicked"
+    NURTURE_SUPPRESSED = "nurture_suppressed", "Nurture suppressed"
+    NURTURE_DELIVERED = "nurture_delivered", "Nurture delivered"
+    NURTURE_BOUNCED = "nurture_bounced", "Nurture bounced"
+    NURTURE_COMPLAINED = "nurture_complained", "Nurture complained"
+    CHANNEL_MESSAGE_RECEIVED = "channel_message_received", "Channel message received"
+    NURTURE_STOPPED = "nurture_stopped", "Nurture stopped"
     COMPLETED = "completed", "Completed"
     FAILED = "failed", "Failed"
 
@@ -473,3 +486,512 @@ class LeadDelivery(BaseOrgModel):
                 name="sdr_delivery_org_status_idx",
             )
         ]
+
+
+class NurtureEnrollmentStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    PAUSED = "paused", "Paused"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+    REPLIED = "replied", "Replied"
+    CONVERTED = "converted", "Converted"
+
+
+class NurtureDeliveryStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    SENDING = "sending", "Sending"
+    SENT = "sent", "Sent"
+    FAILED = "failed", "Failed"
+    SKIPPED = "skipped", "Skipped"
+
+
+class NurtureReplySentiment(models.TextChoices):
+    POSITIVE = "positive", "Positive"
+    NEUTRAL = "neutral", "Neutral"
+    NEGATIVE = "negative", "Negative"
+
+
+class SDRNurtureSequence(BaseOrgModel):
+    """Ordered email journey selected from source and qualification rules."""
+
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    priority = models.PositiveIntegerField(default=100)
+    is_active = models.BooleanField(default=False)
+    auto_enroll = models.BooleanField(default=False)
+    sources = models.JSONField(default=list, blank=True)
+    qualification_bands = models.JSONField(default=list, blank=True)
+    from_email = models.EmailField(blank=True)
+
+    class Meta:
+        db_table = "sdr_nurture_sequence"
+        ordering = ("priority", "created_at", "id")
+        indexes = [
+            models.Index(
+                fields=["org", "is_active", "auto_enroll", "priority"],
+                name="sdr_nurture_org_active_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class SDRNurtureStep(BaseOrgModel):
+    """One delayed message with an optional deterministic B variant."""
+
+    sequence = models.ForeignKey(
+        SDRNurtureSequence,
+        on_delete=models.CASCADE,
+        related_name="steps",
+    )
+    position = models.PositiveSmallIntegerField()
+    delay_minutes = models.PositiveIntegerField(
+        default=0,
+        validators=[MaxValueValidator(525600)],
+        help_text="Delay after enrollment or the preceding successful step.",
+    )
+    subject_a = models.CharField(max_length=255)
+    body_a = models.TextField()
+    subject_b = models.CharField(max_length=255, blank=True)
+    body_b = models.TextField(blank=True)
+    variant_b_percent = models.PositiveSmallIntegerField(
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+    )
+
+    class Meta:
+        db_table = "sdr_nurture_step"
+        ordering = ("position", "created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "sequence", "position"],
+                name="unique_sdr_nurture_step_position",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "sequence", "position"],
+                name="sdr_nurture_step_org_seq_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.sequence}: step {self.position}"
+
+
+class LeadNurtureEnrollment(BaseOrgModel):
+    """A lead's durable progress through one nurture sequence."""
+
+    sequence = models.ForeignKey(
+        SDRNurtureSequence,
+        on_delete=models.PROTECT,
+        related_name="enrollments",
+    )
+    intake = models.OneToOneField(
+        LeadIntake,
+        on_delete=models.CASCADE,
+        related_name="nurture_enrollment",
+    )
+    lead = models.ForeignKey(
+        "leads.Lead",
+        on_delete=models.SET_NULL,
+        related_name="sdr_nurture_enrollments",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=NurtureEnrollmentStatus.choices,
+        default=NurtureEnrollmentStatus.ACTIVE,
+    )
+    current_step_position = models.PositiveSmallIntegerField(default=0)
+    resume_count = models.PositiveIntegerField(default=0)
+    next_run_at = models.DateTimeField(null=True, blank=True)
+    enrolled_at = models.DateTimeField(default=timezone.now)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    stop_reason = models.CharField(max_length=500, blank=True)
+
+    class Meta:
+        db_table = "sdr_nurture_enrollment"
+        ordering = ("-enrolled_at", "-created_at")
+        indexes = [
+            models.Index(
+                fields=["org", "status", "next_run_at"],
+                name="sdr_nurture_enroll_status_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.sequence}:{self.intake_id}"
+
+
+class LeadNurtureDelivery(BaseOrgModel):
+    """Auditable email attempt and immutable A/B template snapshot."""
+
+    enrollment = models.ForeignKey(
+        LeadNurtureEnrollment,
+        on_delete=models.CASCADE,
+        related_name="deliveries",
+    )
+    step = models.ForeignKey(
+        SDRNurtureStep,
+        on_delete=models.SET_NULL,
+        related_name="deliveries",
+        null=True,
+        blank=True,
+    )
+    step_position = models.PositiveSmallIntegerField()
+    variant = models.CharField(
+        max_length=1,
+        choices=(("A", "A"), ("B", "B")),
+        default="A",
+    )
+    recipient = models.EmailField()
+    subject_template = models.CharField(max_length=255)
+    body_template = models.TextField()
+    status = models.CharField(
+        max_length=16,
+        choices=NurtureDeliveryStatus.choices,
+        default=NurtureDeliveryStatus.PENDING,
+    )
+    scheduled_for = models.DateTimeField()
+    attempt_count = models.PositiveIntegerField(default=0)
+    last_error_code = models.CharField(max_length=80, blank=True)
+    last_error_message = models.TextField(blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    provider_message_id = models.CharField(max_length=255, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    bounced_at = models.DateTimeField(null=True, blank=True)
+    complained_at = models.DateTimeField(null=True, blank=True)
+    bounce_type = models.CharField(max_length=32, blank=True)
+    bounce_subtype = models.CharField(max_length=64, blank=True)
+    opened_at = models.DateTimeField(null=True, blank=True)
+    clicked_at = models.DateTimeField(null=True, blank=True)
+    open_count = models.PositiveIntegerField(default=0)
+    click_count = models.PositiveIntegerField(default=0)
+    last_clicked_url = models.URLField(max_length=2048, blank=True)
+    replied_at = models.DateTimeField(null=True, blank=True)
+    reply_message_id = models.CharField(max_length=512, blank=True)
+    reply_sentiment = models.CharField(
+        max_length=16,
+        choices=NurtureReplySentiment.choices,
+        blank=True,
+    )
+
+    class Meta:
+        db_table = "sdr_nurture_delivery"
+        ordering = ("scheduled_for", "created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "enrollment", "step_position"],
+                name="unique_sdr_nurture_delivery_step",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "status", "scheduled_for"],
+                name="sdr_nurture_delivery_due_idx",
+            ),
+            models.Index(
+                fields=["org", "variant", "sent_at"],
+                name="sdr_nurture_variant_sent_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.enrollment_id}:step-{self.step_position}{self.variant}"
+
+
+class NurtureInteractionType(models.TextChoices):
+    OPEN = "open", "Open"
+    CLICK = "click", "Click"
+
+
+class LeadNurtureInteraction(BaseOrgModel):
+    """Privacy-preserving, deduplicated recipient interaction audit row."""
+
+    delivery = models.ForeignKey(
+        LeadNurtureDelivery,
+        on_delete=models.CASCADE,
+        related_name="interactions",
+    )
+    event_type = models.CharField(
+        max_length=12,
+        choices=NurtureInteractionType.choices,
+    )
+    target_url = models.URLField(max_length=2048, blank=True)
+    target_hash = models.CharField(max_length=64)
+    visitor_hash = models.CharField(max_length=64)
+    occurred_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "sdr_nurture_interaction"
+        ordering = ("occurred_at", "created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "org",
+                    "delivery",
+                    "event_type",
+                    "target_hash",
+                    "visitor_hash",
+                ],
+                name="unique_sdr_nurture_interaction",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "event_type", "-occurred_at"],
+                name="sdr_nurture_interact_event_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.delivery_id}:{self.event_type}"
+
+
+class EmailSuppressionReason(models.TextChoices):
+    UNSUBSCRIBED = "unsubscribed", "Unsubscribed"
+    COMPLAINT = "complaint", "Spam complaint"
+    HARD_BOUNCE = "hard_bounce", "Hard bounce"
+    INVALID = "invalid", "Invalid address"
+    ADMIN = "admin", "Administrator"
+
+
+class EmailSuppressionSource(models.TextChoices):
+    ONE_CLICK = "one_click", "One-click unsubscribe"
+    INBOUND_REPLY = "inbound_reply", "Inbound email reply"
+    PROVIDER = "provider", "Email provider"
+    ADMIN = "admin", "Administrator"
+
+
+class SDREmailSuppression(BaseOrgModel):
+    """Tenant-owned email opt-out and deliverability suppression state."""
+
+    email = models.EmailField()
+    reason = models.CharField(
+        max_length=24,
+        choices=EmailSuppressionReason.choices,
+    )
+    source = models.CharField(
+        max_length=24,
+        choices=EmailSuppressionSource.choices,
+    )
+    is_active = models.BooleanField(default=True)
+    suppressed_at = models.DateTimeField(default=timezone.now)
+    released_at = models.DateTimeField(null=True, blank=True)
+    source_delivery = models.ForeignKey(
+        LeadNurtureDelivery,
+        on_delete=models.SET_NULL,
+        related_name="suppressions",
+        null=True,
+        blank=True,
+    )
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "sdr_email_suppression"
+        ordering = ("-is_active", "-suppressed_at", "email")
+        constraints = [
+            models.UniqueConstraint(
+                Lower("email"),
+                "org",
+                name="unique_sdr_email_suppression",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "is_active", "-suppressed_at"],
+                name="sdr_suppression_org_active_idx",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self.email = (self.email or "").strip().lower()
+        return super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.email}:{self.reason}"
+
+
+class EmailProviderEventType(models.TextChoices):
+    DELIVERY = "delivery", "Delivery"
+    BOUNCE = "bounce", "Bounce"
+    COMPLAINT = "complaint", "Complaint"
+
+
+class SDREmailProviderEvent(BaseOrgModel):
+    """Idempotent, sanitized delivery feedback received from an email provider."""
+
+    delivery = models.ForeignKey(
+        LeadNurtureDelivery,
+        on_delete=models.CASCADE,
+        related_name="provider_events",
+    )
+    provider = models.CharField(
+        max_length=24,
+        choices=(("ses", "AWS SES"),),
+        default="ses",
+    )
+    provider_event_id = models.CharField(max_length=255)
+    event_type = models.CharField(
+        max_length=24,
+        choices=EmailProviderEventType.choices,
+    )
+    event_at = models.DateTimeField(default=timezone.now)
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "sdr_email_provider_event"
+        ordering = ("-event_at", "-created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "provider", "provider_event_id"],
+                name="unique_sdr_email_provider_event",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "event_type", "-event_at"],
+                name="sdr_provider_event_org_type_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.provider_event_id}"
+
+
+class OutboundCampaignStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    ACTIVE = "active", "Active"
+    PAUSED = "paused", "Paused"
+    COMPLETED = "completed", "Completed"
+    ARCHIVED = "archived", "Archived"
+
+
+class OutboundProspectStatus(models.TextChoices):
+    READY = "ready", "Ready"
+    QUEUED = "queued", "Queued"
+    PROCESSING = "processing", "Processing"
+    PROMOTED = "promoted", "Promoted to CRM"
+    FAILED = "failed", "Failed"
+    DISQUALIFIED = "disqualified", "Disqualified"
+
+
+class SDROutboundCampaign(BaseOrgModel):
+    """Tenant-owned ICP campaign grouping a cleaned outbound prospect list."""
+
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    icp_description = models.TextField(blank=True)
+    channels = models.JSONField(default=list, blank=True)
+    sequence = models.ForeignKey(
+        SDRNurtureSequence,
+        on_delete=models.PROTECT,
+        related_name="outbound_campaigns",
+        null=True,
+        blank=True,
+    )
+    daily_send_limit = models.PositiveSmallIntegerField(
+        default=50,
+        validators=[MinValueValidator(1), MaxValueValidator(1000)],
+        help_text="Maximum prospects released into the SDR pipeline per local day.",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=OutboundCampaignStatus.choices,
+        default=OutboundCampaignStatus.DRAFT,
+    )
+    owner = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.SET_NULL,
+        related_name="sdr_outbound_campaigns",
+        null=True,
+        blank=True,
+    )
+    launched_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    run_count = models.PositiveIntegerField(default=0)
+    last_refilled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sdr_outbound_campaign"
+        ordering = ("-created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                Lower("name"),
+                "org",
+                name="unique_sdr_out_campaign_name",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "status", "-created_at"],
+                name="sdr_out_campaign_status_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class SDROutboundProspect(BaseOrgModel):
+    """Cleaned, tenant-deduplicated prospect awaiting SDR promotion."""
+
+    campaign = models.ForeignKey(
+        SDROutboundCampaign,
+        on_delete=models.PROTECT,
+        related_name="prospects",
+    )
+    first_name = models.CharField(max_length=255, blank=True)
+    last_name = models.CharField(max_length=255, blank=True)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=32, blank=True)
+    job_title = models.CharField(max_length=255, blank=True)
+    linkedin_url = models.URLField(max_length=500, blank=True)
+    company_name = models.CharField(max_length=255)
+    website = models.URLField(max_length=500, blank=True)
+    industry = models.CharField(max_length=255, blank=True)
+    country = models.CharField(max_length=100, blank=True)
+    source_url = models.URLField(max_length=1000, blank=True)
+    notes = models.TextField(blank=True)
+    dedupe_key = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16,
+        choices=OutboundProspectStatus.choices,
+        default=OutboundProspectStatus.READY,
+    )
+    attempt_count = models.PositiveIntegerField(default=0)
+    last_error_code = models.CharField(max_length=80, blank=True)
+    last_error_message = models.TextField(blank=True)
+    intake = models.OneToOneField(
+        LeadIntake,
+        on_delete=models.SET_NULL,
+        related_name="outbound_prospect",
+        null=True,
+        blank=True,
+    )
+    promoted_at = models.DateTimeField(null=True, blank=True)
+    queued_at = models.DateTimeField(null=True, blank=True)
+    queued_run = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "sdr_outbound_prospect"
+        ordering = ("-created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "dedupe_key"],
+                name="unique_sdr_out_prospect_key",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "campaign", "status", "-created_at"],
+                name="sdr_out_prospect_status_idx",
+            )
+        ]
+
+    def __str__(self) -> str:
+        contact = " ".join(filter(None, (self.first_name, self.last_name)))
+        return contact or self.email or self.company_name

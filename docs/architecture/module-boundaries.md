@@ -85,3 +85,19 @@ Provider protocol translation, encrypted BYOK credentials, and failover are
 isolated behind the [SDR model gateway](model-gateway.md).
 Immediate website acceptance, lifecycle audit, acknowledgement, and sales
 handoff delivery are described in [lead-response-loop.md](lead-response-loop.md).
+Scheduled follow-up, deterministic A/B variants, signed open/click tracking,
+one-click unsubscribe, tenant suppression, signed SES delivery feedback,
+reply outcomes, and automatic CRM-state exits are described in
+[lead-nurturing.md](lead-nurturing.md).
+Signed email receipt, mailbox-purpose routing, automatic reply capture, and new
+email lead normalization are described in [inbound-email-sdr.md](inbound-email-sdr.md).
+Meta Lead Ads and Messenger private-message ingestion, durable in-window first
+responses, assigned-sales conversation handoff, plus PII-free Conversion Leads
+CRM feedback are described in
+[facebook-lead-ads.md](../sdr/facebook-lead-ads.md).
+Progressive MQL-to-SQL funnel reporting, acquisition-source quality, nurture
+A/B outcomes, first-response SLA, and deterministic weekly optimization prompts
+are described in [sdr-growth-analytics.md](sdr-growth-analytics.md).
+ICP campaign management, CSV prospect cleaning, tenant-wide deduplication, and
+durable outbound-to-CRM promotion are described in
+[outbound-prospecting.md](outbound-prospecting.md).

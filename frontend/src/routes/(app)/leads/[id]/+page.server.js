@@ -9,6 +9,7 @@
 
 import { error, fail } from '@sveltejs/kit';
 import { apiRequest } from '$lib/api-helpers.js';
+import { randomUUID } from 'node:crypto';
 
 /** @type {import('./$types').PageServerLoad} */
 export async function load({ params, locals, cookies }) {
@@ -26,6 +27,19 @@ export async function load({ params, locals, cookies }) {
 
     // Django LeadDetailView returns the lead under `lead_obj` (see backend/leads/views/lead_views.py).
     const lead = response.lead_obj || response.lead || response;
+    let messengerConversation = { available: false, messages: [], can_reply: false };
+    let messengerConversationError = '';
+    try {
+      messengerConversation = await apiRequest(
+        `/integrations/facebook/conversations/leads/${params.id}/`,
+        {},
+        { cookies, org }
+      );
+    } catch (err) {
+      console.error('Failed to load Messenger conversation:', err);
+      messengerConversationError =
+        /** @type {any} */ (err)?.message || 'Failed to load Messenger conversation';
+    }
 
     return {
       lead,
@@ -35,7 +49,10 @@ export async function load({ params, locals, cookies }) {
       users: response.users || [],
       commentPermission: response.comment_permission || false,
       customFieldDefinitions: response.custom_field_definitions || [],
-      customFieldValues: lead?.custom_fields || {}
+      customFieldValues: lead?.custom_fields || {},
+      messengerConversation,
+      messengerConversationError,
+      messengerRequestId: randomUUID()
     };
   } catch (err) {
     if (/** @type {any} */ (err)?.status) throw err;
@@ -66,6 +83,34 @@ export const actions = {
       console.error('Update lead custom fields error:', err);
       return fail(400, {
         error: /** @type {any} */ (err)?.message || 'Failed to save custom fields'
+      });
+    }
+  },
+
+  sendMessengerReply: async ({ request, params, locals, cookies }) => {
+    const form = await request.formData();
+    const body = form.get('body')?.toString().trim() || '';
+    const clientRequestId = form.get('client_request_id')?.toString() || '';
+    if (!body) {
+      return fail(400, { messengerError: 'Enter a reply message.' });
+    }
+    if (body.length > 2000) {
+      return fail(400, { messengerError: 'Messenger replies cannot exceed 2,000 characters.' });
+    }
+    try {
+      await apiRequest(
+        `/integrations/facebook/conversations/leads/${params.id}/`,
+        {
+          method: 'POST',
+          body: { body, client_request_id: clientRequestId }
+        },
+        { cookies, org: locals.org }
+      );
+      return { messengerReplyQueued: true };
+    } catch (err) {
+      console.error('Send Messenger reply error:', err);
+      return fail(400, {
+        messengerError: /** @type {any} */ (err)?.message || 'Failed to send Messenger reply'
       });
     }
   }

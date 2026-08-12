@@ -54,13 +54,87 @@ class FacebookGraphClient:
     def fetch_page_identity(self, *, access_token: str) -> Mapping[str, Any]:
         return self._get("me", access_token=access_token, params={"fields": "id,name"})
 
-    def subscribe_page(self, *, page_id: str, access_token: str) -> None:
+    def subscribe_page(
+        self,
+        *,
+        page_id: str,
+        access_token: str,
+        subscribed_fields: Sequence[str] = ("leadgen",),
+    ) -> None:
+        fields = tuple(dict.fromkeys(field.strip() for field in subscribed_fields if field.strip()))
+        if not fields:
+            raise ValueError("At least one Page webhook field is required")
         self._request(
             "POST",
             f"{page_id}/subscribed_apps",
             access_token=access_token,
-            params={"subscribed_fields": "leadgen"},
+            params={"subscribed_fields": ",".join(fields)},
         )
+
+    def send_text_message(
+        self,
+        *,
+        page_id: str,
+        recipient_psid: str,
+        access_token: str,
+        text: str,
+    ) -> Mapping[str, Any]:
+        """Send an in-window Messenger response to a Page-scoped recipient."""
+
+        payload = self._request(
+            "POST",
+            f"{page_id}/messages",
+            access_token=access_token,
+            params={},
+            json_payload={
+                "recipient": {"id": recipient_psid},
+                "messaging_type": "RESPONSE",
+                "message": {"text": text},
+            },
+        )
+        if not str(payload.get("message_id", "")).strip():
+            raise FacebookGraphAPIError(
+                "Meta did not return a Messenger message id",
+                retryable=False,
+            )
+        return payload
+
+    def send_conversion_event(
+        self,
+        *,
+        pixel_id: str,
+        access_token: str,
+        event: Mapping[str, Any],
+        test_event_code: str = "",
+    ) -> Mapping[str, Any]:
+        """Send one CRM funnel stage using Meta's Conversion Leads payload."""
+
+        params: dict[str, Any] = {"access_token": access_token}
+        if self.app_secret:
+            params["appsecret_proof"] = hmac.new(
+                self.app_secret.encode("utf-8"),
+                access_token.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+        payload: dict[str, Any] = {"data": [dict(event)]}
+        if test_event_code.strip():
+            payload["test_event_code"] = test_event_code.strip()
+        response = self._send_request(
+            "POST",
+            f"{pixel_id}/events",
+            params=params,
+            json_payload=payload,
+        )
+        try:
+            events_received = int(response.get("events_received", 0))
+        except (TypeError, ValueError):
+            events_received = 0
+        if events_received < 1:
+            raise FacebookGraphAPIError(
+                "Meta did not accept the conversion event",
+                retryable=False,
+            )
+        return response
 
     def exchange_oauth_code(
         self, *, code: str, redirect_uri: str
@@ -149,6 +223,7 @@ class FacebookGraphClient:
         *,
         access_token: str,
         params: Mapping[str, Any],
+        json_payload: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         request_params = dict(params)
         request_params["access_token"] = access_token
@@ -158,17 +233,32 @@ class FacebookGraphClient:
                 access_token.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()
-        return self._send_request(method, object_id, params=request_params)
+        return self._send_request(
+            method,
+            object_id,
+            params=request_params,
+            json_payload=json_payload,
+        )
 
     def _send_request(
-        self, method: str, object_id: str, *, params: Mapping[str, Any]
+        self,
+        method: str,
+        object_id: str,
+        *,
+        params: Mapping[str, Any],
+        json_payload: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         try:
+            request_kwargs: dict[str, Any] = {
+                "params": dict(params),
+                "timeout": self.timeout,
+            }
+            if json_payload is not None:
+                request_kwargs["json"] = dict(json_payload)
             response = self.session.request(
                 method,
                 f"{self.base_url}/{self.api_version}/{object_id}",
-                params=dict(params),
-                timeout=self.timeout,
+                **request_kwargs,
             )
         except requests.RequestException as exc:
             raise FacebookGraphAPIError(

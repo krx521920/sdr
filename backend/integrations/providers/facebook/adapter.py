@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -13,7 +13,7 @@ from sdr.domain import CompanySnapshot, LeadCandidate, LeadIdentity, LeadSource
 
 
 class FacebookWebhookError(ValueError):
-    """The webhook body is not a supported Meta Page leadgen notification."""
+    """The webhook body is not a supported Meta Page notification."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +37,26 @@ class FacebookLeadEvent:
                 "created_time": self.created_time,
             }.items()
             if value is not None
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FacebookMessageEvent:
+    page_id: str
+    sender_psid: str
+    message_id: str
+    body: str
+    attachment_types: tuple[str, ...] = ()
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "page_id": self.page_id,
+            "sender_psid": self.sender_psid,
+            "message_id": self.message_id,
+            "body": self.body,
+            "attachment_types": list(self.attachment_types),
+            "occurred_at": self.occurred_at.isoformat(),
         }
 
 
@@ -78,16 +98,7 @@ class FacebookLeadAdsAdapter:
         return hmac.compare_digest(signature, f"sha256={digest}")
 
     def parse_events(self, *, body: bytes) -> tuple[FacebookLeadEvent, ...]:
-        try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise FacebookWebhookError("webhook body must be valid JSON") from exc
-        if not isinstance(payload, Mapping) or payload.get("object") != "page":
-            raise FacebookWebhookError("webhook object must be 'page'")
-
-        entries = payload.get("entry", [])
-        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
-            raise FacebookWebhookError("webhook entry must be a list")
+        entries = self._entries(body)
 
         events: list[FacebookLeadEvent] = []
         seen: set[tuple[str, str]] = set()
@@ -135,6 +146,73 @@ class FacebookLeadAdsAdapter:
                         ad_id=_clean(value.get("ad_id")),
                         adgroup_id=_clean(value.get("adgroup_id")),
                         created_time=created_timestamp,
+                    )
+                )
+        return tuple(events)
+
+    def parse_message_events(self, *, body: bytes) -> tuple[FacebookMessageEvent, ...]:
+        entries = self._entries(body)
+        events: list[FacebookMessageEvent] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise FacebookWebhookError("webhook entry items must be objects")
+            page_id = _clean(entry.get("id"))
+            messaging = entry.get("messaging", [])
+            if not isinstance(messaging, Sequence) or isinstance(
+                messaging, (str, bytes)
+            ):
+                raise FacebookWebhookError("webhook messaging must be a list")
+            for item in messaging:
+                if not isinstance(item, Mapping):
+                    raise FacebookWebhookError("messaging items must be objects")
+                message = item.get("message")
+                if not isinstance(message, Mapping) or message.get("is_echo"):
+                    continue
+                recipient = item.get("recipient", {})
+                sender = item.get("sender", {})
+                recipient_page_id = (
+                    _clean(recipient.get("id"))
+                    if isinstance(recipient, Mapping)
+                    else None
+                )
+                sender_psid = (
+                    _clean(sender.get("id")) if isinstance(sender, Mapping) else None
+                )
+                resolved_page_id = page_id or recipient_page_id
+                message_id = _clean(message.get("mid"))
+                if not resolved_page_id or not sender_psid or not message_id:
+                    raise FacebookWebhookError(
+                        "Messenger event requires Page, sender, and message ids"
+                    )
+                if recipient_page_id and recipient_page_id != resolved_page_id:
+                    raise FacebookWebhookError(
+                        "entry Page id does not match Messenger recipient id"
+                    )
+                if sender_psid == resolved_page_id:
+                    continue
+                identity = (resolved_page_id, message_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+
+                attachment_types = self._attachment_types(message.get("attachments"))
+                text = _clean(message.get("text")) or ""
+                if not text and attachment_types:
+                    text = f"[Messenger attachment: {', '.join(attachment_types)}]"
+                if not text:
+                    continue
+                events.append(
+                    FacebookMessageEvent(
+                        page_id=resolved_page_id,
+                        sender_psid=sender_psid,
+                        message_id=message_id,
+                        body=text[:10000],
+                        attachment_types=attachment_types,
+                        occurred_at=self._message_occurred_at(
+                            item.get("timestamp"),
+                            entry.get("time"),
+                        ),
                     )
                 )
         return tuple(events)
@@ -242,4 +320,45 @@ class FacebookLeadAdsAdapter:
                 pass
         if fallback_timestamp is not None:
             return datetime.fromtimestamp(fallback_timestamp, tz=UTC)
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _entries(body: bytes) -> Sequence[Any]:
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FacebookWebhookError("webhook body must be valid JSON") from exc
+        if not isinstance(payload, Mapping) or payload.get("object") != "page":
+            raise FacebookWebhookError("webhook object must be 'page'")
+        entries = payload.get("entry", [])
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+            raise FacebookWebhookError("webhook entry must be a list")
+        return entries
+
+    @staticmethod
+    def _attachment_types(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return ()
+        return tuple(
+            dict.fromkeys(
+                cleaned[:32]
+                for item in value
+                if isinstance(item, Mapping)
+                and (cleaned := _clean(item.get("type"))) is not None
+            )
+        )
+
+    @staticmethod
+    def _message_occurred_at(value: Any, entry_value: Any) -> datetime:
+        for candidate in (value, entry_value):
+            try:
+                timestamp = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            try:
+                return datetime.fromtimestamp(timestamp, tz=UTC)
+            except (OSError, OverflowError, ValueError):
+                continue
         return datetime.now(UTC)

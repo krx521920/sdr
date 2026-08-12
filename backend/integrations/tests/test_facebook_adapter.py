@@ -96,3 +96,51 @@ def test_fetched_lead_is_normalized_without_losing_custom_answers():
     assert candidate.company.name == "Analytical Engines"
     assert candidate.attributes["facebook_form_id"] == "form-3"
     assert candidate.attributes["facebook_answers"] == {"team_size": ["51-200"]}
+
+
+def test_messenger_text_and_attachment_events_are_parsed_without_echoes():
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-42",
+                    "time": 1_785_391_200_000,
+                    "messaging": [
+                        {
+                            "sender": {"id": "psid-7"},
+                            "recipient": {"id": "page-42"},
+                            "timestamp": 1_785_391_201_000,
+                            "message": {
+                                "mid": "mid.1",
+                                "text": "We need help automating our sales workflow.",
+                            },
+                        },
+                        {
+                            "sender": {"id": "psid-8"},
+                            "recipient": {"id": "page-42"},
+                            "message": {
+                                "mid": "mid.2",
+                                "attachments": [{"type": "image", "payload": {}}],
+                            },
+                        },
+                        {
+                            "sender": {"id": "page-42"},
+                            "recipient": {"id": "psid-7"},
+                            "message": {"mid": "mid.echo", "is_echo": True},
+                        },
+                    ],
+                }
+            ],
+        }
+    ).encode()
+
+    events = FacebookLeadAdsAdapter(app_secret="secret").parse_message_events(
+        body=body
+    )
+
+    assert [event.message_id for event in events] == ["mid.1", "mid.2"]
+    assert events[0].sender_psid == "psid-7"
+    assert events[0].body == "We need help automating our sales workflow."
+    assert events[1].body == "[Messenger attachment: image]"
+    assert events[1].attachment_types == ("image",)

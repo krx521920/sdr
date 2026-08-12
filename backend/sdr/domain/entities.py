@@ -9,11 +9,13 @@ from uuid import UUID
 
 class LeadSource(StrEnum):
     FACEBOOK_AD = "facebook_ad"
+    FACEBOOK_MESSENGER = "facebook_messenger"
     WEBSITE_FORM = "website_form"
     LINKEDIN = "linkedin"
     EMAIL = "email"
     API = "api"
     MANUAL = "manual"
+    OUTBOUND = "outbound"
 
 
 class QualificationBand(StrEnum):

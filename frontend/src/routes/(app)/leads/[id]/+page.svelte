@@ -1,11 +1,14 @@
 <script>
+  import { enhance } from '$app/forms';
   import { goto } from '$app/navigation';
+  import { toast } from 'svelte-sonner';
   import {
     Pencil,
     Mail,
     Phone,
     MoreHorizontal,
     Paperclip,
+    MessageCircle,
     MessageSquare,
     Calendar,
     ArrowRightCircle,
@@ -19,7 +22,8 @@
     Users,
     UserCheck,
     FileText,
-    ExternalLink
+    ExternalLink,
+    Send
   } from '@lucide/svelte';
   import { LinkedinIcon as Linkedin } from '$lib/components/icons';
   import { PageHeader } from '$lib/components/layout';
@@ -45,8 +49,8 @@
   import { INDUSTRIES } from '$lib/constants/lead-choices.js';
   import { getCountryName } from '$lib/constants/countries.js';
 
-  /** @type {{ data: { lead: any, comments: any[], attachments: any[], tags: any[], users: any[], commentPermission: boolean, customFieldDefinitions: any[], customFieldValues: Record<string, unknown> } }} */
-  let { data } = $props();
+  /** @type {{ data: { lead: any, comments: any[], attachments: any[], tags: any[], users: any[], commentPermission: boolean, customFieldDefinitions: any[], customFieldValues: Record<string, unknown>, messengerConversation: any, messengerConversationError: string, messengerRequestId: string }, form: any }} */
+  let { data, form } = $props();
 
   const lead = $derived(data.lead || {});
   const comments = $derived(data.comments || []);
@@ -54,8 +58,15 @@
   const tags = $derived(data.tags || []);
   const customFieldDefinitions = $derived(data.customFieldDefinitions || []);
   const customFieldValues = $derived(data.customFieldValues || {});
+  const messengerConversation = $derived(data.messengerConversation || { available: false });
 
   let tab = $state('overview');
+  let messengerSending = $state(false);
+
+  $effect(() => {
+    if (form?.messengerReplyQueued) toast.success('Messenger reply queued for delivery.');
+    if (form?.messengerError) toast.error(form.messengerError);
+  });
 
   // Normalize backend status ("in process", "assigned") to leadStatusOptions value format ("IN_PROCESS")
   const normalizedStatus = $derived(
@@ -133,6 +144,15 @@
   function normalizeUrl(/** @type {string} */ raw) {
     if (!raw) return '';
     return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  }
+
+  function messengerUnavailableMessage(/** @type {string} */ reason) {
+    if (reason === 'outside_messaging_window') {
+      return "Meta's standard 24-hour response window has expired.";
+    }
+    if (reason === 'messenger_disabled') return 'Messenger intake is disabled for this Page.';
+    if (reason === 'page_disconnected') return 'The Facebook Page is no longer connected.';
+    return 'Messenger replies are currently unavailable.';
   }
 
   // Timeline items: comments + attachments + created event, sorted DESC by timestamp.
@@ -269,6 +289,101 @@
               <p class="text-[12px] italic text-[color:var(--text-subtle)]">No description.</p>
             {/if}
           </SectionCard>
+
+        {#if messengerConversation.available}
+          <SectionCard title="Messenger conversation">
+            <div class="space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
+                  <MessageCircle class="size-4 text-blue-600 dark:text-blue-400" />
+                  <span>{messengerConversation.page_name || 'Facebook Page'}</span>
+                </div>
+                {#if messengerConversation.can_reply}
+                  <Badge
+                    class="border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-400"
+                  >Reply window open</Badge>
+                {:else}
+                  <Badge variant="outline">Reply unavailable</Badge>
+                {/if}
+              </div>
+
+              <div
+                class="max-h-[420px] space-y-3 overflow-y-auto rounded-lg bg-[color:var(--bg-subtle)] p-3"
+              >
+                {#each messengerConversation.messages || [] as message (message.direction + message.id)}
+                  <div class:ml-auto={message.direction === 'outbound'} class="max-w-[85%]">
+                    <div
+                      class={`rounded-lg px-3 py-2 shadow-sm ${
+                        message.direction === 'outbound'
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-[color:var(--bg-elevated)] text-[color:var(--text-primary)]'
+                      }`}
+                    >
+                      {#if message.body}
+                        <p class="whitespace-pre-wrap text-sm leading-5">{message.body}</p>
+                      {:else if message.attachment_types?.length}
+                        <p class="text-sm">Attachment: {message.attachment_types.join(', ')}</p>
+                      {/if}
+                    </div>
+                    <p
+                      class:text-right={message.direction === 'outbound'}
+                      class="mt-1 text-[10px] text-[color:var(--text-subtle)]"
+                    >
+                      {message.sent_by} · {formatRelativeDate(message.timestamp)}
+                      {#if message.direction === 'outbound'}
+                        · {message.status}
+                      {/if}
+                    </p>
+                  </div>
+                {/each}
+              </div>
+
+              {#if messengerConversation.can_reply}
+                <form
+                  method="POST"
+                  action="?/sendMessengerReply"
+                  class="space-y-2"
+                  use:enhance={() => {
+                    messengerSending = true;
+                    return async ({ update }) => {
+                      messengerSending = false;
+                      await update({ invalidateAll: true });
+                    };
+                  }}
+                >
+                  <input
+                    type="hidden"
+                    name="client_request_id"
+                    value={data.messengerRequestId}
+                  />
+                  <textarea
+                    name="body"
+                    rows="3"
+                    maxlength="2000"
+                    required
+                    placeholder="Reply to this Messenger conversation…"
+                    class="w-full resize-y rounded-md border border-[color:var(--border)] bg-[color:var(--bg-elevated)] px-3 py-2 text-sm leading-5"
+                  ></textarea>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <p class="text-[11px] text-[color:var(--text-muted)]">
+                      Window closes {formatDate(messengerConversation.reply_window_expires_at)}
+                    </p>
+                    <Button type="submit" size="sm" disabled={messengerSending} class="gap-2">
+                      <Send class="size-3.5" />
+                      {messengerSending ? 'Queueing…' : 'Send reply'}
+                    </Button>
+                  </div>
+                </form>
+              {:else}
+                <div
+                  class="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300"
+                >
+                  {messengerUnavailableMessage(messengerConversation.reply_unavailable_reason)}
+                </div>
+              {/if}
+            </div>
+          </SectionCard>
+        {/if}
 
         <!-- Custom fields -->
         {#if customFieldDefinitions.length > 0}

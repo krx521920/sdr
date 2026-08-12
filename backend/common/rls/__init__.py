@@ -68,10 +68,23 @@ ORG_SCOPED_TABLES = [
     "sdr_response_settings",
     "sdr_lead_lifecycle_event",
     "sdr_lead_delivery",
+    "sdr_nurture_sequence",
+    "sdr_nurture_step",
+    "sdr_nurture_enrollment",
+    "sdr_nurture_delivery",
+    "sdr_nurture_interaction",
+    "sdr_email_suppression",
+    "sdr_email_provider_event",
+    "sdr_outbound_campaign",
+    "sdr_outbound_prospect",
     # Tenant-owned external credentials. The companion Page route is
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.
     "integration_facebook_page_connection",
     "integration_facebook_oauth_session",
+    "integration_facebook_conversion_settings",
+    "integration_facebook_conversion_event",
+    "integration_facebook_messenger_message",
+    "integration_facebook_messenger_reply",
     # Durable tenant workflow state and attempt audit history.
     "automation_job",
     "automation_job_attempt",

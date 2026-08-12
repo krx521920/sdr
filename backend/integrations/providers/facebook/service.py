@@ -1,5 +1,6 @@
 """Tenant connection and lead-processing services for Meta Lead Ads."""
 
+import logging
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -16,7 +17,13 @@ from integrations.providers.facebook.adapter import (
     FacebookLeadEvent,
 )
 from integrations.providers.facebook.client import FacebookGraphClient
+from integrations.providers.facebook.conversions import (
+    schedule_conversion_events_for_intake,
+)
+from sdr.models import LeadIntake
 from sdr.services import LeadIntakeResult, process_candidate_intake
+
+logger = logging.getLogger(__name__)
 
 
 class FacebookPageAlreadyConnected(ValueError):
@@ -73,6 +80,29 @@ def connect_facebook_page(
         page_access_token=page_access_token,
         token_expires_at=token_expires_at,
     )
+
+
+def set_facebook_messenger_enabled(
+    connection: FacebookPageConnection,
+    *,
+    enabled: bool,
+    client: FacebookGraphClient | None = None,
+) -> FacebookPageConnection:
+    """Opt a connected Page into Messenger messages without regressing Lead Ads."""
+
+    if enabled:
+        (client or graph_client()).subscribe_page(
+            page_id=connection.page_id,
+            access_token=connection.get_access_token(),
+            subscribed_fields=("leadgen", "messages"),
+        )
+    connection.messenger_enabled = enabled
+    update_fields = ["messenger_enabled", "updated_at"]
+    if not enabled and connection.messenger_auto_reply_enabled:
+        connection.messenger_auto_reply_enabled = False
+        update_fields.append("messenger_auto_reply_enabled")
+    connection.save(update_fields=update_fields)
+    return connection
 
 
 @transaction.atomic
@@ -174,6 +204,15 @@ def process_facebook_lead_event(
             candidate=candidate,
             raw_payload={"webhook": event.as_payload(), "lead": dict(lead)},
         )
+        try:
+            schedule_conversion_events_for_intake(
+                LeadIntake.objects.get(id=result.intake_id, org_id=route.org_id)
+            )
+        except Exception:
+            logger.exception(
+                "Could not schedule Meta conversion feedback for intake %s",
+                result.intake_id,
+            )
         FacebookPageConnection.objects.filter(id=connection.id).update(
             last_webhook_at=timezone.now()
         )

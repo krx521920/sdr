@@ -5,16 +5,113 @@ from sdr.api.views import (
     LeadInspectionListView,
     LeadIntakeDetailView,
     LeadIntakeListView,
+    LeadNurtureEnrollmentActionView,
+    LeadNurtureEnrollmentListView,
+    SDRAnalyticsView,
+    SDREmailSuppressionDetailView,
+    SDREmailSuppressionListCreateView,
     SDRIntelligenceSettingsView,
+    SDRNurtureSequenceDetailView,
+    SDRNurtureSequenceListCreateView,
+    SDROutboundCampaignActionView,
+    SDROutboundCampaignDetailView,
+    SDROutboundCampaignListCreateView,
+    SDROutboundProspectActionView,
+    SDROutboundProspectImportView,
+    SDROutboundProspectListView,
     SDRResponseSettingsView,
     SDRRoutingPreviewView,
     SDRRoutingRuleDetailView,
     SDRRoutingRuleListCreateView,
 )
+from sdr.ses_views import SESFeedbackWebhookView
+from sdr.tracking_views import NurtureClickTrackingView, NurtureOpenTrackingView
+from sdr.unsubscribe_views import NurtureUnsubscribeView
 
 app_name = "api_sdr"
 
 urlpatterns = [
+    path("analytics/funnel/", SDRAnalyticsView.as_view(), name="analytics_funnel"),
+    path(
+        "outbound/campaigns/",
+        SDROutboundCampaignListCreateView.as_view(),
+        name="outbound_campaign_list_create",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/",
+        SDROutboundCampaignDetailView.as_view(),
+        name="outbound_campaign_detail",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/action/",
+        SDROutboundCampaignActionView.as_view(),
+        name="outbound_campaign_action",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/prospects/",
+        SDROutboundProspectListView.as_view(),
+        name="outbound_prospect_list",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/prospects/import/",
+        SDROutboundProspectImportView.as_view(),
+        name="outbound_prospect_import",
+    ),
+    path(
+        "outbound/prospects/<uuid:prospect_id>/action/",
+        SDROutboundProspectActionView.as_view(),
+        name="outbound_prospect_action",
+    ),
+    path(
+        "public/ses-feedback/",
+        SESFeedbackWebhookView.as_view(),
+        name="ses_feedback",
+    ),
+    path(
+        "public/nurture/open/<str:token>/pixel.gif",
+        NurtureOpenTrackingView.as_view(),
+        name="nurture_open_tracking",
+    ),
+    path(
+        "public/nurture/click/<str:token>/",
+        NurtureClickTrackingView.as_view(),
+        name="nurture_click_tracking",
+    ),
+    path(
+        "public/nurture/unsubscribe/<str:token>/",
+        NurtureUnsubscribeView.as_view(),
+        name="nurture_unsubscribe",
+    ),
+    path(
+        "nurture/sequences/",
+        SDRNurtureSequenceListCreateView.as_view(),
+        name="nurture_sequence_list_create",
+    ),
+    path(
+        "nurture/sequences/<uuid:sequence_id>/",
+        SDRNurtureSequenceDetailView.as_view(),
+        name="nurture_sequence_detail",
+    ),
+    path(
+        "nurture/enrollments/",
+        LeadNurtureEnrollmentListView.as_view(),
+        name="nurture_enrollment_list",
+    ),
+    path(
+        "nurture/enrollments/<uuid:enrollment_id>/action/",
+        LeadNurtureEnrollmentActionView.as_view(),
+        name="nurture_enrollment_action",
+    ),
+    path(
+        "nurture/suppressions/",
+        SDREmailSuppressionListCreateView.as_view(),
+        name="nurture_suppression_list_create",
+    ),
+    path(
+        "nurture/suppressions/<uuid:suppression_id>/",
+        SDREmailSuppressionDetailView.as_view(),
+        name="nurture_suppression_detail",
+    ),
     path(
         "response-settings/",
         SDRResponseSettingsView.as_view(),

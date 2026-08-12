@@ -1179,6 +1179,30 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/sdr-nurturing')}
+                class="gap-2.5"
+              >
+                <Mail class="size-4" />
+                <span>SDR Nurturing</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
+                onclick={() => navigateTo('/settings/sdr-analytics')}
+                class="gap-2.5"
+              >
+                <BarChart3 class="size-4" />
+                <span>SDR Growth</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
+                onclick={() => navigateTo('/settings/sdr-outbound')}
+                class="gap-2.5"
+              >
+                <Target class="size-4" />
+                <span>SDR Outbound</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >

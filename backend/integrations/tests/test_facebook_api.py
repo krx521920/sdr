@@ -66,8 +66,56 @@ def test_signed_webhook_is_enqueued(unauthenticated_client, monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json() == {"status": "accepted", "events": 1}
+    assert response.json() == {
+        "status": "accepted",
+        "events": 1,
+        "lead_events": 1,
+        "messenger_events": 0,
+    }
     assert queued == [{"page_id": "page-42", "leadgen_id": "lead-7"}]
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="integrations.tests.urls", META_APP_SECRET="app-secret")
+def test_signed_messenger_webhook_is_enqueued(unauthenticated_client, monkeypatch):
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-42",
+                    "messaging": [
+                        {
+                            "sender": {"id": "psid-7"},
+                            "recipient": {"id": "page-42"},
+                            "timestamp": 1_785_391_201_000,
+                            "message": {"mid": "mid.1", "text": "Need a quote"},
+                        }
+                    ],
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    signature = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+    queued = []
+    monkeypatch.setattr(
+        "integrations.api.views.enqueue_facebook_message_event", queued.append
+    )
+
+    response = unauthenticated_client.generic(
+        "POST",
+        "/api/integrations/facebook/webhook/",
+        data=body,
+        content_type="application/json",
+        HTTP_X_HUB_SIGNATURE_256=signature,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["messenger_events"] == 1
+    assert queued[0]["page_id"] == "page-42"
+    assert queued[0]["sender_psid"] == "psid-7"
+    assert queued[0]["message_id"] == "mid.1"
 
 
 @pytest.mark.django_db

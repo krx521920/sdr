@@ -27,6 +27,7 @@ from sdr.models import (
     LeadDeliveryKind,
     LeadDeliveryStatus,
     LeadIntake,
+    LeadIntakeSource,
     LeadIntakeStatus,
     LeadLifecycleEvent,
     LeadLifecycleEventType,
@@ -125,7 +126,11 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
         return []
     configuration = response_settings_for(intake.org_id)
     jobs = []
-    acknowledgement_job = schedule_acknowledgement_job(intake)
+    acknowledgement_job = (
+        None
+        if intake.source == LeadIntakeSource.OUTBOUND
+        else schedule_acknowledgement_job(intake)
+    )
     if acknowledgement_job:
         jobs.append(acknowledgement_job)
 

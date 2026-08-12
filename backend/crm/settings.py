@@ -169,6 +169,7 @@ if "django_ses" in EMAIL_BACKEND:
     AWS_SES_REGION_ENDPOINT = os.environ.get(
         "AWS_SES_REGION_ENDPOINT", f"email.{AWS_SES_REGION_NAME}.amazonaws.com"
     )
+    AWS_SES_CONFIGURATION_SET = os.environ.get("AWS_SES_CONFIGURATION_SET")
     # Uses AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from env if set;
     # otherwise falls back to IAM role credentials.
 
@@ -363,6 +364,13 @@ JWT_ALGO = "HS256"
 
 DOMAIN_NAME = os.environ.get("DOMAIN_NAME", "http://localhost:8000")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+SDR_NURTURE_TRACKING_BASE_URL = os.environ.get(
+    "SDR_NURTURE_TRACKING_BASE_URL",
+    FRONTEND_URL,
+).rstrip("/")
+SDR_NURTURE_TRACKING_MAX_AGE_SECONDS = int(
+    os.environ.get("SDR_NURTURE_TRACKING_MAX_AGE_SECONDS", str(366 * 24 * 60 * 60))
+)
 SWAGGER_ROOT_URL = os.environ.get("SWAGGER_ROOT_URL", "http://localhost:8000")
 
 # Google OAuth Configuration
@@ -479,12 +487,27 @@ AUTOMATION_JOB_HANDLERS = {
     "facebook.process_lead": (
         "integrations.providers.facebook.jobs.process_facebook_lead_job"
     ),
+    "facebook.send_conversion_event": (
+        "integrations.providers.facebook.conversions.process_facebook_conversion_job"
+    ),
+    "facebook.process_messenger_message": (
+        "integrations.providers.facebook.messenger.process_facebook_messenger_job"
+    ),
+    "facebook.send_messenger_reply": (
+        "integrations.providers.facebook.messenger.process_facebook_messenger_reply_job"
+    ),
     "sdr.process_intake": (
         "integrations.providers.website.jobs.process_website_intake_job"
     ),
     "sdr.send_acknowledgement": "sdr.response.process_acknowledgement_email_job",
     "sdr.notify_sales_in_app": "sdr.response.process_sales_in_app_job",
     "sdr.notify_sales_feishu": "sdr.response.process_sales_feishu_job",
+    "sdr.send_nurture_email": "sdr.nurture.process_nurture_email_job",
+    "sdr.process_inbound_email": "sdr.email.process_inbound_email_job",
+    "sdr.process_outbound_prospect": "sdr.outbound.process_outbound_prospect_job",
+}
+INBOUND_EMAIL_ROUTE_HANDLERS = {
+    "sdr": "sdr.email.enqueue_inbound_email",
 }
 AUTOMATION_RETRY_BASE_SECONDS = max(
     1, int(os.environ.get("AUTOMATION_RETRY_BASE_SECONDS", "5"))

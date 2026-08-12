@@ -84,4 +84,12 @@ app.conf.beat_schedule = {
         "task": "sdr.reconcile_response_jobs",
         "schedule": crontab(minute="*"),
     },
+    "reconcile-sdr-nurture-jobs": {
+        "task": "sdr.reconcile_nurture_jobs",
+        "schedule": crontab(minute="*/5"),
+    },
+    "reconcile-sdr-outbound-campaigns": {
+        "task": "sdr.reconcile_outbound_campaigns",
+        "schedule": crontab(minute="*/15"),
+    },
 }
