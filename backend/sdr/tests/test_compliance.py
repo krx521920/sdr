@@ -4,6 +4,15 @@ import pytest
 from django.test import override_settings
 from django.utils import timezone
 
+from integrations.models import (
+    LinkedInConnection,
+    LinkedInInvitation,
+    LinkedInInvitationStatus,
+    WhatsAppBusinessConnection,
+    WhatsAppMessage,
+    WhatsAppMessageStatus,
+    WhatsAppPhoneRoute,
+)
 from leads.models import Lead
 from sdr.compliance import (
     block_contact,
@@ -212,6 +221,45 @@ def test_csv_import_preserves_reviewed_compliance_fields(org_a):
 @pytest.mark.django_db
 def test_retention_anonymizes_sdr_data_but_preserves_crm_record(org_a):
     lead, intake, prospect = _outbound_record(org_a)
+    whatsapp_connection = WhatsAppBusinessConnection.objects.create(
+        org=org_a,
+        route=WhatsAppPhoneRoute.objects.create(
+            org=org_a,
+            phone_number_id="retention-phone-route",
+        ),
+        access_token_ciphertext="encrypted-token",
+        is_active=True,
+    )
+    whatsapp_message = WhatsAppMessage.objects.create(
+        org=org_a,
+        connection=whatsapp_connection,
+        campaign=prospect.campaign,
+        prospect=prospect,
+        campaign_run=1,
+        recipient=prospect.phone,
+        template_name="approved_template",
+        status=WhatsAppMessageStatus.QUEUED,
+        provider_message_id="wamid.personal",
+        provider_status_snapshot={"recipient_id": prospect.phone},
+    )
+    linkedin_connection = LinkedInConnection.objects.create(
+        org=org_a,
+        access_token_ciphertext="encrypted-token",
+        partner_access_confirmed=True,
+        is_active=True,
+    )
+    linkedin_invitation = LinkedInInvitation.objects.create(
+        org=org_a,
+        connection=linkedin_connection,
+        campaign=prospect.campaign,
+        prospect=prospect,
+        campaign_run=1,
+        recipient=prospect.email,
+        message_body="Personalized invitation",
+        status=LinkedInInvitationStatus.FAILED,
+        provider_invitation_id="urn:li:invitation:personal",
+        provider_status_snapshot={"recipient": prospect.email},
+    )
     old = timezone.now() - timedelta(days=60)
     LeadIntake.objects.filter(id=intake.id).update(created_at=old)
     intake.refresh_from_db()
@@ -237,11 +285,22 @@ def test_retention_anonymizes_sdr_data_but_preserves_crm_record(org_a):
     intake.refresh_from_db()
     prospect.refresh_from_db()
     lead.refresh_from_db()
+    whatsapp_message.refresh_from_db()
+    linkedin_invitation.refresh_from_db()
     assert intake.raw_payload == {}
     assert prospect.email == ""
     assert prospect.company_name == "Anonymized"
     assert lead.email == "one@example.com"
     assert lead.first_name == "Ada"
+    assert whatsapp_message.status == WhatsAppMessageStatus.SKIPPED
+    assert whatsapp_message.recipient.startswith("redacted:")
+    assert whatsapp_message.provider_message_id == ""
+    assert whatsapp_message.provider_status_snapshot == {}
+    assert linkedin_invitation.status == LinkedInInvitationStatus.SKIPPED
+    assert linkedin_invitation.recipient.endswith("@invalid.local")
+    assert linkedin_invitation.message_body == ""
+    assert linkedin_invitation.provider_invitation_id == ""
+    assert linkedin_invitation.provider_status_snapshot == {}
     settings.refresh_from_db()
     assert settings.last_retention_scan_at is not None
 

@@ -72,9 +72,22 @@ class ResearchResultSinkAdapterPort(Protocol):
     def enqueue(self, *, intake: Any) -> Any: ...
 
 
+class ProviderDataGovernanceAdapterPort(Protocol):
+    def anonymize_intake_data(
+        self,
+        *,
+        org_id: UUID,
+        intake_id: UUID,
+        marker: str,
+    ) -> Mapping[str, int]: ...
+
+
 _PROSPECT_SOURCE_ADAPTERS: dict[str, ProspectSourceAdapterPort] = {}
 _OUTBOUND_CHANNEL_ADAPTERS: dict[str, OutboundChannelAdapterPort] = {}
 _RESEARCH_RESULT_SINK_ADAPTERS: dict[str, ResearchResultSinkAdapterPort] = {}
+_PROVIDER_DATA_GOVERNANCE_ADAPTERS: dict[
+    str, ProviderDataGovernanceAdapterPort
+] = {}
 
 
 def register_prospect_source_adapter(
@@ -96,6 +109,13 @@ def register_research_result_sink_adapter(
     adapter: ResearchResultSinkAdapterPort,
 ) -> None:
     _RESEARCH_RESULT_SINK_ADAPTERS[provider] = adapter
+
+
+def register_provider_data_governance_adapter(
+    provider: str,
+    adapter: ProviderDataGovernanceAdapterPort,
+) -> None:
+    _PROVIDER_DATA_GOVERNANCE_ADAPTERS[provider] = adapter
 
 
 def prospect_source_adapter(provider: str) -> ProspectSourceAdapterPort:
@@ -123,3 +143,9 @@ def research_result_sink_adapter(provider: str) -> ResearchResultSinkAdapterPort
         raise ProviderAdapterUnavailable(
             f"The {provider} research-result sink adapter is unavailable."
         ) from exc
+
+
+def provider_data_governance_adapters() -> tuple[
+    ProviderDataGovernanceAdapterPort, ...
+]:
+    return tuple(_PROVIDER_DATA_GOVERNANCE_ADAPTERS.values())

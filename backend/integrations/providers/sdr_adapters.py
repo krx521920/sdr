@@ -28,6 +28,7 @@ from sdr.provider_ports import (
     ProviderAdapterError,
     register_outbound_channel_adapter,
     register_prospect_source_adapter,
+    register_provider_data_governance_adapter,
     register_research_result_sink_adapter,
 )
 
@@ -193,6 +194,73 @@ class LinkedInOutboundChannelAdapter:
         return {key: int(value or 0) for key, value in summary.items()}
 
 
+class WhatsAppDataGovernanceAdapter:
+    def anonymize_intake_data(
+        self,
+        *,
+        org_id: UUID,
+        intake_id: UUID,
+        marker: str,
+    ) -> Mapping[str, int]:
+        messages = WhatsAppMessage.objects.filter(
+            org_id=org_id,
+            prospect__intake_id=intake_id,
+        )
+        redacted = messages.update(
+            recipient=f"redacted:{marker}",
+            provider_message_id="",
+            provider_status_snapshot={},
+            error_message="",
+        )
+        skipped = messages.filter(
+            status__in=(
+                WhatsAppMessageStatus.PENDING,
+                WhatsAppMessageStatus.QUEUED,
+                WhatsAppMessageStatus.SENDING,
+                WhatsAppMessageStatus.FAILED,
+            )
+        ).update(
+            status=WhatsAppMessageStatus.SKIPPED,
+            error_code="data_anonymized",
+            error_message="SDR-owned personal data was anonymized.",
+        )
+        return {"redacted": redacted, "skipped": skipped}
+
+
+class LinkedInDataGovernanceAdapter:
+    def anonymize_intake_data(
+        self,
+        *,
+        org_id: UUID,
+        intake_id: UUID,
+        marker: str,
+    ) -> Mapping[str, int]:
+        invitations = LinkedInInvitation.objects.filter(
+            org_id=org_id,
+            prospect__intake_id=intake_id,
+        )
+        redacted = invitations.update(
+            recipient=f"redacted+{marker}@invalid.local",
+            message_body="",
+            provider_invitation_id="",
+            provider_status_snapshot={},
+            error_message="",
+        )
+        skipped = invitations.filter(
+            status__in=(
+                LinkedInInvitationStatus.PENDING,
+                LinkedInInvitationStatus.QUEUED,
+                LinkedInInvitationStatus.SENDING,
+                LinkedInInvitationStatus.FAILED,
+            )
+        ).update(
+            status=LinkedInInvitationStatus.SKIPPED,
+            error_code="data_anonymized",
+            error_message="SDR-owned personal data was anonymized.",
+        )
+        return {"redacted": redacted, "skipped": skipped}
+
+
 class FeishuBaseResearchResultSinkAdapter:
     def is_ready(self, *, org_id: UUID) -> bool:
         return (
@@ -215,6 +283,14 @@ def register_sdr_provider_adapters() -> None:
     register_prospect_source_adapter("apollo", ApolloProspectSourceAdapter())
     register_outbound_channel_adapter("whatsapp", WhatsAppOutboundChannelAdapter())
     register_outbound_channel_adapter("linkedin", LinkedInOutboundChannelAdapter())
+    register_provider_data_governance_adapter(
+        "whatsapp",
+        WhatsAppDataGovernanceAdapter(),
+    )
+    register_provider_data_governance_adapter(
+        "linkedin",
+        LinkedInDataGovernanceAdapter(),
+    )
     register_research_result_sink_adapter(
         "feishu_base",
         FeishuBaseResearchResultSinkAdapter(),

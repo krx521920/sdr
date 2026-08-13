@@ -52,6 +52,8 @@ CRM Lead data is intentionally not changed automatically because it may have a s
 
 Minimal email suppression and DNC data is retained independently to avoid contacting someone who objected. Organizations should document the lawful basis and retention period for those suppression records.
 
+Provider-owned WhatsApp and LinkedIn audit records are redacted through data-governance adapters registered by `integrations`. This keeps the retention transaction complete without allowing the SDR module to import or query concrete provider models.
+
 ## API
 
 - `GET /api/sdr/compliance/` — overview, choices, and recent events

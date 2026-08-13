@@ -17,12 +17,6 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from integrations.models import (
-    LinkedInInvitation,
-    LinkedInInvitationStatus,
-    WhatsAppMessage,
-    WhatsAppMessageStatus,
-)
 from sdr.domain import LeadCandidate, LeadSource
 from sdr.models import (
     LeadDelivery,
@@ -50,6 +44,7 @@ from sdr.models import (
     SDRProvenanceStatus,
     SDRRetentionMode,
 )
+from sdr.provider_ports import provider_data_governance_adapters
 from sdr.routing import normalize_country
 
 PHONE_NON_DIGITS = re.compile(r"\D")
@@ -663,53 +658,12 @@ def anonymize_intake(intake: LeadIntake, *, performed_by=None) -> SDRDataProvena
         consent_evidence="",
         allowed_channels=[],
     )
-    WhatsAppMessage.objects.filter(
-        org_id=intake.org_id,
-        prospect__intake=intake,
-    ).update(
-        recipient=f"redacted:{marker}",
-        provider_message_id="",
-        provider_status_snapshot={},
-        error_message="",
-    )
-    WhatsAppMessage.objects.filter(
-        org_id=intake.org_id,
-        prospect__intake=intake,
-        status__in=[
-            WhatsAppMessageStatus.PENDING,
-            WhatsAppMessageStatus.QUEUED,
-            WhatsAppMessageStatus.SENDING,
-            WhatsAppMessageStatus.FAILED,
-        ],
-    ).update(
-        status=WhatsAppMessageStatus.SKIPPED,
-        error_code="data_anonymized",
-        error_message="SDR-owned personal data was anonymized.",
-    )
-    LinkedInInvitation.objects.filter(
-        org_id=intake.org_id,
-        prospect__intake=intake,
-    ).update(
-        recipient=f"redacted+{marker}@invalid.local",
-        message_body="",
-        provider_invitation_id="",
-        provider_status_snapshot={},
-        error_message="",
-    )
-    LinkedInInvitation.objects.filter(
-        org_id=intake.org_id,
-        prospect__intake=intake,
-        status__in=[
-            LinkedInInvitationStatus.PENDING,
-            LinkedInInvitationStatus.QUEUED,
-            LinkedInInvitationStatus.SENDING,
-            LinkedInInvitationStatus.FAILED,
-        ],
-    ).update(
-        status=LinkedInInvitationStatus.SKIPPED,
-        error_code="data_anonymized",
-        error_message="SDR-owned personal data was anonymized.",
-    )
+    for adapter in provider_data_governance_adapters():
+        adapter.anonymize_intake_data(
+            org_id=intake.org_id,
+            intake_id=intake.id,
+            marker=marker,
+        )
     LeadIntake.objects.filter(id=intake.id, org_id=intake.org_id).update(
         source_record_id=f"anon:{marker}",
         raw_payload={},

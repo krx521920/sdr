@@ -30,7 +30,7 @@ def create_campaign(client, name="Industrial automation EU"):
             "name": name,
             "description": "Factory automation decision makers.",
             "icp_description": "European manufacturers with 100+ employees.",
-            "channels": ["email", "linkedin"],
+            "channels": ["email"],
             "status": "draft",
         },
         format="json",
