@@ -11,7 +11,7 @@ from django.utils import timezone
 
 from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
-from sdr.compliance import ensure_intake_provenance
+from sdr.compliance import ensure_intake_provenance, intake_data_restriction
 from sdr.domain import LeadCandidate
 from sdr.intelligence.service import LeadInspector
 from sdr.models import LeadIntake, LeadIntakeStatus, LeadLifecycleEventType
@@ -112,6 +112,8 @@ def process_candidate_intake(
 ) -> LeadIntakeResult:
     """Run any normalized provider lead through the durable SDR pipeline."""
     intake, replayed = _claim_intake(candidate=candidate, raw_payload=raw_payload)
+    if intake_data_restriction(intake):
+        return _result_from_intake(intake, replayed=True)
     ensure_intake_provenance(
         intake=intake,
         candidate=candidate,
@@ -255,7 +257,10 @@ def _claim_intake(*, candidate: LeadCandidate, raw_payload: Mapping[str, Any]):
                 intake = LeadIntake.objects.select_for_update().get(**lookup)
                 created = False
 
-        if not created and intake.status == LeadIntakeStatus.COMPLETED:
+        if not created and (
+            intake.status == LeadIntakeStatus.COMPLETED
+            or intake_data_restriction(intake)
+        ):
             return intake, True
         if (
             not created

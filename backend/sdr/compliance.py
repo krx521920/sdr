@@ -75,6 +75,24 @@ class ComplianceDecision:
     country_code: str
 
 
+@dataclass(frozen=True, slots=True)
+class DataProcessingRestriction:
+    code: str
+    reason: str
+
+
+PROVENANCE_PROCESSING_RESTRICTIONS = {
+    SDRProvenanceStatus.DELETION_REQUESTED: DataProcessingRestriction(
+        code="data_deletion_requested",
+        reason="The intake has an active data deletion request.",
+    ),
+    SDRProvenanceStatus.ANONYMIZED: DataProcessingRestriction(
+        code="data_anonymized",
+        reason="The intake's SDR-owned data has been anonymized.",
+    ),
+}
+
+
 def normalize_contact_identifier(channel: str, value: str) -> str:
     cleaned = (value or "").strip()
     if channel == SDRComplianceChannel.EMAIL:
@@ -131,6 +149,22 @@ def clean_channels(value: Any) -> list[str]:
 def get_compliance_settings(*, org_id: UUID) -> SDRComplianceSettings:
     settings, _ = SDRComplianceSettings.objects.get_or_create(org_id=org_id)
     return settings
+
+
+def intake_data_restriction(
+    intake: LeadIntake,
+) -> DataProcessingRestriction | None:
+    """Return the deletion lifecycle restriction for an intake, if any."""
+
+    status = (
+        SDRDataProvenance.objects.filter(
+            org_id=intake.org_id,
+            intake_id=intake.id,
+        )
+        .values_list("status", flat=True)
+        .first()
+    )
+    return PROVENANCE_PROCESSING_RESTRICTIONS.get(status)
 
 
 @transaction.atomic
@@ -240,6 +274,24 @@ def evaluate_contact(
         )
         _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
         return decision
+
+    provenance = _provenance_for(intake=intake, prospect=prospect)
+    restriction = (
+        PROVENANCE_PROCESSING_RESTRICTIONS.get(provenance.status)
+        if provenance
+        else None
+    )
+    if restriction:
+        decision = _decision(
+            False,
+            restriction.code,
+            restriction.reason,
+            channel,
+            country,
+        )
+        _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+        return decision
+
     dnc = SDRDoNotContactEntry.objects.filter(
         org_id=org_id,
         channel=channel,
@@ -296,7 +348,6 @@ def evaluate_contact(
         _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
         return decision
 
-    provenance = _provenance_for(intake=intake, prospect=prospect)
     lawful_basis = (
         provenance.lawful_basis
         if provenance
@@ -705,13 +756,18 @@ def anonymize_intake(intake: LeadIntake, *, performed_by=None) -> SDRDataProvena
 
 
 def _provenance_for(*, intake=None, prospect=None):
-    target_intake = intake or (prospect.intake if prospect and prospect.intake_id else None)
+    target_intake = intake or (
+        prospect.intake if prospect and prospect.intake_id else None
+    )
     if not target_intake:
         return None
-    try:
-        return target_intake.data_provenance
-    except SDRDataProvenance.DoesNotExist:
-        return ensure_intake_provenance(intake=target_intake)
+    # Do not trust the reverse one-to-one cache for an execution-time decision.
+    # A worker can hold an intake/prospect instance across a deletion-state update.
+    provenance = SDRDataProvenance.objects.filter(
+        org_id=target_intake.org_id,
+        intake_id=target_intake.id,
+    ).first()
+    return provenance or ensure_intake_provenance(intake=target_intake)
 
 
 def _consent_datetime(value):

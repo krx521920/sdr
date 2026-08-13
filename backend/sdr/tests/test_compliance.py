@@ -15,6 +15,7 @@ from integrations.models import (
 )
 from leads.models import Lead
 from sdr.compliance import (
+    anonymize_intake,
     block_contact,
     ensure_intake_provenance,
     evaluate_contact,
@@ -322,6 +323,43 @@ def test_deletion_request_is_audited_and_waits_for_grace_period(org_a):
     assert SDRComplianceEvent.objects.filter(
         org=org_a, event_type="deletion_requested"
     ).exists()
+
+
+@pytest.mark.django_db
+def test_deletion_lifecycle_blocks_contact_with_enforcement_disabled(org_a):
+    _, intake, prospect = _outbound_record(org_a, suffix="deletion-block")
+    ensure_intake_provenance(intake=intake)
+
+    provenance = request_intake_deletion(intake)
+
+    assert SDRComplianceSettings.objects.get(org=org_a).enforcement_enabled is False
+    for channel, identifier in (
+        ("email", prospect.email),
+        ("whatsapp", prospect.phone),
+        ("linkedin", prospect.linkedin_url),
+    ):
+        decision = evaluate_contact(
+            org_id=org_a.id,
+            channel=channel,
+            identifier=identifier,
+            prospect=prospect,
+            event_key=f"test:deletion-requested:{channel}",
+        )
+        assert decision.allowed is False
+        assert decision.code == "data_deletion_requested"
+
+    original_email = prospect.email
+    provenance = anonymize_intake(intake)
+    decision = evaluate_contact(
+        org_id=org_a.id,
+        channel="email",
+        identifier=original_email,
+        intake=intake,
+        event_key="test:data-anonymized:email",
+    )
+    assert provenance.status == SDRProvenanceStatus.ANONYMIZED
+    assert decision.allowed is False
+    assert decision.code == "data_anonymized"
 
 
 @pytest.mark.django_db

@@ -19,6 +19,7 @@ from integrations.providers.feishu_base.client import (
     FeishuBaseRecord,
     validate_field_mapping,
 )
+from sdr.compliance import request_intake_deletion
 from sdr.models import LeadInspection, LeadIntake
 from sdr.response import schedule_post_handoff_jobs
 
@@ -337,3 +338,52 @@ def test_completed_research_is_durably_created_then_updated_in_feishu_base(
     assert rerun["status"] == "succeeded"
     assert fake.updated_fields["Research"] == "Updated verified company research."
     assert FeishuBaseSync.objects.filter(intake=intake).count() == 1
+
+
+@pytest.mark.django_db
+def test_deletion_request_stops_queued_feishu_base_export(org_a, monkeypatch):
+    connection = FeishuBaseConnection(
+        org=org_a,
+        app_id="cli_test",
+        app_token="bascn-app",
+        table_id="tbl-target",
+        field_mapping=FIELD_MAPPING,
+        is_active=True,
+    )
+    connection.set_app_secret("super-secret")
+    connection.full_clean()
+    connection.save()
+    intake = LeadIntake.objects.create(
+        org=org_a,
+        source="website_form",
+        source_record_id="feishu-base-deletion-request",
+        raw_payload={
+            "email": "ada@example.com",
+            "company_name": "Analytical Engines Ltd",
+        },
+        normalized_payload={
+            "identity": {"email": "ada@example.com"},
+            "company": {"name": "Analytical Engines Ltd"},
+        },
+        status="completed",
+    )
+    sync_job = next(
+        job
+        for job in schedule_post_handoff_jobs(intake)
+        if job.name == "feishu_base.sync_research_result"
+    )
+    request_intake_deletion(intake)
+    provider_client = Mock(side_effect=AssertionError("provider must not be called"))
+    monkeypatch.setattr(
+        "integrations.providers.feishu_base.sync._client",
+        provider_client,
+    )
+
+    result = run_automation_job.run(str(sync_job.id), str(org_a.id))
+
+    sync = FeishuBaseSync.objects.get(intake=intake)
+    assert result["status"] == "succeeded"
+    assert sync.status == FeishuBaseSyncStatus.SKIPPED
+    assert sync.error_code == "data_deletion_requested"
+    provider_client.assert_not_called()
+    assert schedule_post_handoff_jobs(intake) == []

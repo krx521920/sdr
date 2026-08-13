@@ -7,6 +7,7 @@ from django.test import override_settings
 from automation.models import AutomationJob
 from automation.tasks import run_automation_job
 from common.models import Notification
+from sdr.compliance import request_intake_deletion
 from sdr.models import (
     LeadDelivery,
     LeadDeliveryStatus,
@@ -14,6 +15,7 @@ from sdr.models import (
     LeadLifecycleEvent,
     SDRResponseSettings,
 )
+from sdr.response import schedule_post_handoff_jobs
 
 
 def run_job(job, org):
@@ -125,6 +127,89 @@ def test_completed_intake_sends_idempotent_ack_and_in_app_handoff(
     assert detail.status_code == 200
     assert detail.json()["response_seconds"] is not None
     assert detail.json()["sla_breached"] is False
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+)
+def test_deletion_request_stops_queued_intake_and_response_jobs(
+    admin_client,
+    org_a,
+):
+    SDRResponseSettings.objects.create(
+        org=org_a,
+        acknowledgement_email_enabled=True,
+        sales_in_app_enabled=False,
+    )
+    response = admin_client.post(
+        "/api/sdr/intake/website/",
+        {
+            "source_record_id": "response-loop-deletion-request",
+            "first_name": "Grace",
+            "email": "grace@example.com",
+            "company_name": "Deletion Safe Ltd",
+        },
+        format="json",
+    )
+    assert response.status_code == 202
+    intake = LeadIntake.objects.get(id=response.json()["intake_id"])
+    intake_job = AutomationJob.objects.get(id=response.json()["job_id"])
+    acknowledgement_job = AutomationJob.objects.get(
+        org=org_a,
+        name="sdr.send_acknowledgement",
+    )
+
+    deletion = admin_client.post(
+        f"/api/sdr/compliance/intakes/{intake.id}/deletion/",
+        {"action": "request"},
+        format="json",
+    )
+
+    assert deletion.status_code == 200, deletion.json()
+    assert deletion.json()["status"] == "deletion_requested"
+    assert run_job(intake_job, org_a)["status"] == "succeeded"
+    assert run_job(acknowledgement_job, org_a)["status"] == "succeeded"
+    intake.refresh_from_db()
+    delivery = LeadDelivery.objects.get(
+        intake=intake,
+        kind="acknowledgement_email",
+    )
+    assert intake.status == "received"
+    assert intake.crm_lead_id is None
+    assert delivery.status == LeadDeliveryStatus.SKIPPED
+    assert delivery.last_error_code == "data_deletion_requested"
+    assert mail.outbox == []
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="integrations.tests.urls")
+def test_deletion_request_stops_response_reconciliation(admin_client, org_a):
+    configuration = SDRResponseSettings.objects.create(
+        org=org_a,
+        acknowledgement_email_enabled=False,
+        sales_in_app_enabled=False,
+    )
+    intake = accept_and_process(
+        admin_client,
+        org_a,
+        source_record_id="response-loop-deletion-reconcile",
+    )
+    configuration.acknowledgement_email_enabled = True
+    configuration.sales_in_app_enabled = True
+    configuration.save(
+        update_fields=[
+            "acknowledgement_email_enabled",
+            "sales_in_app_enabled",
+            "updated_at",
+        ]
+    )
+
+    request_intake_deletion(intake)
+
+    assert schedule_post_handoff_jobs(intake) == []
+    assert not LeadDelivery.objects.filter(intake=intake).exists()
 
 
 @pytest.mark.django_db

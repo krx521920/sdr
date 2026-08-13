@@ -29,6 +29,7 @@ from integrations.providers.feishu_base.client import (
     FeishuBaseConfigurationError,
     validate_field_mapping,
 )
+from sdr.compliance import intake_data_restriction
 from sdr.models import LeadInspection, LeadIntake, LeadIntakeStatus
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ def active_feishu_base_connection(*, org_id: UUID) -> FeishuBaseConnection | Non
 def enqueue_feishu_base_sync(*, intake: LeadIntake):
     if intake.status != LeadIntakeStatus.COMPLETED:
         raise FeishuBaseSyncUnavailable("Only completed intakes can be synchronized.")
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        raise FeishuBaseSyncUnavailable(restriction.reason)
     connection = active_feishu_base_connection(org_id=intake.org_id)
     if connection is None:
         raise FeishuBaseSyncUnavailable(
@@ -151,6 +155,10 @@ def process_feishu_base_sync_job(payload: Mapping[str, Any]) -> Mapping[str, Any
             "The Feishu Base sync state no longer exists.",
             code="feishu_sync_not_found",
         )
+    restriction = intake_data_restriction(sync.intake)
+    if restriction:
+        _mark_skipped(sync, restriction.code, error=restriction.reason)
+        return _result(sync, replayed=False)
     if sync.payload_sha256 != expected_hash:
         return _result(sync, replayed=True, stale=True)
     if sync.status == FeishuBaseSyncStatus.SUCCEEDED:
@@ -389,14 +397,20 @@ def _sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _mark_skipped(sync: FeishuBaseSync, code: str) -> None:
+def _mark_skipped(
+    sync: FeishuBaseSync,
+    code: str,
+    *,
+    error: str = "The Feishu Base connection is inactive.",
+) -> None:
     FeishuBaseSync.objects.filter(id=sync.id, org_id=sync.org_id).update(
         status=FeishuBaseSyncStatus.SKIPPED,
         error_code=code,
-        error_message="The Feishu Base connection is inactive.",
+        error_message=error[:1000],
     )
     sync.status = FeishuBaseSyncStatus.SKIPPED
     sync.error_code = code
+    sync.error_message = error[:1000]
 
 
 def _mark_failed(sync: FeishuBaseSync, *, code: str, error: str) -> None:
