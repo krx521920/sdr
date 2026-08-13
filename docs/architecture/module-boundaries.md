@@ -98,6 +98,20 @@ CRM feedback are described in
 Progressive MQL-to-SQL funnel reporting, acquisition-source quality, nurture
 A/B outcomes, first-response SLA, and deterministic weekly optimization prompts
 are described in [sdr-growth-analytics.md](sdr-growth-analytics.md).
+Outbound channel execution, provider readiness, prospect-source clients, and
+channel-specific analytics are resolved through the SDR-owned runtime ports in
+`sdr.provider_ports`. The `integrations` app registers its Apollo, LinkedIn, and
+WhatsApp adapters during Django startup, so SDR services never import provider
+models or implementations directly.
 ICP campaign management, CSV prospect cleaning, tenant-wide deduplication, and
 durable outbound-to-CRM promotion are described in
 [outbound-prospecting.md](outbound-prospecting.md).
+Official WhatsApp Cloud API template delivery, encrypted sender credentials,
+durable campaign jobs, and signed delivery receipts are described in
+[whatsapp-outbound.md](../sdr/whatsapp-outbound.md).
+Official, partner-gated LinkedIn connection invitations are described in
+[linkedin-outbound.md](../sdr/linkedin-outbound.md).
+Official Feishu Bitable field discovery and idempotent research-result upserts
+are implemented by an `integrations` research-result sink registered behind the
+SDR runtime port, as described in
+[feishu-base-research-sync.md](../sdr/feishu-base-research-sync.md).

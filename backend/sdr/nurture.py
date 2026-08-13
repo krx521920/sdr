@@ -21,6 +21,11 @@ from automation.errors import PermanentJobError, RetryableJobError
 from automation.jobs import JobRequest
 from automation.models import AutomationJobStatus
 from automation.services import dispatch_job, enqueue_job
+from sdr.compliance import evaluate_contact
+from sdr.email_safety import (
+    CAMPAIGN_SAFETY_PAUSE_REASON,
+    reserve_delivery_send,
+)
 from sdr.models import (
     LeadIntake,
     LeadIntakeSource,
@@ -35,7 +40,7 @@ from sdr.models import (
     SDRNurtureStep,
 )
 from sdr.response import record_lifecycle_event, validate_message_template
-from sdr.suppression import is_email_suppressed, unsubscribe_url
+from sdr.suppression import unsubscribe_url
 from sdr.tracking import build_tracked_email_content
 
 logger = logging.getLogger(__name__)
@@ -67,7 +72,9 @@ def auto_enroll_intake(intake: LeadIntake) -> LeadNurtureEnrollment | None:
         intake=intake,
     ).first()
     if existing:
-        if is_email_suppressed(org_id=intake.org_id, email=email):
+        if _email_not_permitted(
+            intake, email, event_key="nurture:auto-enroll:existing"
+        ):
             if existing.status not in TERMINAL_ENROLLMENT_STATUSES:
                 stop_enrollment(
                     existing,
@@ -78,7 +85,7 @@ def auto_enroll_intake(intake: LeadIntake) -> LeadNurtureEnrollment | None:
         ensure_enrollment_schedule(existing)
         return existing
 
-    if is_email_suppressed(org_id=intake.org_id, email=email):
+    if _email_not_permitted(intake, email, event_key="nurture:auto-enroll"):
         record_lifecycle_event(
             intake=intake,
             event_type=LeadLifecycleEventType.NURTURE_SUPPRESSED,
@@ -157,7 +164,7 @@ def enroll_intake_in_sequence(
         ensure_enrollment_schedule(existing)
         return existing
 
-    if is_email_suppressed(org_id=intake.org_id, email=email):
+    if _email_not_permitted(intake, email, event_key="nurture:explicit-enroll"):
         record_lifecycle_event(
             intake=intake,
             event_type=LeadLifecycleEventType.NURTURE_SUPPRESSED,
@@ -208,7 +215,11 @@ def ensure_enrollment_schedule(
     if enrollment.status != NurtureEnrollmentStatus.ACTIVE:
         return None
     recipient = _lead_email(enrollment.intake)
-    if is_email_suppressed(org_id=enrollment.org_id, email=recipient):
+    if _email_not_permitted(
+        enrollment.intake,
+        recipient,
+        event_key=f"nurture:schedule:{enrollment.id}",
+    ):
         stop_enrollment(
             enrollment,
             status=NurtureEnrollmentStatus.CANCELLED,
@@ -294,9 +305,10 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     if enrollment.status in TERMINAL_ENROLLMENT_STATUSES:
         _skip_delivery(delivery, code=f"enrollment_{enrollment.status}")
         return _delivery_result(delivery)
-    if is_email_suppressed(
-        org_id=enrollment.org_id,
-        email=delivery.recipient,
+    if _email_not_permitted(
+        enrollment.intake,
+        delivery.recipient,
+        event_key=f"nurture:send:{delivery.id}",
     ):
         stop_enrollment(
             enrollment,
@@ -329,7 +341,29 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         _fail_delivery(delivery, code="invalid_nurture_message", message=str(exc))
         raise PermanentJobError(str(exc), code="invalid_nurture_message") from exc
 
-    _start_delivery(delivery)
+    safety = reserve_delivery_send(delivery)
+    if not safety.allowed:
+        if safety.reason == "campaign_safety_hold":
+            pause_enrollment(
+                enrollment,
+                reason=CAMPAIGN_SAFETY_PAUSE_REASON,
+            )
+            return {
+                **_delivery_result(delivery),
+                "paused": True,
+                "safety_reason": safety.reason,
+            }
+        _enqueue_delivery(delivery)
+        return {
+            **_delivery_result(delivery),
+            "deferred": True,
+            "safety_reason": safety.reason,
+            "next_attempt_at": (
+                safety.next_attempt_at.isoformat() if safety.next_attempt_at else None
+            ),
+            "used_today": safety.used_today,
+            "daily_limit": safety.daily_limit,
+        }
     context = _template_context(enrollment.intake)
     try:
         subject = Template(delivery.subject_template).render(Context(context))
@@ -343,10 +377,7 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         email = EmailMultiAlternatives(
             subject=subject.strip()[:255],
             body=tracked_body,
-            from_email=(
-                enrollment.sequence.from_email
-                or settings.DEFAULT_FROM_EMAIL
-            ),
+            from_email=(enrollment.sequence.from_email or settings.DEFAULT_FROM_EMAIL),
             to=[delivery.recipient],
             headers={
                 "List-Unsubscribe": f"<{opt_out_url}>",
@@ -438,9 +469,13 @@ def resume_enrollment(enrollment: LeadNurtureEnrollment) -> LeadNurtureEnrollmen
     enrollment.status = NurtureEnrollmentStatus.ACTIVE
     enrollment.stop_reason = ""
     enrollment.resume_count += 1
-    pending = enrollment.deliveries.filter(
-        status__in=(NurtureDeliveryStatus.PENDING, NurtureDeliveryStatus.FAILED)
-    ).order_by("step_position").first()
+    pending = (
+        enrollment.deliveries.filter(
+            status__in=(NurtureDeliveryStatus.PENDING, NurtureDeliveryStatus.FAILED)
+        )
+        .order_by("step_position")
+        .first()
+    )
     if pending:
         if pending.scheduled_for < timezone.now():
             pending.scheduled_for = timezone.now()
@@ -476,9 +511,11 @@ def stop_enrollment(
     enrollment.next_run_at = None
     enrollment.completed_at = now
     if status == NurtureEnrollmentStatus.REPLIED:
-        latest = enrollment.deliveries.filter(
-            status=NurtureDeliveryStatus.SENT
-        ).order_by("-sent_at").first()
+        latest = (
+            enrollment.deliveries.filter(status=NurtureDeliveryStatus.SENT)
+            .order_by("-sent_at")
+            .first()
+        )
         if latest:
             sentiment = (
                 reply_sentiment
@@ -552,7 +589,8 @@ def _enqueue_delivery(delivery: LeadNurtureDelivery) -> None:
             org_id=delivery.org_id,
             name=NURTURE_EMAIL_JOB,
             idempotency_key=(
-                f"nurture-delivery:{delivery.id}:dispatch:{enrollment.resume_count}"
+                f"nurture-delivery:{delivery.id}:defer:{delivery.deferral_count}:"
+                f"dispatch:{enrollment.resume_count}"
             ),
             payload={
                 "org_id": str(delivery.org_id),
@@ -703,11 +741,30 @@ def _lead_stop_status(enrollment: LeadNurtureEnrollment) -> str:
 def _lead_email(intake: LeadIntake) -> str:
     if intake.crm_lead and intake.crm_lead.email:
         return intake.crm_lead.email.strip().lower()
-    return str(
-        intake.normalized_payload.get("identity", {}).get("email")
-        or intake.raw_payload.get("email")
-        or ""
-    ).strip().lower()
+    return (
+        str(
+            intake.normalized_payload.get("identity", {}).get("email")
+            or intake.raw_payload.get("email")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
+
+
+def _email_not_permitted(
+    intake: LeadIntake,
+    email: str,
+    *,
+    event_key: str,
+) -> bool:
+    return not evaluate_contact(
+        org_id=intake.org_id,
+        channel="email",
+        identifier=email,
+        intake=intake,
+        event_key=event_key,
+    ).allowed
 
 
 def _template_context(intake: LeadIntake) -> dict[str, Any]:

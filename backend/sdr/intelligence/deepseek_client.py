@@ -54,6 +54,7 @@ class DeepSeekLeadQualifier:
         icp_description: str,
         positive_signals: str,
         negative_signals: str,
+        sales_feedback_calibration: dict | None = None,
     ) -> AIQualification:
         if not self.api_key:
             raise DeepSeekQualificationError(
@@ -67,6 +68,7 @@ class DeepSeekLeadQualifier:
             icp_description=icp_description,
             positive_signals=positive_signals,
             negative_signals=negative_signals,
+            sales_feedback_calibration=sales_feedback_calibration,
         )
         payload = {
             "model": self.model,

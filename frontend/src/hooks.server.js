@@ -112,6 +112,20 @@ function refreshAccessToken(refreshToken) {
 }
 
 /**
+ * Log only non-sensitive transport metadata. Axios errors contain request
+ * headers and bodies, which can include access and refresh tokens.
+ *
+ * @param {string} message
+ * @param {unknown} error
+ */
+function logAuthRequestFailure(message, error) {
+  const metadata = axios.isAxiosError(error)
+    ? { status: error.response?.status, code: error.code }
+    : { code: 'unknown_error' };
+  console.error(message, metadata);
+}
+
+/**
  * Perform the actual refresh round-trip. Use refreshAccessToken() instead —
  * it deduplicates concurrent callers.
  *
@@ -130,7 +144,7 @@ async function performTokenRefresh(refreshToken) {
 
     return { access: response.data.access, refresh: response.data.refresh };
   } catch (error) {
-    console.error('Token refresh failed:', error);
+    logAuthRequestFailure('Token refresh failed', error);
     return null;
   }
 }
@@ -164,7 +178,7 @@ async function switchOrg(accessToken, orgId, refreshToken) {
 
     return response.data;
   } catch (error) {
-    console.error('Org switch failed:', error);
+    logAuthRequestFailure('Org switch failed', error);
     return null;
   }
 }
@@ -279,14 +293,14 @@ export const handle = sequence(Sentry.sentryHandle(), async function _handle({ e
           });
 
           // Extract org info from switch result (no additional API call!)
+          const newPayload = decodeJwtPayload(switchResult.access_token);
           event.locals.org = switchResult.current_org;
           /** @type {any} */ (event.locals).profile = {
             org: switchResult.current_org,
-            role: 'USER' // Will be in new JWT
+            role: typeof newPayload?.role === 'string' ? newPayload.role : 'USER'
           };
           event.locals.org_name = switchResult.current_org?.name || 'Organization';
           // Decode new token to get org_settings
-          const newPayload = decodeJwtPayload(switchResult.access_token);
           event.locals.org_settings = newPayload?.org_settings || {
             default_currency: 'USD',
             currency_symbol: '$',

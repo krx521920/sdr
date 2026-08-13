@@ -29,6 +29,8 @@ export async function load({ params, locals, cookies }) {
     const lead = response.lead_obj || response.lead || response;
     let messengerConversation = { available: false, messages: [], can_reply: false };
     let messengerConversationError = '';
+    let salesFeedback = { available: false };
+    let salesFeedbackError = '';
     try {
       messengerConversation = await apiRequest(
         `/integrations/facebook/conversations/leads/${params.id}/`,
@@ -39,6 +41,16 @@ export async function load({ params, locals, cookies }) {
       console.error('Failed to load Messenger conversation:', err);
       messengerConversationError =
         /** @type {any} */ (err)?.message || 'Failed to load Messenger conversation';
+    }
+    try {
+      salesFeedback = await apiRequest(
+        `/sdr/sales-feedback/leads/${params.id}/`,
+        {},
+        { cookies, org }
+      );
+    } catch (err) {
+      console.error('Failed to load SDR sales feedback:', err);
+      salesFeedbackError = /** @type {any} */ (err)?.message || 'Failed to load SDR sales feedback';
     }
 
     return {
@@ -52,7 +64,9 @@ export async function load({ params, locals, cookies }) {
       customFieldValues: lead?.custom_fields || {},
       messengerConversation,
       messengerConversationError,
-      messengerRequestId: randomUUID()
+      messengerRequestId: randomUUID(),
+      salesFeedback,
+      salesFeedbackError
     };
   } catch (err) {
     if (/** @type {any} */ (err)?.status) throw err;
@@ -111,6 +125,30 @@ export const actions = {
       console.error('Send Messenger reply error:', err);
       return fail(400, {
         messengerError: /** @type {any} */ (err)?.message || 'Failed to send Messenger reply'
+      });
+    }
+  },
+
+  saveSalesFeedback: async ({ request, params, locals, cookies }) => {
+    const form = await request.formData();
+    const payload = {
+      decision: form.get('decision')?.toString() || '',
+      reason: form.get('reason')?.toString() || '',
+      quality_score: Number(form.get('quality_score')),
+      satisfaction_score: Number(form.get('satisfaction_score')),
+      notes: form.get('notes')?.toString().trim() || ''
+    };
+    try {
+      await apiRequest(
+        `/sdr/sales-feedback/leads/${params.id}/`,
+        { method: 'PUT', body: payload },
+        { cookies, org: locals.org }
+      );
+      return { salesFeedbackSaved: true };
+    } catch (err) {
+      console.error('Save SDR sales feedback error:', err);
+      return fail(400, {
+        salesFeedbackError: /** @type {any} */ (err)?.message || 'Failed to save SDR sales feedback'
       });
     }
   }

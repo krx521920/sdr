@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
+from sdr.compliance import ensure_intake_provenance
 from sdr.domain import LeadCandidate
 from sdr.intelligence.service import LeadInspector
 from sdr.models import LeadIntake, LeadIntakeStatus, LeadLifecycleEventType
@@ -93,6 +94,11 @@ def accept_candidate_intake(
             event_key="received",
             data={"source": candidate.source.value},
         )
+        ensure_intake_provenance(
+            intake=intake,
+            candidate=candidate,
+            raw_payload=raw_payload,
+        )
         return LeadIntakeAcceptance(
             intake_id=intake.id,
             status=intake.status,
@@ -106,6 +112,11 @@ def process_candidate_intake(
 ) -> LeadIntakeResult:
     """Run any normalized provider lead through the durable SDR pipeline."""
     intake, replayed = _claim_intake(candidate=candidate, raw_payload=raw_payload)
+    ensure_intake_provenance(
+        intake=intake,
+        candidate=candidate,
+        raw_payload=raw_payload,
+    )
     record_lifecycle_event(
         intake=intake,
         event_type=LeadLifecycleEventType.RECEIVED,

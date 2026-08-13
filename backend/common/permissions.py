@@ -59,6 +59,22 @@ class IsOrgAdmin(permissions.BasePermission):
         return request.profile.role == "ADMIN" or request.profile.is_organization_admin
 
 
+class HasSalesAccess(permissions.BasePermission):
+    """Allow organization administrators and active sales-enabled profiles."""
+
+    message = "Sales access is required to review SDR handoffs."
+
+    def has_permission(self, request, view):
+        profile = getattr(request, "profile", None)
+        if profile is None:
+            return False
+        return bool(
+            profile.role == "ADMIN"
+            or profile.is_organization_admin
+            or profile.has_sales_access
+        )
+
+
 class IsSuperAdmin(permissions.BasePermission):
     """
     Permission class for platform-level super admins.

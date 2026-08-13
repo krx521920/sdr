@@ -36,6 +36,10 @@ services:
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
+    environment:
+      STATIC_ROOT: /tmp/staticfiles
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
       - ./backend:/app
       - ./docker/backend/entrypoint.sh:/entrypoint.sh:ro
@@ -64,7 +68,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A crm worker --loglevel=info
+    command: celery -A crm worker --loglevel=info --queues=celery,default
 
   celery-beat:
     build:
@@ -82,7 +86,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A crm beat --loglevel=info
+    command: celery -A crm beat --loglevel=info --schedule=/tmp/celerybeat-schedule
 
   frontend:
     build:

@@ -33,6 +33,11 @@ from sdr.models import (
     LeadLifecycleEventType,
     SDRResponseSettings,
 )
+from sdr.provider_ports import (
+    ProviderAdapterError,
+    ProviderAdapterUnavailable,
+    research_result_sink_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +162,15 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
                 job_name=SALES_FEISHU_JOB,
             )
         )
+
+    try:
+        sink = research_result_sink_adapter("feishu_base")
+        if sink.is_ready(org_id=intake.org_id):
+            jobs.append(sink.enqueue(intake=intake))
+    except ProviderAdapterUnavailable:
+        logger.debug("Feishu Base research-result sink is not registered")
+    except ProviderAdapterError:
+        logger.exception("Could not schedule Feishu Base sync for intake %s", intake.id)
 
     for job in jobs:
         if job.name == ACKNOWLEDGEMENT_JOB:

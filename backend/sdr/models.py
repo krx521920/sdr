@@ -1,5 +1,9 @@
 """Durable intake records for reliable, tenant-scoped SDR processing."""
 
+from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models.functions import Lower
@@ -34,6 +38,101 @@ Thanks for contacting {{ organization_name }}. We have received your request and
 
 Best,
 {{ organization_name }}"""
+
+
+def validate_iana_timezone(value: str) -> None:
+    try:
+        ZoneInfo(value)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValidationError("Enter a valid IANA timezone.") from exc
+
+
+def validate_send_weekdays(value) -> None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(day, int) or day < 0 or day > 6 for day in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValidationError("Send weekdays must be unique integers from 0 to 6.")
+
+
+def default_send_weekdays() -> list[int]:
+    return [0, 1, 2, 3, 4]
+
+
+def default_compliance_channels() -> list[str]:
+    return ["email", "whatsapp", "linkedin", "phone"]
+
+
+class SDRComplianceChannel(models.TextChoices):
+    EMAIL = "email", "Email"
+    WHATSAPP = "whatsapp", "WhatsApp"
+    LINKEDIN = "linkedin", "LinkedIn"
+    PHONE = "phone", "Phone"
+
+
+class SDRLawfulBasis(models.TextChoices):
+    UNASSESSED = "unassessed", "Not assessed"
+    CONSENT = "consent", "Consent"
+    LEGITIMATE_INTEREST = "legitimate_interest", "Legitimate interest"
+    CONTRACT = "contract", "Contract / pre-contract request"
+    LEGAL_OBLIGATION = "legal_obligation", "Legal obligation"
+    PUBLIC_TASK = "public_task", "Public task"
+    VITAL_INTEREST = "vital_interest", "Vital interest"
+
+
+class SDRCollectionMethod(models.TextChoices):
+    INBOUND_FORM = "inbound_form", "Inbound form"
+    DIRECT_MESSAGE = "direct_message", "Direct message"
+    INBOUND_EMAIL = "inbound_email", "Inbound email"
+    PROVIDER_API = "provider_api", "Provider API"
+    CSV_IMPORT = "csv_import", "CSV import"
+    MANUAL = "manual", "Manual entry"
+    OTHER = "other", "Other"
+
+
+class SDRRetentionMode(models.TextChoices):
+    DISABLED = "disabled", "Disabled"
+    AUDIT_ONLY = "audit_only", "Audit only"
+    ANONYMIZE_SDR = "anonymize_sdr", "Anonymize SDR-owned data"
+
+
+class SDRProvenanceStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    RETENTION_DUE = "retention_due", "Retention review due"
+    DELETION_REQUESTED = "deletion_requested", "Deletion requested"
+    ANONYMIZED = "anonymized", "Anonymized"
+
+
+class SDRDoNotContactReason(models.TextChoices):
+    UNSUBSCRIBED = "unsubscribed", "Unsubscribed / objected"
+    COMPLAINT = "complaint", "Complaint"
+    ADMIN = "admin", "Administrator"
+    REGULATORY = "regulatory", "Regulatory rule"
+    DATA_REQUEST = "data_request", "Data subject request"
+    INVALID = "invalid", "Invalid contact"
+
+
+class SDRDoNotContactSource(models.TextChoices):
+    EMAIL_SUPPRESSION = "email_suppression", "Email suppression"
+    PROVIDER = "provider", "Provider"
+    ADMIN = "admin", "Administrator"
+    DATA_SUBJECT = "data_subject", "Data subject"
+    RETENTION = "retention", "Retention workflow"
+    SYSTEM = "system", "System"
+
+
+class SDRComplianceEventType(models.TextChoices):
+    PROVENANCE_RECORDED = "provenance_recorded", "Provenance recorded"
+    CONTACT_ALLOWED = "contact_allowed", "Contact allowed"
+    CONTACT_BLOCKED = "contact_blocked", "Contact blocked"
+    DNC_ADDED = "dnc_added", "Do-not-contact added"
+    DNC_RELEASED = "dnc_released", "Do-not-contact released"
+    RETENTION_DUE = "retention_due", "Retention review due"
+    DELETION_REQUESTED = "deletion_requested", "Deletion requested"
+    DELETION_CANCELLED = "deletion_cancelled", "Deletion request cancelled"
+    ANONYMIZED = "anonymized", "SDR data anonymized"
 
 
 class SDRRoutingStrategy(models.TextChoices):
@@ -218,7 +317,7 @@ class SDRModelCredential(BaseOrgModel):
         indexes = [
             models.Index(
                 fields=["org", "provider", "is_active"],
-                name="sdr_credential_org_provider_idx",
+                name="sdr_cred_org_provider_idx",
             )
         ]
 
@@ -257,6 +356,46 @@ class SDRResponseSettings(BaseOrgModel):
         default=60,
         validators=[MinValueValidator(1), MaxValueValidator(86400)],
     )
+    email_safety_enabled = models.BooleanField(default=True)
+    org_daily_send_limit = models.PositiveIntegerField(
+        default=1000,
+        validators=[MinValueValidator(1), MaxValueValidator(100000)],
+        help_text="Maximum nurture emails sent by the organization per local day.",
+    )
+    bounce_rate_threshold = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=5,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Campaign bounce percentage that triggers a safety hold.",
+    )
+    complaint_rate_threshold = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0.1,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Campaign complaint percentage that triggers a safety hold.",
+    )
+    safety_min_sample_size = models.PositiveIntegerField(
+        default=100,
+        validators=[MinValueValidator(1), MaxValueValidator(1000000)],
+    )
+    safety_window_days = models.PositiveSmallIntegerField(
+        default=7,
+        validators=[MinValueValidator(1), MaxValueValidator(90)],
+    )
+    enforce_recipient_working_hours = models.BooleanField(default=False)
+    default_recipient_timezone = models.CharField(
+        max_length=64,
+        default="UTC",
+        validators=[validate_iana_timezone],
+    )
+    recipient_send_window_start = models.TimeField(default=time(9, 0))
+    recipient_send_window_end = models.TimeField(default=time(17, 0))
+    recipient_send_weekdays = models.JSONField(
+        default=default_send_weekdays,
+        validators=[validate_send_weekdays],
+    )
 
     class Meta:
         db_table = "sdr_response_settings"
@@ -274,6 +413,35 @@ class SDRResponseSettings(BaseOrgModel):
     def clear_feishu_webhook(self) -> None:
         self.feishu_webhook_ciphertext = ""
         self.feishu_webhook_hint = ""
+
+
+class SDRComplianceSettings(BaseOrgModel):
+    """Tenant controls for contact eligibility and SDR data retention."""
+
+    org = models.OneToOneField(
+        "common.Org",
+        on_delete=models.CASCADE,
+        related_name="sdr_compliance_settings",
+    )
+    enforcement_enabled = models.BooleanField(default=False)
+    require_lawful_basis = models.BooleanField(default=True)
+    retention_mode = models.CharField(
+        max_length=24,
+        choices=SDRRetentionMode.choices,
+        default=SDRRetentionMode.AUDIT_ONLY,
+    )
+    retention_days = models.PositiveIntegerField(
+        default=730,
+        validators=[MinValueValidator(30), MaxValueValidator(3650)],
+    )
+    deletion_grace_days = models.PositiveSmallIntegerField(
+        default=30,
+        validators=[MinValueValidator(0), MaxValueValidator(365)],
+    )
+    last_retention_scan_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sdr_compliance_settings"
 
 
 class LeadInspection(BaseOrgModel):
@@ -382,6 +550,252 @@ class LeadIntake(BaseOrgModel):
 
     def __str__(self) -> str:
         return f"{self.source}:{self.source_record_id}"
+
+
+class SDRDataProvenance(BaseOrgModel):
+    """Auditable collection source and legal assessment for one intake."""
+
+    intake = models.OneToOneField(
+        LeadIntake,
+        on_delete=models.CASCADE,
+        related_name="data_provenance",
+    )
+    collection_method = models.CharField(
+        max_length=24,
+        choices=SDRCollectionMethod.choices,
+        default=SDRCollectionMethod.OTHER,
+    )
+    source_url = models.URLField(max_length=1000, blank=True)
+    lawful_basis = models.CharField(
+        max_length=32,
+        choices=SDRLawfulBasis.choices,
+        default=SDRLawfulBasis.UNASSESSED,
+    )
+    lawful_basis_notes = models.TextField(blank=True)
+    consent_at = models.DateTimeField(null=True, blank=True)
+    consent_evidence = models.TextField(blank=True)
+    country_code = models.CharField(max_length=3, blank=True)
+    allowed_channels = models.JSONField(
+        default=default_compliance_channels,
+        blank=True,
+    )
+    retention_until = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=24,
+        choices=SDRProvenanceStatus.choices,
+        default=SDRProvenanceStatus.ACTIVE,
+    )
+    deletion_requested_at = models.DateTimeField(null=True, blank=True)
+    anonymized_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sdr_data_provenance"
+        indexes = [
+            models.Index(
+                fields=["org", "status", "retention_until"],
+                name="sdr_prov_retention_idx",
+            )
+        ]
+
+
+class SDRChannelComplianceRule(BaseOrgModel):
+    """Country/channel rule; '*' is the organization-wide fallback."""
+
+    country_code = models.CharField(max_length=3, default="*")
+    channel = models.CharField(max_length=16, choices=SDRComplianceChannel.choices)
+    is_allowed = models.BooleanField(default=True)
+    requires_consent = models.BooleanField(default=False)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "sdr_channel_compliance_rule"
+        ordering = ("country_code", "channel")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "country_code", "channel"],
+                name="unique_sdr_country_channel_rule",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "country_code"],
+                name="sdr_rule_channel_country_idx",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self.country_code = (self.country_code or "*").strip().upper()
+        return super().save(*args, **kwargs)
+
+
+class SDRDoNotContactEntry(BaseOrgModel):
+    """Cross-channel contact objection / block list."""
+
+    channel = models.CharField(max_length=16, choices=SDRComplianceChannel.choices)
+    identifier = models.CharField(max_length=1000)
+    identifier_hash = models.CharField(max_length=64)
+    country_code = models.CharField(max_length=3, blank=True)
+    reason = models.CharField(max_length=24, choices=SDRDoNotContactReason.choices)
+    source = models.CharField(max_length=24, choices=SDRDoNotContactSource.choices)
+    is_active = models.BooleanField(default=True)
+    blocked_at = models.DateTimeField(default=timezone.now)
+    released_at = models.DateTimeField(null=True, blank=True)
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "sdr_do_not_contact"
+        ordering = ("-is_active", "-blocked_at")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "channel", "identifier_hash"],
+                name="unique_sdr_channel_dnc",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "is_active", "identifier_hash"],
+                name="sdr_dnc_active_lookup_idx",
+            )
+        ]
+
+
+class SDRComplianceEvent(BaseOrgModel):
+    """Immutable audit fact produced by compliance decisions and workflows."""
+
+    intake = models.ForeignKey(
+        LeadIntake,
+        on_delete=models.SET_NULL,
+        related_name="compliance_events",
+        null=True,
+        blank=True,
+    )
+    prospect = models.ForeignKey(
+        "sdr.SDROutboundProspect",
+        on_delete=models.SET_NULL,
+        related_name="compliance_events",
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(
+        max_length=32,
+        choices=SDRComplianceEventType.choices,
+    )
+    channel = models.CharField(
+        max_length=16,
+        choices=SDRComplianceChannel.choices,
+        blank=True,
+    )
+    allowed = models.BooleanField(null=True, blank=True)
+    reason = models.CharField(max_length=500, blank=True)
+    event_key = models.CharField(max_length=255)
+    snapshot = models.JSONField(default=dict, blank=True)
+    occurred_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "sdr_compliance_event"
+        ordering = ("-occurred_at", "-created_at")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "event_key"],
+                name="unique_sdr_compliance_event",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "event_type", "-occurred_at"],
+                name="sdr_compliance_event_idx",
+            )
+        ]
+
+
+class SalesFeedbackDecision(models.TextChoices):
+    ACCEPTED = "accepted", "Accepted"
+    REJECTED = "rejected", "Rejected"
+    RECYCLE = "recycle", "Recycle / nurture"
+
+
+class SalesFeedbackReason(models.TextChoices):
+    GOOD_FIT = "good_fit", "Good fit"
+    WRONG_INDUSTRY = "wrong_industry", "Wrong industry"
+    WRONG_COMPANY_SIZE = "wrong_company_size", "Wrong company size"
+    WRONG_ROLE = "wrong_role", "Wrong contact role"
+    BAD_CONTACT = "bad_contact", "Invalid or unreachable contact"
+    NO_NEED = "no_need", "No current need"
+    NO_BUDGET = "no_budget", "No budget"
+    BAD_TIMING = "bad_timing", "Bad timing"
+    DUPLICATE = "duplicate", "Duplicate"
+    OTHER = "other", "Other"
+
+
+class SDRSalesFeedback(BaseOrgModel):
+    """Current sales verdict for an SDR handoff, with immutable AI snapshots."""
+
+    intake = models.OneToOneField(
+        LeadIntake,
+        on_delete=models.CASCADE,
+        related_name="sales_feedback",
+    )
+    feedback_by = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.SET_NULL,
+        related_name="submitted_sdr_sales_feedback",
+        null=True,
+    )
+    decision = models.CharField(max_length=16, choices=SalesFeedbackDecision.choices)
+    reason = models.CharField(
+        max_length=32,
+        choices=SalesFeedbackReason.choices,
+        blank=True,
+    )
+    quality_score = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    satisfaction_score = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    notes = models.CharField(max_length=1000, blank=True)
+    qualification_score_snapshot = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+    qualification_band_snapshot = models.CharField(max_length=32, blank=True)
+    provider_snapshot = models.CharField(max_length=32, blank=True)
+    model_snapshot = models.CharField(max_length=100, blank=True)
+    prompt_version_snapshot = models.CharField(max_length=64, blank=True)
+    submitted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "sdr_sales_feedback"
+        ordering = ("-submitted_at", "-created_at")
+        indexes = [
+            models.Index(
+                fields=["org", "decision", "-submitted_at"],
+                name="sdr_feedback_org_decision_idx",
+            ),
+            models.Index(
+                fields=["org", "qualification_band_snapshot", "-submitted_at"],
+                name="sdr_feedback_org_band_idx",
+            ),
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        errors = {}
+        if self.intake_id and self.org_id != self.intake.org_id:
+            errors["intake"] = "Feedback and intake must belong to the same organization."
+        if self.feedback_by_id and self.org_id != self.feedback_by.org_id:
+            errors["feedback_by"] = (
+                "Feedback author must belong to the same organization."
+            )
+        if self.decision == SalesFeedbackDecision.ACCEPTED:
+            if self.reason and self.reason != SalesFeedbackReason.GOOD_FIT:
+                errors["reason"] = "Accepted feedback may only use the good-fit reason."
+        elif not self.reason:
+            errors["reason"] = "A reason is required for rejected or recycled leads."
+        if self.reason == SalesFeedbackReason.OTHER and not self.notes.strip():
+            errors["notes"] = "Add notes when the reason is Other."
+        if errors:
+            raise ValidationError(errors)
 
 
 class LeadLifecycleEventType(models.TextChoices):
@@ -657,6 +1071,7 @@ class LeadNurtureDelivery(BaseOrgModel):
     )
     scheduled_for = models.DateTimeField()
     attempt_count = models.PositiveIntegerField(default=0)
+    deferral_count = models.PositiveIntegerField(default=0)
     last_error_code = models.CharField(max_length=80, blank=True)
     last_error_message = models.TextField(blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
@@ -854,7 +1269,7 @@ class SDREmailProviderEvent(BaseOrgModel):
         indexes = [
             models.Index(
                 fields=["org", "event_type", "-event_at"],
-                name="sdr_provider_event_org_type_idx",
+                name="sdr_event_org_type_idx",
             )
         ]
 
@@ -879,6 +1294,18 @@ class OutboundProspectStatus(models.TextChoices):
     DISQUALIFIED = "disqualified", "Disqualified"
 
 
+class OutboundSourceProvider(models.TextChoices):
+    APOLLO = "apollo", "Apollo"
+
+
+class OutboundCopyDraftStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    GENERATING = "generating", "Generating"
+    READY = "ready", "Ready for review"
+    FAILED = "failed", "Failed"
+    APPLIED = "applied", "Applied"
+
+
 class SDROutboundCampaign(BaseOrgModel):
     """Tenant-owned ICP campaign grouping a cleaned outbound prospect list."""
 
@@ -886,6 +1313,9 @@ class SDROutboundCampaign(BaseOrgModel):
     description = models.TextField(blank=True)
     icp_description = models.TextField(blank=True)
     channels = models.JSONField(default=list, blank=True)
+    linkedin_invitation_message = models.CharField(max_length=300, blank=True)
+    whatsapp_template_name = models.CharField(max_length=512, blank=True)
+    whatsapp_template_language = models.CharField(max_length=20, default="en_US")
     sequence = models.ForeignKey(
         SDRNurtureSequence,
         on_delete=models.PROTECT,
@@ -914,6 +1344,11 @@ class SDROutboundCampaign(BaseOrgModel):
     completed_at = models.DateTimeField(null=True, blank=True)
     run_count = models.PositiveIntegerField(default=0)
     last_refilled_at = models.DateTimeField(null=True, blank=True)
+    safety_hold = models.BooleanField(default=False)
+    safety_paused_at = models.DateTimeField(null=True, blank=True)
+    safety_cleared_at = models.DateTimeField(null=True, blank=True)
+    safety_pause_reason = models.CharField(max_length=500, blank=True)
+    safety_snapshot = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "sdr_outbound_campaign"
@@ -954,8 +1389,25 @@ class SDROutboundProspect(BaseOrgModel):
     website = models.URLField(max_length=500, blank=True)
     industry = models.CharField(max_length=255, blank=True)
     country = models.CharField(max_length=100, blank=True)
+    recipient_timezone = models.CharField(
+        max_length=64,
+        blank=True,
+        validators=[validate_iana_timezone],
+    )
     source_url = models.URLField(max_length=1000, blank=True)
     notes = models.TextField(blank=True)
+    lawful_basis = models.CharField(
+        max_length=32,
+        choices=SDRLawfulBasis.choices,
+        default=SDRLawfulBasis.UNASSESSED,
+    )
+    lawful_basis_notes = models.TextField(blank=True)
+    consent_at = models.DateTimeField(null=True, blank=True)
+    consent_evidence = models.TextField(blank=True)
+    allowed_channels = models.JSONField(
+        default=default_compliance_channels,
+        blank=True,
+    )
     dedupe_key = models.CharField(max_length=64)
     status = models.CharField(
         max_length=16,
@@ -995,3 +1447,135 @@ class SDROutboundProspect(BaseOrgModel):
     def __str__(self) -> str:
         contact = " ".join(filter(None, (self.first_name, self.last_name)))
         return contact or self.email or self.company_name
+
+
+class SDROutboundSource(BaseOrgModel):
+    """Recurring provider query that imports prospects into one campaign."""
+
+    campaign = models.ForeignKey(
+        SDROutboundCampaign,
+        on_delete=models.CASCADE,
+        related_name="sources",
+    )
+    name = models.CharField(max_length=160)
+    provider = models.CharField(
+        max_length=24,
+        choices=OutboundSourceProvider.choices,
+        default=OutboundSourceProvider.APOLLO,
+    )
+    is_active = models.BooleanField(default=False)
+    search_filters = models.JSONField(default=dict)
+    interval_hours = models.PositiveSmallIntegerField(
+        default=24,
+        validators=[MinValueValidator(1), MaxValueValidator(168)],
+    )
+    max_results_per_sync = models.PositiveSmallIntegerField(
+        default=25,
+        validators=[MinValueValidator(1), MaxValueValidator(100)],
+        help_text="Maximum Apollo enrichment requests made by one source sync.",
+    )
+    enrichment_credits_acknowledged = models.BooleanField(default=False)
+    next_sync_at = models.DateTimeField(null=True, blank=True)
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    last_job_id = models.UUIDField(null=True, blank=True)
+    next_page = models.PositiveSmallIntegerField(default=1)
+    sync_count = models.PositiveIntegerField(default=0)
+    last_sync_stats = models.JSONField(default=dict, blank=True)
+    last_error_code = models.CharField(max_length=80, blank=True)
+    last_error_message = models.CharField(max_length=1000, blank=True)
+
+    class Meta:
+        db_table = "sdr_outbound_source"
+        ordering = ("name", "created_at")
+        constraints = [
+            models.UniqueConstraint(
+                Lower("name"),
+                "campaign",
+                "org",
+                name="unique_sdr_out_source_name",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "is_active", "next_sync_at"],
+                name="sdr_out_source_due_idx",
+            )
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        if self.campaign_id and self.org_id and self.campaign.org_id != self.org_id:
+            raise ValidationError("Outbound source campaign must belong to the org")
+        if self.is_active and not self.enrichment_credits_acknowledged:
+            raise ValidationError(
+                "Acknowledge Apollo enrichment credit usage before enabling the source"
+            )
+
+    def __str__(self) -> str:
+        return f"{self.campaign}:{self.name}"
+
+
+class SDROutboundCopyDraft(BaseOrgModel):
+    """AI-generated campaign copy that requires an explicit human apply action."""
+
+    campaign = models.ForeignKey(
+        SDROutboundCampaign,
+        on_delete=models.CASCADE,
+        related_name="copy_drafts",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=OutboundCopyDraftStatus.choices,
+        default=OutboundCopyDraftStatus.PENDING,
+    )
+    language = models.CharField(max_length=40, default="English")
+    tone = models.CharField(max_length=80, default="concise and consultative")
+    offering_summary = models.TextField()
+    value_proposition = models.TextField()
+    proof_points = models.TextField(blank=True)
+    cta_goal = models.CharField(max_length=500)
+    step_count = models.PositiveSmallIntegerField(
+        default=3,
+        validators=[MinValueValidator(1), MaxValueValidator(5)],
+    )
+    generated_steps = models.JSONField(default=list, blank=True)
+    provider = models.CharField(max_length=24, blank=True)
+    model = models.CharField(max_length=100, blank=True)
+    prompt_version = models.CharField(max_length=80, blank=True)
+    provider_response_id = models.CharField(max_length=255, blank=True)
+    provider_attempts = models.JSONField(default=list, blank=True)
+    input_tokens = models.PositiveIntegerField(null=True, blank=True)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True)
+    last_job_id = models.UUIDField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.SET_NULL,
+        related_name="reviewed_sdr_outbound_copy_drafts",
+        null=True,
+        blank=True,
+    )
+    generated_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=80, blank=True)
+    error_message = models.CharField(max_length=1000, blank=True)
+
+    class Meta:
+        db_table = "sdr_outbound_copy_draft"
+        ordering = ("-created_at", "id")
+        indexes = [
+            models.Index(
+                fields=["org", "campaign", "-created_at"],
+                name="sdr_copy_draft_campaign_idx",
+            )
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        if self.campaign_id and self.org_id and self.campaign.org_id != self.org_id:
+            raise ValidationError("Outbound copy draft campaign must belong to the org")
+        if self.reviewed_by_id and self.reviewed_by.org_id != self.org_id:
+            raise ValidationError("Outbound copy reviewer must belong to the org")
+
+    def __str__(self) -> str:
+        return f"{self.campaign}:copy:{self.status}"

@@ -14,10 +14,14 @@ from sdr.models import (
     LeadNurtureEnrollment,
     NurtureDeliveryStatus,
     NurtureEnrollmentStatus,
+    OutboundCampaignStatus,
     SDREmailProviderEvent,
     SDREmailSuppression,
     SDRNurtureSequence,
     SDRNurtureStep,
+    SDROutboundCampaign,
+    SDROutboundProspect,
+    SDRResponseSettings,
 )
 
 
@@ -131,6 +135,7 @@ def post_feedback(client, delivery, event_type, *, event_id, **message_kwargs):
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
 def test_permanent_ses_bounce_is_idempotent_and_suppresses_email(
     admin_client,
+    unauthenticated_client,
     org_a,
     monkeypatch,
 ):
@@ -138,13 +143,13 @@ def test_permanent_ses_bounce_is_idempotent_and_suppresses_email(
     delivery = sent_delivery(org_a)
 
     first = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Bounce",
         event_id="sns-bounce-1",
     )
     replay = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Bounce",
         event_id="sns-bounce-1",
@@ -177,6 +182,7 @@ def test_permanent_ses_bounce_is_idempotent_and_suppresses_email(
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
 def test_ses_complaint_suppresses_and_delivery_event_updates_metrics(
     admin_client,
+    unauthenticated_client,
     org_a,
     monkeypatch,
 ):
@@ -188,13 +194,13 @@ def test_ses_complaint_suppresses_and_delivery_event_updates_metrics(
     )
 
     delivered = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Delivery",
         event_id="sns-delivery-1",
     )
     complained = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Complaint",
         event_id="sns-complaint-1",
@@ -217,8 +223,81 @@ def test_ses_complaint_suppresses_and_delivery_event_updates_metrics(
 
 @pytest.mark.django_db
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
-def test_transient_bounce_is_audited_without_suppression(
+def test_ses_bounce_threshold_auto_pauses_outbound_campaign(
     admin_client,
+    unauthenticated_client,
+    org_a,
+    monkeypatch,
+):
+    monkeypatch.setattr(ses_views, "verify_sns_message", lambda payload: None)
+    delivery = sent_delivery(
+        org_a,
+        email="circuit-breaker@example.com",
+        provider_message_id="ses-message-circuit-breaker",
+    )
+    campaign = SDROutboundCampaign.objects.create(
+        org=org_a,
+        name="Circuit breaker",
+        channels=["email"],
+        sequence=delivery.enrollment.sequence,
+        status=OutboundCampaignStatus.ACTIVE,
+        run_count=1,
+    )
+    SDROutboundProspect.objects.create(
+        org=org_a,
+        campaign=campaign,
+        company_name="Circuit Breaker Inc",
+        email=delivery.recipient,
+        dedupe_key="circuit-breaker",
+        intake=delivery.enrollment.intake,
+    )
+    SDRResponseSettings.objects.create(
+        org=org_a,
+        safety_min_sample_size=1,
+        bounce_rate_threshold=5,
+        complaint_rate_threshold=100,
+    )
+
+    response = post_feedback(
+        unauthenticated_client,
+        delivery,
+        "Bounce",
+        event_id="sns-bounce-circuit-breaker",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["campaign_safety"]["paused"] is True
+    campaign.refresh_from_db()
+    delivery.enrollment.refresh_from_db()
+    assert campaign.status == OutboundCampaignStatus.PAUSED
+    assert campaign.safety_hold is True
+    assert campaign.safety_snapshot["bounce_rate"] == 100.0
+    # The bounced recipient is cancelled by suppression; the campaign hold
+    # pauses every other still-active enrollment in the same campaign.
+    assert delivery.enrollment.status == NurtureEnrollmentStatus.CANCELLED
+
+    blocked = admin_client.post(
+        f"/api/sdr/outbound/campaigns/{campaign.id}/action/",
+        {"action": "launch"},
+        format="json",
+    )
+    cleared = admin_client.post(
+        f"/api/sdr/outbound/campaigns/{campaign.id}/action/",
+        {"action": "clear_safety_hold"},
+        format="json",
+    )
+    assert blocked.status_code == 409
+    assert cleared.status_code == 200
+    assert cleared.json()["execution"]["cleared"] is True
+    campaign.refresh_from_db()
+    assert campaign.safety_hold is False
+    assert campaign.safety_cleared_at is not None
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="integrations.tests.urls")
+def test_transient_bounce_is_audited_without_suppression(
+    unauthenticated_client,
     org_a,
     monkeypatch,
 ):
@@ -230,7 +309,7 @@ def test_transient_bounce_is_audited_without_suppression(
     )
 
     response = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Bounce",
         event_id="sns-bounce-transient-1",
@@ -249,7 +328,7 @@ def test_transient_bounce_is_audited_without_suppression(
 @pytest.mark.django_db
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
 def test_ses_feedback_rejects_bad_signature_and_ignores_recipient_mismatch(
-    admin_client,
+    unauthenticated_client,
     org_a,
     monkeypatch,
 ):
@@ -264,7 +343,7 @@ def test_ses_feedback_rejects_bad_signature_and_ignores_recipient_mismatch(
 
     monkeypatch.setattr(ses_views, "verify_sns_message", reject_signature)
     rejected = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Bounce",
         event_id="sns-forged-1",
@@ -274,7 +353,7 @@ def test_ses_feedback_rejects_bad_signature_and_ignores_recipient_mismatch(
 
     monkeypatch.setattr(ses_views, "verify_sns_message", lambda payload: None)
     mismatch = post_feedback(
-        admin_client,
+        unauthenticated_client,
         delivery,
         "Bounce",
         event_id="sns-mismatch-1",

@@ -3,6 +3,7 @@ from datetime import timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
@@ -14,6 +15,8 @@ from rest_framework.views import APIView
 
 from common.permissions import HasOrgContext, IsOrgAdmin
 from integrations.api.serializers import (
+    ApolloConnectionSerializer,
+    ApolloConnectionWriteSerializer,
     FacebookConversionSettingsSerializer,
     FacebookMessengerManualReplySerializer,
     FacebookMessengerSettingsSerializer,
@@ -22,13 +25,24 @@ from integrations.api.serializers import (
     FacebookOAuthStartSerializer,
     FacebookPageConnectionCreateSerializer,
     FacebookPageConnectionSerializer,
+    FeishuBaseConnectionSerializer,
+    FeishuBaseConnectionWriteSerializer,
+    LinkedInConnectionSerializer,
+    LinkedInConnectionWriteSerializer,
+    WhatsAppBusinessConnectionSerializer,
+    WhatsAppBusinessConnectionWriteSerializer,
 )
 from integrations.models import (
+    ApolloConnection,
     FacebookConversionSettings,
     FacebookMessengerMessage,
     FacebookMessengerReply,
     FacebookOAuthSession,
     FacebookPageConnection,
+    FeishuBaseConnection,
+    LinkedInConnection,
+    WhatsAppBusinessConnection,
+    WhatsAppPhoneRoute,
 )
 from integrations.providers.facebook.adapter import (
     FacebookLeadAdsAdapter,
@@ -60,10 +74,341 @@ from integrations.providers.facebook.service import (
     connect_facebook_page,
     set_facebook_messenger_enabled,
 )
+from integrations.providers.feishu_base.client import (
+    FeishuBaseAPIError,
+    FeishuBaseClient,
+    FeishuBaseConfigurationError,
+    validate_field_mapping,
+)
+from integrations.providers.whatsapp.webhooks import (
+    process_whatsapp_status_webhook,
+    verify_whatsapp_signature,
+)
 from leads.models import Lead
 from sdr.models import LeadIntake
 
 logger = logging.getLogger(__name__)
+
+
+class ApolloConnectionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - Apollo"],
+        responses={200: ApolloConnectionSerializer},
+    )
+    def get(self, request):
+        connection = ApolloConnection.objects.filter(org=request.org).first()
+        if connection is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(ApolloConnectionSerializer(connection).data)
+
+    @extend_schema(
+        tags=["Integrations - Apollo"],
+        request=ApolloConnectionWriteSerializer,
+        responses={200: ApolloConnectionSerializer},
+    )
+    def put(self, request):
+        connection = ApolloConnection.objects.filter(org=request.org).first()
+        serializer = ApolloConnectionWriteSerializer(
+            data=request.data,
+            context={"connection": connection},
+        )
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        if connection is None:
+            connection = ApolloConnection(
+                org=request.org,
+                api_key_ciphertext="",
+            )
+        if values.get("api_key"):
+            connection.set_api_key(values["api_key"])
+        if "is_active" in values:
+            connection.is_active = values["is_active"]
+        connection.full_clean()
+        connection.save()
+        return Response(ApolloConnectionSerializer(connection).data)
+
+
+class LinkedInConnectionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - LinkedIn"],
+        responses={200: LinkedInConnectionSerializer},
+    )
+    def get(self, request):
+        connection = LinkedInConnection.objects.filter(org=request.org).first()
+        if connection is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(LinkedInConnectionSerializer(connection).data)
+
+    @extend_schema(
+        tags=["Integrations - LinkedIn"],
+        request=LinkedInConnectionWriteSerializer,
+        responses={200: LinkedInConnectionSerializer},
+    )
+    def put(self, request):
+        connection = LinkedInConnection.objects.filter(org=request.org).first()
+        serializer = LinkedInConnectionWriteSerializer(
+            data=request.data,
+            context={"connection": connection},
+        )
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        if connection is None:
+            connection = LinkedInConnection(
+                org=request.org,
+                access_token_ciphertext="",
+            )
+        if values.get("access_token"):
+            connection.set_access_token(values["access_token"])
+        for field_name in ("partner_access_confirmed", "is_active"):
+            if field_name in values:
+                setattr(connection, field_name, values[field_name])
+        connection.full_clean()
+        connection.save()
+        return Response(LinkedInConnectionSerializer(connection).data)
+
+
+class FeishuBaseConnectionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        responses={200: FeishuBaseConnectionSerializer},
+    )
+    def get(self, request):
+        connection = FeishuBaseConnection.objects.filter(org=request.org).first()
+        if connection is None:
+            return Response(
+                {
+                    "id": None,
+                    "app_id": "",
+                    "app_secret_configured": False,
+                    "app_secret_hint": "",
+                    "app_token": "",
+                    "table_id": "",
+                    "field_mapping": {},
+                    "is_active": False,
+                    "last_validated_at": None,
+                    "last_sync_at": None,
+                    "sync_summary": {
+                        "total": 0,
+                        "pending": 0,
+                        "queued": 0,
+                        "syncing": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                    },
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            )
+        return Response(FeishuBaseConnectionSerializer(connection).data)
+
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        request=FeishuBaseConnectionWriteSerializer,
+        responses={200: FeishuBaseConnectionSerializer},
+    )
+    def put(self, request):
+        connection = FeishuBaseConnection.objects.filter(org=request.org).first()
+        serializer = FeishuBaseConnectionWriteSerializer(
+            data=request.data,
+            context={"connection": connection},
+        )
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        if connection is None:
+            connection = FeishuBaseConnection(org=request.org)
+        if values.get("app_secret"):
+            connection.set_app_secret(values["app_secret"])
+        for field_name in (
+            "app_id",
+            "app_token",
+            "table_id",
+            "field_mapping",
+            "is_active",
+        ):
+            if field_name in values:
+                setattr(connection, field_name, values[field_name])
+        connection.full_clean()
+        connection.save()
+        return Response(FeishuBaseConnectionSerializer(connection).data)
+
+
+class FeishuBaseConnectionTestView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["Integrations - Feishu Base"], responses={200: dict})
+    def post(self, request):
+        connection = FeishuBaseConnection.objects.filter(org=request.org).first()
+        if connection is None or not all(
+            (
+                connection.app_id,
+                connection.app_secret_ciphertext,
+                connection.app_token,
+                connection.table_id,
+                connection.field_mapping.get("intake_id"),
+            )
+        ):
+            return Response(
+                {
+                    "detail": "Save the app credentials, target table, and field mapping first."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        client = FeishuBaseClient(
+            base_url=settings.FEISHU_OPEN_API_BASE_URL,
+            timeout=settings.FEISHU_OPEN_API_TIMEOUT,
+        )
+        try:
+            access_token = client.tenant_access_token(
+                app_id=connection.app_id,
+                app_secret=connection.get_app_secret(),
+            )
+            fields = client.list_fields(
+                access_token=access_token,
+                app_token=connection.app_token,
+                table_id=connection.table_id,
+            )
+            validate_field_mapping(connection.field_mapping, fields)
+        except FeishuBaseConfigurationError as exc:
+            return Response(
+                {
+                    "detail": str(exc),
+                    "missing_fields": exc.missing_fields,
+                    "type_mismatches": exc.type_mismatches,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except FeishuBaseAPIError as exc:
+            return Response(
+                {"detail": str(exc), "code": exc.error_code},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        validated_at = timezone.now()
+        FeishuBaseConnection.objects.filter(
+            id=connection.id,
+            org=request.org,
+        ).update(last_validated_at=validated_at)
+        return Response(
+            {
+                "valid": True,
+                "field_count": len(fields),
+                "mapped_fields": sorted(connection.field_mapping.values()),
+                "validated_at": validated_at,
+            }
+        )
+
+
+class WhatsAppBusinessConnectionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - WhatsApp"],
+        responses={200: WhatsAppBusinessConnectionSerializer},
+    )
+    def get(self, request):
+        connection = (
+            WhatsAppBusinessConnection.objects.filter(org=request.org)
+            .select_related("route")
+            .first()
+        )
+        if connection is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(WhatsAppBusinessConnectionSerializer(connection).data)
+
+    @extend_schema(
+        tags=["Integrations - WhatsApp"],
+        request=WhatsAppBusinessConnectionWriteSerializer,
+        responses={200: WhatsAppBusinessConnectionSerializer},
+    )
+    def put(self, request):
+        connection = (
+            WhatsAppBusinessConnection.objects.filter(org=request.org)
+            .select_related("route")
+            .first()
+        )
+        serializer = WhatsAppBusinessConnectionWriteSerializer(
+            data=request.data,
+            context={"connection": connection},
+        )
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        phone_number_id = values["phone_number_id"]
+        conflicting = WhatsAppPhoneRoute.objects.filter(
+            phone_number_id=phone_number_id
+        ).exclude(org=request.org)
+        if conflicting.exists():
+            return Response(
+                {"detail": "This WhatsApp phone number is already connected."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        with transaction.atomic():
+            route, _ = WhatsAppPhoneRoute.objects.get_or_create(
+                phone_number_id=phone_number_id,
+                defaults={"org": request.org},
+            )
+            if connection is None:
+                connection = WhatsAppBusinessConnection(
+                    org=request.org,
+                    route=route,
+                    access_token_ciphertext="",
+                )
+            else:
+                previous_route = connection.route
+                connection.route = route
+            for field_name in (
+                "business_account_id",
+                "display_phone_number",
+                "is_active",
+            ):
+                if field_name in values:
+                    setattr(connection, field_name, values[field_name])
+            if values.get("access_token"):
+                connection.set_access_token(values["access_token"])
+            connection.full_clean()
+            connection.save()
+            if "previous_route" in locals() and previous_route.id != route.id:
+                previous_route.delete()
+        connection = WhatsAppBusinessConnection.objects.select_related("route").get(
+            id=connection.id,
+            org=request.org,
+        )
+        return Response(WhatsAppBusinessConnectionSerializer(connection).data)
+
+
+class WhatsAppWebhookView(APIView):
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    @extend_schema(tags=["Integrations - WhatsApp"], responses={200: str})
+    def get(self, request):
+        if (
+            request.query_params.get("hub.mode") == "subscribe"
+            and request.query_params.get("hub.verify_token")
+            == settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN
+            and settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN
+        ):
+            return HttpResponse(request.query_params.get("hub.challenge", ""))
+        return Response(status=status.HTTP_403_FORBIDDEN)
+
+    @extend_schema(
+        tags=["Integrations - WhatsApp"], request=dict, responses={200: dict}
+    )
+    def post(self, request):
+        if not verify_whatsapp_signature(
+            body=request.body,
+            signature=request.headers.get("X-Hub-Signature-256", ""),
+            app_secret=settings.META_APP_SECRET,
+        ):
+            return Response(status=status.HTTP_403_FORBIDDEN)
+        result = process_whatsapp_status_webhook(request.data)
+        return Response(result)
 
 
 def _frontend_oauth_redirect(**params):
@@ -305,7 +650,10 @@ class FacebookPageConnectionDetailView(APIView):
             "messenger_auto_reply_enabled",
             connection.messenger_auto_reply_enabled,
         )
-        if requested.get("messenger_auto_reply_enabled") is True and not messenger_enabled:
+        if (
+            requested.get("messenger_auto_reply_enabled") is True
+            and not messenger_enabled
+        ):
             return Response(
                 {
                     "detail": (

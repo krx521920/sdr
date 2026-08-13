@@ -149,15 +149,16 @@ EMAIL_BACKEND = os.environ.get(
 
 AUTH_USER_MODEL = "common.User"
 
-STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+STATIC_ROOT = os.environ.get("STATIC_ROOT", os.path.join(BASE_DIR, "staticfiles"))
 STATIC_URL = "/static/"
 STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")]
 
-ENV_TYPE = os.environ.get("ENV_TYPE", "dev")
+ENV_TYPE = os.environ.get("ENV_TYPE", "dev").strip().lower()
+IS_PRODUCTION = ENV_TYPE in {"prod", "production"}
 if ENV_TYPE == "dev":
     MEDIA_ROOT = os.path.join(BASE_DIR, "media")
     MEDIA_URL = "/media/"
-elif ENV_TYPE == "prod":
+elif IS_PRODUCTION:
     from .server_settings import *  # noqa: F401,F403
 
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost")
@@ -225,11 +226,13 @@ LOGGING = {
         },
         "logfile": {
             "class": "logging.FileHandler",
-            "filename": "server.log",
+            "filename": os.environ.get("SERVER_LOG_PATH", "server.log"),
         },
         "security_audit": {
             "class": "logging.FileHandler",
-            "filename": "security_audit.log",
+            "filename": os.environ.get(
+                "SECURITY_AUDIT_LOG_PATH", "security_audit.log"
+            ),
             "formatter": "security",
         },
     },
@@ -330,6 +333,23 @@ CORS_ALLOWED_ORIGINS = [
 _csrf_origins = os.environ.get("CSRF_TRUSTED_ORIGINS", "")
 CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_origins.split(",") if o.strip()]
 
+# TLS is normally terminated by the deployment's reverse proxy. Keep these
+# environment-controlled so local HTTP remains usable while public deployments
+# can enforce secure redirects and cookies.
+_secure_default = "True" if IS_PRODUCTION else "False"
+SECURE_SSL_REDIRECT = (
+    os.environ.get("SECURE_SSL_REDIRECT", _secure_default).lower() == "true"
+)
+SESSION_COOKIE_SECURE = (
+    os.environ.get("SESSION_COOKIE_SECURE", _secure_default).lower() == "true"
+)
+CSRF_COOKIE_SECURE = (
+    os.environ.get("CSRF_COOKIE_SECURE", _secure_default).lower() == "true"
+)
+if os.environ.get("TRUST_X_FORWARDED_PROTO", _secure_default).lower() == "true":
+    # The deployment proxy must overwrite (not append to) this header.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 # Security: HSTS with 1 year duration (recommended minimum)
 SECURE_HSTS_SECONDS = 31536000  # 1 year
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
@@ -383,6 +403,10 @@ GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
 META_APP_ID = os.environ.get("META_APP_ID", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.environ.get(
+    "WHATSAPP_WEBHOOK_VERIFY_TOKEN",
+    META_WEBHOOK_VERIFY_TOKEN,
+)
 META_GRAPH_API_VERSION = os.environ.get("META_GRAPH_API_VERSION", "v25.0")
 META_GRAPH_API_BASE_URL = os.environ.get(
     "META_GRAPH_API_BASE_URL", "https://graph.facebook.com"
@@ -480,6 +504,36 @@ AI_GATEWAY_ALLOWED_REASONING_EFFORTS = tuple(
     if value.strip() in {"none", "low", "medium", "high", "xhigh", "max"}
 ) or ("low",)
 
+# Apollo People Search is tenant-authenticated. The provider URL remains a
+# deployment-owned setting so tenant credentials cannot redirect requests.
+APOLLO_API_BASE_URL = os.environ.get(
+    "APOLLO_API_BASE_URL", "https://api.apollo.io/api/v1"
+).rstrip("/")
+APOLLO_API_TIMEOUT = max(
+    1.0,
+    min(60.0, float(os.environ.get("APOLLO_API_TIMEOUT", "15"))),
+)
+
+# LinkedIn Invitations API is restricted to approved partners. The base URL is
+# deployment-owned so tenant tokens cannot redirect outbound requests.
+LINKEDIN_API_BASE_URL = os.environ.get(
+    "LINKEDIN_API_BASE_URL", "https://api.linkedin.com"
+).rstrip("/")
+LINKEDIN_API_TIMEOUT = max(
+    1.0,
+    min(60.0, float(os.environ.get("LINKEDIN_API_TIMEOUT", "10"))),
+)
+
+# Feishu host ownership stays with deployment configuration. Tenant credentials
+# may authenticate but cannot redirect server-side requests to another host.
+FEISHU_OPEN_API_BASE_URL = os.environ.get(
+    "FEISHU_OPEN_API_BASE_URL", "https://open.feishu.cn"
+).rstrip("/")
+FEISHU_OPEN_API_TIMEOUT = max(
+    1.0,
+    min(60.0, float(os.environ.get("FEISHU_OPEN_API_TIMEOUT", "15"))),
+)
+
 # Durable automation jobs are persisted before broker dispatch. Handlers are
 # deployment-owned allow-list entries rather than arbitrary dotted paths from
 # user input.
@@ -496,6 +550,15 @@ AUTOMATION_JOB_HANDLERS = {
     "facebook.send_messenger_reply": (
         "integrations.providers.facebook.messenger.process_facebook_messenger_reply_job"
     ),
+    "whatsapp.send_campaign_message": (
+        "integrations.providers.whatsapp.outbound.process_whatsapp_message_job"
+    ),
+    "linkedin.send_campaign_invitation": (
+        "integrations.providers.linkedin.outbound.process_linkedin_invitation_job"
+    ),
+    "feishu_base.sync_research_result": (
+        "integrations.providers.feishu_base.sync.process_feishu_base_sync_job"
+    ),
     "sdr.process_intake": (
         "integrations.providers.website.jobs.process_website_intake_job"
     ),
@@ -505,6 +568,8 @@ AUTOMATION_JOB_HANDLERS = {
     "sdr.send_nurture_email": "sdr.nurture.process_nurture_email_job",
     "sdr.process_inbound_email": "sdr.email.process_inbound_email_job",
     "sdr.process_outbound_prospect": "sdr.outbound.process_outbound_prospect_job",
+    "sdr.sync_outbound_source": "sdr.sources.process_outbound_source_sync_job",
+    "sdr.generate_outbound_copy": "sdr.outbound_copy.process_outbound_copy_job",
 }
 INBOUND_EMAIL_ROUTE_HANDLERS = {
     "sdr": "sdr.email.enqueue_inbound_email",

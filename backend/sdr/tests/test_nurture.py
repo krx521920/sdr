@@ -273,6 +273,7 @@ def test_reply_action_stops_sequence_and_records_sentiment(admin_client, org_a):
 )
 def test_tracked_email_records_deduplicated_open_and_click_metrics(
     admin_client,
+    unauthenticated_client,
     org_a,
 ):
     payload = sequence_payload()
@@ -311,12 +312,12 @@ def test_tracked_email_records_deduplicated_open_and_click_metrics(
     open_path = urlsplit(open_match.group(0)).path
     click_path = urlsplit(click_match.group(0)).path
     headers = {"HTTP_USER_AGENT": "Example Mail Client/1.0"}
-    assert admin_client.get(open_path, **headers).status_code == 200
-    assert admin_client.get(open_path, **headers).status_code == 200
-    clicked = admin_client.get(click_path, **headers)
+    assert unauthenticated_client.get(open_path, **headers).status_code == 200
+    assert unauthenticated_client.get(open_path, **headers).status_code == 200
+    clicked = unauthenticated_client.get(click_path, **headers)
     assert clicked.status_code == 302
     assert clicked["Location"] == "https://example.com/demo"
-    assert admin_client.get(click_path, **headers).status_code == 302
+    assert unauthenticated_client.get(click_path, **headers).status_code == 302
 
     delivery.refresh_from_db()
     assert delivery.opened_at is not None
@@ -335,6 +336,19 @@ def test_tracked_email_records_deduplicated_open_and_click_metrics(
 
 
 @pytest.mark.django_db
+@override_settings(ROOT_URLCONF="integrations.tests.urls")
+def test_nurture_management_api_still_requires_org_context(
+    unauthenticated_client,
+):
+    response = unauthenticated_client.get("/api/sdr/nurture/sequences/")
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "Organization context is required. Please login again."
+    }
+
+
+@pytest.mark.django_db
 @override_settings(
     ROOT_URLCONF="integrations.tests.urls",
     EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
@@ -342,6 +356,7 @@ def test_tracked_email_records_deduplicated_open_and_click_metrics(
 )
 def test_tracking_tokens_reject_tampering_unsafe_redirects_and_prefetch(
     admin_client,
+    unauthenticated_client,
     org_a,
 ):
     create_sequence(admin_client)
@@ -358,17 +373,17 @@ def test_tracking_tokens_reject_tampering_unsafe_redirects_and_prefetch(
 
     open_url = tracking_url(delivery, NurtureInteractionType.OPEN)
     open_path = urlsplit(open_url).path
-    assert admin_client.head(open_path).status_code == 200
+    assert unauthenticated_client.head(open_path).status_code == 200
     assert not LeadNurtureInteraction.objects.filter(delivery=delivery).exists()
 
     tampered_open_path = open_path.replace("/pixel.gif", "x/pixel.gif")
-    assert admin_client.get(tampered_open_path).status_code == 200
+    assert unauthenticated_client.get(tampered_open_path).status_code == 200
     assert not LeadNurtureInteraction.objects.filter(delivery=delivery).exists()
 
     open_token = make_tracking_token(delivery, NurtureInteractionType.OPEN)
     wrong_event_path = f"/api/sdr/public/nurture/click/{open_token}/"
-    assert admin_client.get(wrong_event_path).status_code == 404
-    assert admin_client.head(wrong_event_path).status_code == 204
+    assert unauthenticated_client.get(wrong_event_path).status_code == 404
+    assert unauthenticated_client.head(wrong_event_path).status_code == 204
 
     with pytest.raises(ValueError):
         validate_destination("javascript:alert(1)")
@@ -384,6 +399,7 @@ def test_tracking_tokens_reject_tampering_unsafe_redirects_and_prefetch(
 )
 def test_one_click_unsubscribe_is_idempotent_and_stops_future_delivery(
     admin_client,
+    unauthenticated_client,
     org_a,
 ):
     create_sequence(admin_client)
@@ -404,13 +420,13 @@ def test_one_click_unsubscribe_is_idempotent_and_stops_future_delivery(
     )
     assert unsubscribe_url in message.body
 
-    assert admin_client.get(unsubscribe_path).status_code == 200
+    assert unauthenticated_client.get(unsubscribe_path).status_code == 200
     assert not SDREmailSuppression.objects.exists()
-    assert admin_client.post(
+    assert unauthenticated_client.post(
         unsubscribe_path,
         {"List-Unsubscribe": "One-Click"},
     ).status_code == 200
-    assert admin_client.post(
+    assert unauthenticated_client.post(
         unsubscribe_path,
         {"List-Unsubscribe": "One-Click"},
     ).status_code == 200
@@ -435,7 +451,7 @@ def test_one_click_unsubscribe_is_idempotent_and_stops_future_delivery(
     summary = admin_client.get("/api/sdr/nurture/sequences/").json()["summary"]
     assert summary["active_suppressions"] == 1
     tampered_path = f"{unsubscribe_path.rstrip('/')}x/"
-    assert admin_client.post(tampered_path).status_code == 404
+    assert unauthenticated_client.post(tampered_path).status_code == 404
 
 
 @pytest.mark.django_db

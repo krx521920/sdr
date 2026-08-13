@@ -1203,6 +1203,14 @@
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 inset={false}
+                onclick={() => navigateTo('/settings/sdr-compliance')}
+                class="gap-2.5"
+              >
+                <ShieldCheck class="size-4" />
+                <span>SDR Compliance</span>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                inset={false}
                 onclick={() => navigateTo('/settings/tags')}
                 class="gap-2.5"
               >

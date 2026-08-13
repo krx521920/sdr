@@ -1,15 +1,17 @@
 from uuid import uuid4
 
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from common.permissions import HasOrgContext, IsOrgAdmin
+from common.permissions import HasOrgContext, HasSalesAccess, IsOrgAdmin
 from common.utils import COUNTRIES
 from sdr.analytics import build_sdr_analytics
 from sdr.api.serializers import (
@@ -18,18 +20,40 @@ from sdr.api.serializers import (
     LeadNurtureEnrollmentActionSerializer,
     LeadNurtureEnrollmentSerializer,
     SDRAnalyticsQuerySerializer,
+    SDRChannelComplianceRuleSerializer,
+    SDRComplianceDeletionActionSerializer,
+    SDRComplianceEventSerializer,
+    SDRComplianceRetentionScanSerializer,
+    SDRComplianceSettingsSerializer,
+    SDRDataProvenanceSerializer,
+    SDRDoNotContactCreateSerializer,
+    SDRDoNotContactSerializer,
     SDREmailSuppressionCreateSerializer,
     SDREmailSuppressionSerializer,
     SDRIntelligenceSettingsSerializer,
     SDRNurtureSequenceSerializer,
     SDROutboundCampaignActionSerializer,
     SDROutboundCampaignSerializer,
+    SDROutboundCopyDraftActionSerializer,
+    SDROutboundCopyDraftEditSerializer,
+    SDROutboundCopyDraftSerializer,
+    SDROutboundCopyGenerateSerializer,
     SDROutboundImportSerializer,
     SDROutboundProspectActionSerializer,
     SDROutboundProspectSerializer,
+    SDROutboundSourceSerializer,
     SDRResponseSettingsSerializer,
     SDRRoutingPreviewSerializer,
     SDRRoutingRuleSerializer,
+    SDRSalesFeedbackSerializer,
+)
+from sdr.compliance import (
+    anonymize_intake,
+    block_contact,
+    cancel_intake_deletion,
+    release_contact_block,
+    request_intake_deletion,
+    scan_retention,
 )
 from sdr.domain import (
     CompanySnapshot,
@@ -39,6 +63,7 @@ from sdr.domain import (
     QualificationBand,
     QualificationResult,
 )
+from sdr.email_safety import clear_campaign_safety_hold
 from sdr.models import (
     EmailSuppressionReason,
     EmailSuppressionSource,
@@ -54,14 +79,25 @@ from sdr.models import (
     NurtureReplySentiment,
     OutboundCampaignStatus,
     OutboundProspectStatus,
+    SDRChannelComplianceRule,
+    SDRComplianceChannel,
+    SDRComplianceEvent,
+    SDRComplianceSettings,
+    SDRDataProvenance,
+    SDRDoNotContactEntry,
+    SDRDoNotContactReason,
+    SDRDoNotContactSource,
     SDREmailSuppression,
     SDRIntelligenceSettings,
     SDRNurtureSequence,
     SDROutboundCampaign,
+    SDROutboundCopyDraft,
     SDROutboundProspect,
+    SDROutboundSource,
     SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingStrategy,
+    SDRSalesFeedback,
 )
 from sdr.nurture import pause_enrollment, resume_enrollment, stop_enrollment
 from sdr.outbound import (
@@ -73,10 +109,18 @@ from sdr.outbound import (
     import_prospect_csv,
     launch_outbound_campaign,
     pause_outbound_campaign,
-    refill_outbound_campaign,
     restore_outbound_prospect,
+    retry_failed_outbound_work,
+)
+from sdr.outbound_analytics import build_outbound_campaign_analytics
+from sdr.outbound_copy import (
+    OutboundCopyUnavailable,
+    apply_outbound_copy_draft,
+    enqueue_outbound_copy_generation,
 )
 from sdr.routing import RuleBasedSalesRouter
+from sdr.sales_feedback import feedback_choices
+from sdr.sources import OutboundSourceUnavailable, enqueue_outbound_source_sync
 from sdr.suppression import release_suppression, suppress_email
 
 
@@ -96,6 +140,415 @@ class SDRAnalyticsView(APIView):
                 days=serializer.validated_data["days"],
             )
         )
+
+
+class SDRComplianceOverviewView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["SDR Compliance"])
+    def get(self, request):
+        configuration, _ = SDRComplianceSettings.objects.get_or_create(org=request.org)
+        provenance = SDRDataProvenance.objects.filter(org=request.org)
+        dnc = SDRDoNotContactEntry.objects.filter(org=request.org)
+        events = SDRComplianceEvent.objects.filter(org=request.org)[:20]
+        return Response(
+            {
+                "settings": SDRComplianceSettingsSerializer(configuration).data,
+                "summary": {
+                    "provenance_records": provenance.count(),
+                    "unassessed": provenance.filter(lawful_basis="unassessed").count(),
+                    "retention_due": provenance.filter(status="retention_due").count(),
+                    "deletion_requested": provenance.filter(
+                        status="deletion_requested"
+                    ).count(),
+                    "active_dnc": dnc.filter(is_active=True).count(),
+                    "blocked_decisions": SDRComplianceEvent.objects.filter(
+                        org=request.org,
+                        event_type="contact_blocked",
+                    ).count(),
+                },
+                "choices": {
+                    "channels": [
+                        {"value": value, "label": label}
+                        for value, label in SDRComplianceChannel.choices
+                    ],
+                    "dnc_reasons": [
+                        {"value": value, "label": label}
+                        for value, label in SDRDoNotContactReason.choices
+                    ],
+                    "dnc_sources": [
+                        {"value": value, "label": label}
+                        for value, label in SDRDoNotContactSource.choices
+                    ],
+                },
+                "recent_events": SDRComplianceEventSerializer(events, many=True).data,
+            }
+        )
+
+
+class SDRComplianceSettingsView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _get(request):
+        configuration, _ = SDRComplianceSettings.objects.get_or_create(org=request.org)
+        return configuration
+
+    def get(self, request):
+        return Response(SDRComplianceSettingsSerializer(self._get(request)).data)
+
+    def put(self, request):
+        return self._update(request, partial=False)
+
+    def patch(self, request):
+        return self._update(request, partial=True)
+
+    def _update(self, request, *, partial):
+        serializer = SDRComplianceSettingsSerializer(
+            self._get(request), data=request.data, partial=partial
+        )
+        serializer.is_valid(raise_exception=True)
+        return Response(SDRComplianceSettingsSerializer(serializer.save()).data)
+
+
+class SDRComplianceRuleListCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def get(self, request):
+        rules = SDRChannelComplianceRule.objects.filter(org=request.org)
+        return Response(
+            {
+                "count": rules.count(),
+                "results": SDRChannelComplianceRuleSerializer(rules, many=True).data,
+            }
+        )
+
+    def post(self, request):
+        serializer = SDRChannelComplianceRuleSerializer(
+            data=request.data, context={"org": request.org}
+        )
+        serializer.is_valid(raise_exception=True)
+        rule = serializer.save(org=request.org)
+        return Response(
+            SDRChannelComplianceRuleSerializer(rule).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class SDRComplianceRuleDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _get(request, rule_id):
+        return SDRChannelComplianceRule.objects.filter(
+            org=request.org, id=rule_id
+        ).first()
+
+    def put(self, request, rule_id):
+        return self._update(request, rule_id, partial=False)
+
+    def patch(self, request, rule_id):
+        return self._update(request, rule_id, partial=True)
+
+    def _update(self, request, rule_id, *, partial):
+        rule = self._get(request, rule_id)
+        if rule is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDRChannelComplianceRuleSerializer(
+            rule,
+            data=request.data,
+            partial=partial,
+            context={"org": request.org},
+        )
+        serializer.is_valid(raise_exception=True)
+        return Response(SDRChannelComplianceRuleSerializer(serializer.save()).data)
+
+    def delete(self, request, rule_id):
+        rule = self._get(request, rule_id)
+        if rule is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        rule.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SDRDoNotContactListCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def get(self, request):
+        entries = SDRDoNotContactEntry.objects.filter(org=request.org)
+        if request.query_params.get("include_released", "false").lower() != "true":
+            entries = entries.filter(is_active=True)
+        try:
+            limit = min(max(int(request.query_params.get("limit", 100)), 1), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        entries = list(entries[:limit])
+        return Response(
+            {
+                "count": len(entries),
+                "results": SDRDoNotContactSerializer(entries, many=True).data,
+            }
+        )
+
+    def post(self, request):
+        serializer = SDRDoNotContactCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            entry, created = block_contact(
+                org_id=request.org.id,
+                created_by=request.user,
+                source=SDRDoNotContactSource.ADMIN,
+                **serializer.validated_data,
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response(
+            SDRDoNotContactSerializer(entry).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class SDRDoNotContactDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def delete(self, request, entry_id):
+        entry = SDRDoNotContactEntry.objects.filter(
+            org=request.org, id=entry_id
+        ).first()
+        if entry is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        entry = release_contact_block(entry, updated_by=request.user)
+        return Response(SDRDoNotContactSerializer(entry).data)
+
+
+class SDRDataProvenanceListView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def get(self, request):
+        queryset = SDRDataProvenance.objects.filter(org=request.org).select_related(
+            "intake"
+        )
+        status_filter = request.query_params.get("status", "").strip()
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        try:
+            limit = min(max(int(request.query_params.get("limit", 100)), 1), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        count = queryset.count()
+        return Response(
+            {
+                "count": count,
+                "results": SDRDataProvenanceSerializer(
+                    queryset[:limit], many=True
+                ).data,
+            }
+        )
+
+
+class SDRDataProvenanceDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def patch(self, request, intake_id):
+        provenance = SDRDataProvenance.objects.filter(
+            org=request.org, intake_id=intake_id
+        ).select_related("intake").first()
+        if provenance is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDRDataProvenanceSerializer(
+            provenance, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        return Response(SDRDataProvenanceSerializer(serializer.save()).data)
+
+
+class SDRComplianceDeletionActionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def post(self, request, intake_id):
+        intake = LeadIntake.objects.filter(org=request.org, id=intake_id).first()
+        if intake is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDRComplianceDeletionActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        action = serializer.validated_data["action"]
+        if action == "request":
+            provenance = request_intake_deletion(intake, requested_by=request.user)
+        elif action == "cancel":
+            provenance = cancel_intake_deletion(intake, updated_by=request.user)
+        else:
+            if serializer.validated_data["confirm_intake_id"] != intake.id:
+                return Response(
+                    {"confirm_intake_id": ["The confirmation does not match."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            provenance = anonymize_intake(intake, performed_by=request.user)
+        provenance = SDRDataProvenance.objects.select_related("intake").get(
+            id=provenance.id, org=request.org
+        )
+        return Response(SDRDataProvenanceSerializer(provenance).data)
+
+
+class SDRComplianceRetentionScanView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def post(self, request):
+        serializer = SDRComplianceRetentionScanSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(
+            scan_retention(
+                org_id=request.org.id,
+                execute=serializer.validated_data["execute"],
+                limit=serializer.validated_data["limit"],
+            )
+        )
+
+
+class SDRSalesFeedbackLeadView(APIView):
+    """Read or update the sales verdict for the latest SDR handoff of a CRM lead."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext)
+
+    def get_permissions(self):
+        permission_classes = list(self.permission_classes)
+        if self.request.method == "PUT":
+            permission_classes.append(HasSalesAccess)
+        return [permission() for permission in permission_classes]
+
+    def _get_intake(self, request, lead_id, *, for_update=False):
+        queryset = LeadIntake.objects.filter(
+            org=request.org,
+            crm_lead_id=lead_id,
+        ).select_related("assigned_profile__user", "crm_lead")
+        if for_update:
+            queryset = queryset.select_for_update()
+        return queryset.order_by("-created_at", "-id").first()
+
+    def _can_access(self, request, intake):
+        profile = request.profile
+        if profile.role == "ADMIN" or profile.is_organization_admin:
+            return True
+        if intake.assigned_profile_id == profile.id:
+            return True
+        return intake.crm_lead.assigned_to.filter(id=profile.id).exists()
+
+    def _response_payload(self, request, intake):
+        if not self._can_access(request, intake):
+            return None
+        inspection = LeadInspection.objects.filter(
+            org=request.org,
+            intake=intake,
+        ).first()
+        feedback = (
+            SDRSalesFeedback.objects.filter(org=request.org, intake=intake)
+            .select_related("feedback_by__user")
+            .first()
+        )
+        return {
+            "available": True,
+            "can_submit": True,
+            "intake": {
+                "id": str(intake.id),
+                "source": intake.source,
+                "qualification_score": (
+                    inspection.qualification_score
+                    if inspection and inspection.qualification_score is not None
+                    else intake.qualification_score
+                ),
+                "qualification_band": (
+                    inspection.qualification_band
+                    if inspection and inspection.qualification_band
+                    else intake.qualification_band
+                ),
+                "provider": inspection.provider if inspection else "rules",
+                "model": inspection.model if inspection else "rules-v1",
+                "prompt_version": inspection.prompt_version if inspection else "",
+            },
+            "choices": feedback_choices(),
+            "feedback": (
+                SDRSalesFeedbackSerializer(feedback).data if feedback else None
+            ),
+        }
+
+    @extend_schema(tags=["SDR Sales Feedback"])
+    def get(self, request, lead_id):
+        if not HasSalesAccess().has_permission(request, self):
+            return Response({"available": False})
+        intake = self._get_intake(request, lead_id)
+        if intake is None:
+            return Response({"available": False})
+        payload = self._response_payload(request, intake)
+        if payload is None:
+            return Response(
+                {"detail": "This SDR handoff is not assigned to you."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return Response(payload)
+
+    @extend_schema(
+        tags=["SDR Sales Feedback"],
+        request=SDRSalesFeedbackSerializer,
+    )
+    def put(self, request, lead_id):
+        with transaction.atomic():
+            intake = self._get_intake(request, lead_id, for_update=True)
+            if intake is None:
+                return Response(status=status.HTTP_404_NOT_FOUND)
+            if not self._can_access(request, intake):
+                return Response(
+                    {"detail": "This SDR handoff is not assigned to you."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            feedback = SDRSalesFeedback.objects.filter(
+                org=request.org,
+                intake=intake,
+            ).first()
+            serializer = SDRSalesFeedbackSerializer(
+                feedback,
+                data=request.data,
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            save_values = {
+                "feedback_by": request.profile,
+                "submitted_at": timezone.now(),
+            }
+            if feedback is None:
+                inspection = LeadInspection.objects.filter(
+                    org=request.org,
+                    intake=intake,
+                ).first()
+                save_values.update(
+                    {
+                        "org": request.org,
+                        "intake": intake,
+                        "qualification_score_snapshot": (
+                            inspection.qualification_score
+                            if inspection
+                            and inspection.qualification_score is not None
+                            else intake.qualification_score
+                        ),
+                        "qualification_band_snapshot": (
+                            inspection.qualification_band
+                            if inspection and inspection.qualification_band
+                            else intake.qualification_band
+                        ),
+                        "provider_snapshot": (
+                            inspection.provider if inspection else "rules"
+                        ),
+                        "model_snapshot": (
+                            inspection.model if inspection else "rules-v1"
+                        ),
+                        "prompt_version_snapshot": (
+                            inspection.prompt_version if inspection else ""
+                        ),
+                    }
+                )
+            serializer.save(**save_values)
+            payload = self._response_payload(request, intake)
+        return Response(payload)
 
 
 def _outbound_campaign_queryset(request):
@@ -262,6 +715,30 @@ class SDROutboundCampaignDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class SDROutboundCampaignAnalyticsView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["SDR Outbound Analytics"])
+    def get(self, request, campaign_id):
+        campaign = (
+            SDROutboundCampaign.objects.filter(
+                id=campaign_id,
+                org=request.org,
+            )
+            .select_related("sequence")
+            .prefetch_related("sequence__steps")
+            .first()
+        )
+        if campaign is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            build_outbound_campaign_analytics(
+                org=request.org,
+                campaign=campaign,
+            )
+        )
+
+
 class SDROutboundCampaignActionView(APIView):
     permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
 
@@ -284,8 +761,10 @@ class SDROutboundCampaignActionView(APIView):
             elif action == "retry_failed":
                 execution = {
                     "action": "retry_failed",
-                    **refill_outbound_campaign(campaign, failed_only=True),
+                    **retry_failed_outbound_work(campaign),
                 }
+            elif action == "clear_safety_hold":
+                execution = clear_campaign_safety_hold(campaign)
             else:
                 execution = finish_outbound_campaign(
                     campaign,
@@ -448,6 +927,278 @@ class SDROutboundProspectActionView(APIView):
         response = SDROutboundProspectSerializer(prospect).data
         response["job_id"] = str(job_id) if job_id else None
         return Response(response)
+
+
+class SDROutboundSourceListCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _campaign(request, campaign_id):
+        return SDROutboundCampaign.objects.filter(
+            id=campaign_id,
+            org=request.org,
+        ).first()
+
+    @extend_schema(
+        tags=["SDR Outbound"],
+        responses={200: SDROutboundSourceSerializer(many=True)},
+    )
+    def get(self, request, campaign_id):
+        campaign = self._campaign(request, campaign_id)
+        if campaign is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        sources = SDROutboundSource.objects.filter(
+            org=request.org,
+            campaign=campaign,
+        )
+        return Response(
+            SDROutboundSourceSerializer(
+                sources,
+                many=True,
+                context={"org": request.org, "campaign": campaign},
+            ).data
+        )
+
+    @extend_schema(
+        tags=["SDR Outbound"],
+        request=SDROutboundSourceSerializer,
+        responses={201: SDROutboundSourceSerializer},
+    )
+    def post(self, request, campaign_id):
+        campaign = self._campaign(request, campaign_id)
+        if campaign is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDROutboundSourceSerializer(
+            data=request.data,
+            context={"org": request.org, "campaign": campaign},
+        )
+        serializer.is_valid(raise_exception=True)
+        source = serializer.save()
+        return Response(
+            SDROutboundSourceSerializer(
+                source,
+                context={"org": request.org, "campaign": campaign},
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class SDROutboundSourceDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _source(request, source_id):
+        return (
+            SDROutboundSource.objects.filter(id=source_id, org=request.org)
+            .select_related("campaign")
+            .first()
+        )
+
+    def get(self, request, source_id):
+        source = self._source(request, source_id)
+        if source is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            SDROutboundSourceSerializer(
+                source,
+                context={"org": request.org, "campaign": source.campaign},
+            ).data
+        )
+
+    def patch(self, request, source_id):
+        source = self._source(request, source_id)
+        if source is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDROutboundSourceSerializer(
+            source,
+            data=request.data,
+            partial=True,
+            context={"org": request.org, "campaign": source.campaign},
+        )
+        serializer.is_valid(raise_exception=True)
+        source = serializer.save()
+        return Response(serializer.to_representation(source))
+
+    def delete(self, request, source_id):
+        source = self._source(request, source_id)
+        if source is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        source.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SDROutboundSourceSyncView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["SDR Outbound"])
+    def post(self, request, source_id):
+        source = (
+            SDROutboundSource.objects.filter(id=source_id, org=request.org)
+            .select_related("campaign")
+            .first()
+        )
+        if source is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if source.campaign.status == OutboundCampaignStatus.ARCHIVED:
+            return Response(
+                {"detail": "Reopen the campaign before syncing its sources."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            job = enqueue_outbound_source_sync(source, manual=True)
+        except OutboundSourceUnavailable as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {"job_id": str(job.id), "status": job.status},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class SDROutboundCopyDraftListCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _campaign(request, campaign_id):
+        return SDROutboundCampaign.objects.filter(
+            id=campaign_id,
+            org=request.org,
+        ).first()
+
+    @extend_schema(
+        tags=["SDR Outbound"],
+        responses={200: SDROutboundCopyDraftSerializer(many=True)},
+    )
+    def get(self, request, campaign_id):
+        campaign = self._campaign(request, campaign_id)
+        if campaign is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        drafts = (
+            SDROutboundCopyDraft.objects.filter(org=request.org, campaign=campaign)
+            .select_related("reviewed_by__user")
+            .order_by("-created_at")[:20]
+        )
+        return Response(SDROutboundCopyDraftSerializer(drafts, many=True).data)
+
+    @extend_schema(
+        tags=["SDR Outbound"],
+        request=SDROutboundCopyGenerateSerializer,
+        responses={202: SDROutboundCopyDraftSerializer},
+    )
+    def post(self, request, campaign_id):
+        campaign = self._campaign(request, campaign_id)
+        if campaign is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if campaign.status in {
+            OutboundCampaignStatus.COMPLETED,
+            OutboundCampaignStatus.ARCHIVED,
+        }:
+            return Response(
+                {"detail": "Reopen the campaign before generating outbound copy."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        serializer = SDROutboundCopyGenerateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            draft = SDROutboundCopyDraft.objects.create(
+                org=request.org,
+                campaign=campaign,
+                created_by=request.user,
+                **serializer.validated_data,
+            )
+            job = enqueue_outbound_copy_generation(draft)
+        draft.refresh_from_db()
+        response = SDROutboundCopyDraftSerializer(draft).data
+        response["job_id"] = str(job.id)
+        return Response(response, status=status.HTTP_202_ACCEPTED)
+
+
+class SDROutboundCopyDraftDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @staticmethod
+    def _draft(request, draft_id):
+        return (
+            SDROutboundCopyDraft.objects.filter(id=draft_id, org=request.org)
+            .select_related("campaign", "reviewed_by__user")
+            .first()
+        )
+
+    def get(self, request, draft_id):
+        draft = self._draft(request, draft_id)
+        if draft is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(SDROutboundCopyDraftSerializer(draft).data)
+
+    def patch(self, request, draft_id):
+        draft = self._draft(request, draft_id)
+        if draft is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if draft.status != "ready":
+            return Response(
+                {"detail": "Only ready copy drafts can be edited."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        serializer = SDROutboundCopyDraftEditSerializer(
+            data=request.data,
+            context={"draft": draft},
+        )
+        serializer.is_valid(raise_exception=True)
+        draft.generated_steps = serializer.validated_data["generated_steps"]
+        draft.reviewed_by = request.profile
+        draft.reviewed_at = timezone.now()
+        draft.save(
+            update_fields=[
+                "generated_steps",
+                "reviewed_by",
+                "reviewed_at",
+                "updated_at",
+            ]
+        )
+        draft = self._draft(request, draft.id)
+        return Response(SDROutboundCopyDraftSerializer(draft).data)
+
+
+class SDROutboundCopyDraftActionView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["SDR Outbound"],
+        request=SDROutboundCopyDraftActionSerializer,
+    )
+    def post(self, request, draft_id):
+        draft = (
+            SDROutboundCopyDraft.objects.filter(id=draft_id, org=request.org)
+            .select_related("campaign")
+            .first()
+        )
+        if draft is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDROutboundCopyDraftActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            sequence = apply_outbound_copy_draft(
+                draft,
+                reviewer=request.profile,
+            )
+        except OutboundCopyUnavailable as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+        draft = SDROutboundCopyDraft.objects.select_related(
+            "reviewed_by__user"
+        ).get(id=draft.id, org=request.org)
+        return Response(
+            {
+                "draft": SDROutboundCopyDraftSerializer(draft).data,
+                "sequence_id": str(sequence.id),
+                "sequence_name": sequence.name,
+                "sequence_active": sequence.is_active,
+            }
+        )
 
 
 class SDRRoutingRuleListCreateView(APIView):
@@ -888,9 +1639,7 @@ class SDRNurtureSequenceListCreateView(APIView):
                     "active_suppressions": active_suppressions,
                     "open_rate": round(opened * 100 / sent, 1) if sent else 0,
                     "click_rate": round(clicked * 100 / sent, 1) if sent else 0,
-                    "delivery_rate": (
-                        round(delivered * 100 / sent, 1) if sent else 0
-                    ),
+                    "delivery_rate": (round(delivered * 100 / sent, 1) if sent else 0),
                     "bounce_rate": round(bounced * 100 / sent, 1) if sent else 0,
                     "complaint_rate": (
                         round(complained * 100 / sent, 1) if sent else 0
