@@ -23,7 +23,7 @@ echo "PostgreSQL is ready."
 echo "Running migrations..."
 python manage.py migrate --noinput
 
-echo "Creating default admin user (if needed)..."
+echo "Applying default admin bootstrap policy..."
 python manage.py create_default_admin
 
 echo "Collecting static files..."

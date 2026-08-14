@@ -15,7 +15,7 @@ services:
       timeout: 3s
       retries: 5
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
 
   redis:
     image: redis:7-alpine
@@ -25,7 +25,7 @@ services:
       timeout: 3s
       retries: 5
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
 
   backend:
     build:
@@ -38,6 +38,7 @@ services:
         required: false
     environment:
       STATIC_ROOT: /tmp/staticfiles
+      MEDIA_ROOT: /tmp/media
       SERVER_LOG_PATH: /tmp/server.log
       SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
@@ -68,7 +69,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A crm worker --loglevel=info --queues=celery,default
+    command: >-
+      celery -A crm worker --loglevel=info --queues=celery,default
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
 
   celery-beat:
     build:
