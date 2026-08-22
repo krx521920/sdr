@@ -12,6 +12,7 @@
 import { env as publicEnv } from '$env/dynamic/public';
 import { redirect, fail } from '@sveltejs/kit';
 import axios from 'axios';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -54,7 +55,7 @@ export async function load({ cookies, locals }) {
 
     return { orgs };
   } catch (error) {
-    console.error('Error fetching organizations:', error);
+    logSafeServerError('Organization list request failed', error);
     // Return empty array so user can create a new organization
     return { orgs: [] };
   }
@@ -126,7 +127,7 @@ export const actions = {
       if (error.status === 303) {
         throw error; // Re-throw redirect
       }
-      console.error('Org switch failed:', error);
+      logSafeServerError('Organization switch request failed', error);
       return fail(500, { error: 'Failed to switch organization' });
     }
   }

@@ -15,6 +15,7 @@ import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { env as publicEnv } from '$env/dynamic/public';
 import { generateCodeVerifier, generateCodeChallenge, generateState } from '$lib/utils/pkce.js';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_SCOPES = ['openid', 'email', 'profile'].join(' ');
@@ -48,7 +49,7 @@ export async function load({ url, cookies }) {
 
   // Handle OAuth error returned from Google
   if (error) {
-    console.error('Google OAuth error:', error, errorDescription);
+    logSafeServerError('Google OAuth callback returned an error', { code: 'ERR_BAD_RESPONSE' });
     return {
       google_url: null,
       error: errorDescription || `OAuth error: ${error}`
@@ -87,15 +88,13 @@ async function handleOAuthCallback(code, returnedState, cookies) {
 
   // Validate state parameter (CSRF protection)
   if (!savedState || savedState !== returnedState) {
-    console.error('OAuth state mismatch - possible CSRF attack');
-    console.error('Expected:', savedState?.substring(0, 10) + '...');
-    console.error('Received:', returnedState?.substring(0, 10) + '...');
+    logSafeServerError('OAuth state validation failed', { code: 'ERR_BAD_REQUEST' });
     throw redirect(307, '/login?error=state_mismatch');
   }
 
   // Validate code verifier exists
   if (!codeVerifier) {
-    console.error('Missing PKCE code verifier - session may have expired');
+    logSafeServerError('OAuth PKCE verifier was unavailable', { code: 'ERR_BAD_REQUEST' });
     throw redirect(307, '/login?error=session_expired');
   }
 
@@ -105,7 +104,6 @@ async function handleOAuthCallback(code, returnedState, cookies) {
     // Exchange code for tokens via Django backend
     // The backend handles the actual token exchange with Google using the client secret
     const apiUrl = publicEnv.PUBLIC_DJANGO_API_URL;
-    console.log('Using API URL:', apiUrl);
     const response = await axios.post(
       `${apiUrl}/api/auth/google/callback/`,
       {
@@ -125,9 +123,7 @@ async function handleOAuthCallback(code, returnedState, cookies) {
     cookies.set('jwt_access', access_token, getCookieOptions(60 * 60 * 24)); // 1 day
     cookies.set('jwt_refresh', refresh_token, getCookieOptions(60 * 60 * 24 * 365)); // 1 year
   } catch (error) {
-    console.error('OAuth token exchange failed - Full error:', error);
-    console.error('Response data:', error.response?.data);
-    console.error('Response status:', error.response?.status);
+    logSafeServerError('OAuth token exchange failed', error);
     const errorMessage = error.response?.data?.error || error.message || 'Unknown error';
 
     // Provide user-friendly error messages
@@ -138,8 +134,6 @@ async function handleOAuthCallback(code, returnedState, cookies) {
     } else if (errStr.includes('expired')) {
       userError = 'code_expired';
     }
-    console.error('Final error message:', errorMessage);
-
     throw redirect(307, `/login?error=${userError}`);
   }
 

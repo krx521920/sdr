@@ -1,4 +1,4 @@
-import {sequence} from '@sveltejs/kit/hooks';
+import { sequence } from '@sveltejs/kit/hooks';
 import * as Sentry from '@sentry/sveltekit';
 /**
  * SvelteKit Server Hooks with JWT Authentication
@@ -13,6 +13,7 @@ import * as Sentry from '@sentry/sveltekit';
 import { redirect } from '@sveltejs/kit';
 import axios from 'axios';
 import { env } from '$env/dynamic/public';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
 const API_BASE_URL = `${env.PUBLIC_DJANGO_API_URL}/api`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -112,20 +113,6 @@ function refreshAccessToken(refreshToken) {
 }
 
 /**
- * Log only non-sensitive transport metadata. Axios errors contain request
- * headers and bodies, which can include access and refresh tokens.
- *
- * @param {string} message
- * @param {unknown} error
- */
-function logAuthRequestFailure(message, error) {
-  const metadata = axios.isAxiosError(error)
-    ? { status: error.response?.status, code: error.code }
-    : { code: 'unknown_error' };
-  console.error(message, metadata);
-}
-
-/**
  * Perform the actual refresh round-trip. Use refreshAccessToken() instead —
  * it deduplicates concurrent callers.
  *
@@ -144,7 +131,7 @@ async function performTokenRefresh(refreshToken) {
 
     return { access: response.data.access, refresh: response.data.refresh };
   } catch (error) {
-    logAuthRequestFailure('Token refresh failed', error);
+    logSafeServerError('Token refresh failed', error);
     return null;
   }
 }
@@ -178,7 +165,7 @@ async function switchOrg(accessToken, orgId, refreshToken) {
 
     return response.data;
   } catch (error) {
-    logAuthRequestFailure('Org switch failed', error);
+    logSafeServerError('Org switch failed', error);
     return null;
   }
 }
