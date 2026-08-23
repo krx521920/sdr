@@ -103,6 +103,13 @@ ORG_SCOPED_TABLES = [
     # Durable tenant workflow state and attempt audit history.
     "automation_job",
     "automation_job_attempt",
+    # Unified person-to-opportunity matching graph.
+    "matching_person",
+    "matching_person_identity",
+    "matching_evidence",
+    "matching_opportunity",
+    "matching_match",
+    "matching_match_evidence",
     # Boards (Kanban)
     "board",
     "board_column",

@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "sdr.apps.SDRConfig",
     "integrations.apps.IntegrationsConfig",
     "automation.apps.AutomationConfig",
+    "matching.apps.MatchingConfig",
     "accounts",
     "cases",
     "contacts",
