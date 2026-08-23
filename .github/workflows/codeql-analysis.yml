@@ -69,4 +69,16 @@ jobs:
     #   make release
 
     - name: Perform CodeQL Analysis
+      id: codeql-analysis
       uses: github/codeql-action/analyze@v4
+      with:
+        # This private repository does not have GitHub Advanced Security.
+        # Keep CodeQL as a real CI gate and retain its SARIF as an artifact.
+        upload: never
+
+    - name: Upload CodeQL SARIF
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-sarif-${{ matrix.language }}
+        path: ${{ steps.codeql-analysis.outputs.sarif-output }}
+        retention-days: 14
