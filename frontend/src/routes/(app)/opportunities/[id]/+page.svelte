@@ -75,7 +75,7 @@
       {/if}
       {#if opp?.account?.name}
         <span>·</span>
-        <a href={`/accounts`} class="hover:text-[color:var(--text-muted)]">{opp.account.name}</a>
+        <a href="/accounts" class="hover:text-[color:var(--text-muted)]">{opp.account.name}</a>
       {/if}
       {#if opp?.assigned_to?.[0]}
         <span>·</span>

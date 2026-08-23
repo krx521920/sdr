@@ -71,6 +71,7 @@
   let whatsappActive = $state(false);
   let apolloActive = $state(false);
   let csvText = $state('');
+  const prospectCsvPlaceholder = 'company_name,email,phone,first_name,last_name,job_title,linkedin_url,website,industry,country,recipient_timezone,source_url,notes,lawful_basis,lawful_basis_notes,consent_at,consent_evidence,allowed_channels\nAcme Robotics,ada@acme.example,+15551234567,Ada,Lovelace,CTO,https://linkedin.com/in/ada,https://acme.example,Robotics,US,America/New_York,https://source.example,Research note,legitimate_interest,Review LI-42,,,email|linkedin';
 
   $effect(() => {
     const campaign = selected;
@@ -1483,7 +1484,7 @@
           rows="8"
           required
           class="w-full rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg)] px-3 py-2 font-mono text-xs leading-5"
-          placeholder={'company_name,email,phone,first_name,last_name,job_title,linkedin_url,website,industry,country,recipient_timezone,source_url,notes,lawful_basis,lawful_basis_notes,consent_at,consent_evidence,allowed_channels\nAcme Robotics,ada@acme.example,+15551234567,Ada,Lovelace,CTO,https://linkedin.com/in/ada,https://acme.example,Robotics,US,America/New_York,https://source.example,Research note,legitimate_interest,Review LI-42,,,email|linkedin'}
+          placeholder={prospectCsvPlaceholder}
         ></textarea>
         <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
           <label class="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
