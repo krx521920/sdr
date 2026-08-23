@@ -25,6 +25,7 @@ from sdr.models import (
     LeadInspectionStatus,
     SDRIntelligenceSettings,
 )
+from sdr.sales_feedback import build_ai_calibration_context
 from sdr.scoring import RuleBasedLeadScorer
 
 
@@ -51,6 +52,7 @@ class LeadInspector:
         self.errors: list[tuple[str, str]] = []
         self.provider_attempts: list[dict] = []
         self.inspection: LeadInspection | None = None
+        self.sales_feedback_calibration: dict | None = None
 
         if configuration and configuration.is_enabled:
             self.inspection, _ = LeadInspection.objects.update_or_create(
@@ -131,6 +133,9 @@ class LeadInspector:
         if not self.enabled or not config.ai_scoring_enabled:
             return baseline
         qualifier = self.qualifier or ModelGateway.for_configuration(config)
+        self.sales_feedback_calibration = build_ai_calibration_context(
+            org_id=candidate.org_id
+        )
         try:
             self.ai_result = qualifier.qualify(
                 org_id=candidate.org_id,
@@ -140,6 +145,7 @@ class LeadInspector:
                 icp_description=config.icp_description,
                 positive_signals=config.positive_signals,
                 negative_signals=config.negative_signals,
+                sales_feedback_calibration=self.sales_feedback_calibration,
             )
         except ModelGatewayError as exc:
             self.provider_attempts = list(exc.attempts)
@@ -190,6 +196,8 @@ class LeadInspector:
         metadata = dict(qualification.metadata)
         facts = dict(self.research.facts) if self.research else {}
         facts.update(metadata)
+        if self.sales_feedback_calibration:
+            facts["sales_feedback_calibration"] = self.sales_feedback_calibration
         if self.errors:
             facts["inspection_warnings"] = [
                 {"code": code, "message": message[:500]}

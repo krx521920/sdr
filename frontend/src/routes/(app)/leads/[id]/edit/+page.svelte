@@ -75,7 +75,6 @@
 />
 
 <FormShell errorMessage={form?.error || ''} useEnhance={handleSubmit}>
-  {#snippet children()}
     <!-- Section 1: Basics -->
     <section class="flex flex-col gap-3">
       <h3 class="text-[11px] font-semibold uppercase tracking-wider text-[color:var(--text-subtle)]">Basics</h3>
@@ -294,7 +293,6 @@
                   class="flex w-full resize-y rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 py-2 text-[13px] text-[color:var(--text)] outline-none hover:border-[color:var(--border-strong)] focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]">{fv('description', lead?.description)}</textarea>
       </div>
     </section>
-  {/snippet}
 
   {#snippet actions()}
     <Button type="button" variant="ghost" onclick={() => goto(lead?.id ? `/leads/${lead.id}` : '/leads')}>

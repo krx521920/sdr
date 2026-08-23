@@ -22,6 +22,7 @@ from automation.errors import PermanentJobError, RetryableJobError
 from automation.jobs import JobRequest
 from automation.services import dispatch_job, enqueue_job
 from common import notifications
+from sdr.compliance import intake_data_restriction
 from sdr.models import (
     LeadDelivery,
     LeadDeliveryKind,
@@ -32,6 +33,11 @@ from sdr.models import (
     LeadLifecycleEvent,
     LeadLifecycleEventType,
     SDRResponseSettings,
+)
+from sdr.provider_ports import (
+    ProviderAdapterError,
+    ProviderAdapterUnavailable,
+    research_result_sink_adapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,7 +128,7 @@ def record_lifecycle_event(
 def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
     """Persist and best-effort publish every enabled handoff delivery."""
 
-    if intake.status != LeadIntakeStatus.COMPLETED:
+    if intake.status != LeadIntakeStatus.COMPLETED or intake_data_restriction(intake):
         return []
     configuration = response_settings_for(intake.org_id)
     jobs = []
@@ -158,6 +164,15 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
             )
         )
 
+    try:
+        sink = research_result_sink_adapter("feishu_base")
+        if sink.is_ready(org_id=intake.org_id):
+            jobs.append(sink.enqueue(intake=intake))
+    except ProviderAdapterUnavailable:
+        logger.debug("Feishu Base research-result sink is not registered")
+    except ProviderAdapterError:
+        logger.exception("Could not schedule Feishu Base sync for intake %s", intake.id)
+
     for job in jobs:
         if job.name == ACKNOWLEDGEMENT_JOB:
             continue
@@ -171,6 +186,8 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
 def schedule_acknowledgement_job(intake: LeadIntake):
     """Queue the customer acknowledgement without waiting for qualification."""
 
+    if intake_data_restriction(intake):
+        return None
     configuration = response_settings_for(intake.org_id)
     email = _lead_email(intake)
     if not configuration.acknowledgement_email_enabled or not email:
@@ -246,6 +263,11 @@ def process_acknowledgement_email_job(
     if delivery.status in (LeadDeliveryStatus.SENT, LeadDeliveryStatus.SKIPPED):
         return _delivery_result(delivery)
 
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        _skip_delivery(delivery, code=restriction.code)
+        return _delivery_result(delivery)
+
     configuration = response_settings_for(intake.org_id)
     if not configuration.acknowledgement_email_enabled:
         _skip_delivery(delivery, code="acknowledgement_disabled")
@@ -303,6 +325,10 @@ def process_sales_in_app_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     )
     if delivery.status in (LeadDeliveryStatus.SENT, LeadDeliveryStatus.SKIPPED):
         return _delivery_result(delivery)
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        _skip_delivery(delivery, code=restriction.code)
+        return _delivery_result(delivery)
     configuration = response_settings_for(intake.org_id)
     if not configuration.sales_in_app_enabled:
         _skip_delivery(delivery, code="sales_in_app_disabled")
@@ -353,6 +379,10 @@ def process_sales_feishu_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         expected_kind=LeadDeliveryKind.SALES_FEISHU,
     )
     if delivery.status in (LeadDeliveryStatus.SENT, LeadDeliveryStatus.SKIPPED):
+        return _delivery_result(delivery)
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        _skip_delivery(delivery, code=restriction.code)
         return _delivery_result(delivery)
     configuration = response_settings_for(intake.org_id)
     if not configuration.feishu_enabled or not configuration.feishu_webhook_ciphertext:

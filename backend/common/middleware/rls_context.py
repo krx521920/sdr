@@ -105,8 +105,15 @@ class RequireOrgContext:
         ]
     """
 
-    # Paths that don't require org context
+    # Exact paths that don't require org context. Keep single webhooks here so
+    # an appended or adjacent route cannot inherit the exemption.
+    EXACT_EXEMPT_PATHS = {
+        "/api/sdr/public/ses-feedback/",
+    }
+
+    # Path prefixes that don't require org context.
     EXEMPT_PATHS = [
+        "/healthz/",
         "/api/auth/refresh-token/",
         "/api/auth/me/",
         "/api/auth/switch-org/",
@@ -124,9 +131,19 @@ class RequireOrgContext:
         # Meta signs the request body; the Page id is then resolved to an org
         # and RLS context is set explicitly by the background integration job.
         "/api/integrations/facebook/webhook/",
+        # Meta signs WhatsApp status events; the phone-number route resolves
+        # the tenant and the handler enters that database org context itself.
+        "/api/integrations/whatsapp/webhook/",
         # Signed state binds the public Meta OAuth callback to the tenant; the
         # callback sets that tenant's RLS context before reading its session.
         "/api/integrations/facebook/oauth/callback/",
+        # Nurture links carry signed, event-specific tokens. Each view validates
+        # its token and enters the embedded tenant's RLS context before queries.
+        # Keep these prefixes narrow rather than exempting all future public
+        # SDR routes.
+        "/api/sdr/public/nurture/open/",
+        "/api/sdr/public/nurture/click/",
+        "/api/sdr/public/nurture/unsubscribe/",
     ]
 
     def __init__(self, get_response):
@@ -162,7 +179,9 @@ class RequireOrgContext:
 
     def _is_exempt(self, path):
         """Check if path is exempt from org context requirement."""
-        return any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS)
+        return path in self.EXACT_EXEMPT_PATHS or any(
+            path.startswith(exempt) for exempt in self.EXEMPT_PATHS
+        )
 
     def _set_org_context(self, request):
         """Set PostgreSQL session variable (session scope for autocommit mode)."""

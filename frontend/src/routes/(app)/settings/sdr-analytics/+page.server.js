@@ -18,6 +18,21 @@ function emptyAnalytics(days) {
     trend: [],
     engagement: { sent: 0, variants: [] },
     response_sla: { sample_size: 0, within_sla_rate: 0 },
+    sales_feedback: {
+      summary: {
+        total: 0,
+        accepted: 0,
+        rejected: 0,
+        recycled: 0,
+        coverage_rate: 0,
+        acceptance_rate: 0,
+        calibration_ready: false,
+        minimum_calibration_samples: 10
+      },
+      rejection_reasons: [],
+      by_qualification_band: [],
+      by_model: []
+    },
     insights: [],
     definitions: {}
   };

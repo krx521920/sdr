@@ -1,3 +1,5 @@
+import re
+
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -23,6 +25,15 @@ from sdr.models import (
     NurtureReplySentiment,
     OutboundCampaignStatus,
     OutboundProspectStatus,
+    SalesFeedbackDecision,
+    SalesFeedbackReason,
+    SDRChannelComplianceRule,
+    SDRComplianceChannel,
+    SDRComplianceEvent,
+    SDRComplianceSettings,
+    SDRDataProvenance,
+    SDRDoNotContactEntry,
+    SDRDoNotContactReason,
     SDREmailSuppression,
     SDRIntelligenceSettings,
     SDRModelCredential,
@@ -30,19 +41,335 @@ from sdr.models import (
     SDRNurtureSequence,
     SDRNurtureStep,
     SDROutboundCampaign,
+    SDROutboundCopyDraft,
     SDROutboundProspect,
+    SDROutboundSource,
     SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingRuleMember,
+    SDRSalesFeedback,
+    validate_iana_timezone,
+    validate_send_weekdays,
+)
+from sdr.outbound_copy import validate_generated_steps
+from sdr.provider_ports import (
+    ProviderAdapterUnavailable,
+    outbound_channel_adapter,
+    prospect_source_adapter,
 )
 from sdr.response import validate_feishu_webhook_url, validate_message_template
 from sdr.routing.service import normalize_country
 
 VALID_COUNTRY_CODES = {code for code, _ in COUNTRIES}
 
+APOLLO_LIST_FILTERS = {
+    "person_titles",
+    "person_seniorities",
+    "person_locations",
+    "organization_locations",
+    "organization_domains",
+    "employee_ranges",
+    "email_statuses",
+    "technologies_any",
+    "technologies_all",
+}
+APOLLO_FILTERS = APOLLO_LIST_FILTERS | {"keywords"}
+
 
 class SDRAnalyticsQuerySerializer(serializers.Serializer):
     days = serializers.ChoiceField(choices=(7, 30, 90), default=30)
+
+
+class SDRComplianceSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SDRComplianceSettings
+        fields = (
+            "enforcement_enabled",
+            "require_lawful_basis",
+            "retention_mode",
+            "retention_days",
+            "deletion_grace_days",
+            "last_retention_scan_at",
+            "updated_at",
+        )
+        read_only_fields = ("last_retention_scan_at", "updated_at")
+
+
+class SDRChannelComplianceRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SDRChannelComplianceRule
+        fields = (
+            "id",
+            "country_code",
+            "channel",
+            "is_allowed",
+            "requires_consent",
+            "notes",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate_country_code(self, value):
+        country = value.strip().upper() or "*"
+        if country != "*" and country not in VALID_COUNTRY_CODES:
+            raise serializers.ValidationError("Use * or a supported ISO country code.")
+        return country
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        org = self.context["org"]
+        country = attrs.get(
+            "country_code", getattr(self.instance, "country_code", "*")
+        )
+        channel = attrs.get("channel", getattr(self.instance, "channel", ""))
+        duplicate = SDRChannelComplianceRule.objects.filter(
+            org=org,
+            country_code=country,
+            channel=channel,
+        )
+        if self.instance:
+            duplicate = duplicate.exclude(id=self.instance.id)
+        if duplicate.exists():
+            raise serializers.ValidationError(
+                "A rule already exists for this country and channel."
+            )
+        return attrs
+
+
+class SDRDoNotContactSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SDRDoNotContactEntry
+        fields = (
+            "id",
+            "channel",
+            "identifier",
+            "country_code",
+            "reason",
+            "source",
+            "is_active",
+            "blocked_at",
+            "released_at",
+            "details",
+        )
+        read_only_fields = fields
+
+
+class SDRDoNotContactCreateSerializer(serializers.Serializer):
+    channel = serializers.ChoiceField(choices=SDRComplianceChannel.choices)
+    identifier = serializers.CharField(max_length=1000)
+    country_code = serializers.CharField(max_length=3, required=False, allow_blank=True)
+    reason = serializers.ChoiceField(
+        choices=SDRDoNotContactReason.choices,
+        default=SDRDoNotContactReason.ADMIN,
+    )
+    details = serializers.JSONField(required=False, default=dict)
+
+    def validate_country_code(self, value):
+        country = normalize_country(value)
+        if country and country not in VALID_COUNTRY_CODES:
+            raise serializers.ValidationError("Use a supported ISO country code.")
+        return country
+
+
+class SDRDataProvenanceSerializer(serializers.ModelSerializer):
+    intake_id = serializers.UUIDField(read_only=True)
+    intake_source = serializers.CharField(source="intake.source", read_only=True)
+    company_name = serializers.SerializerMethodField()
+    contact_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SDRDataProvenance
+        fields = (
+            "id",
+            "intake_id",
+            "intake_source",
+            "company_name",
+            "contact_name",
+            "collection_method",
+            "source_url",
+            "lawful_basis",
+            "lawful_basis_notes",
+            "consent_at",
+            "consent_evidence",
+            "country_code",
+            "allowed_channels",
+            "retention_until",
+            "status",
+            "deletion_requested_at",
+            "anonymized_at",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "intake_id",
+            "intake_source",
+            "company_name",
+            "contact_name",
+            "status",
+            "deletion_requested_at",
+            "anonymized_at",
+            "created_at",
+            "updated_at",
+        )
+
+    def get_company_name(self, obj):
+        return (
+            obj.intake.normalized_payload.get("company", {}).get("name")
+            or obj.intake.raw_payload.get("company_name")
+            or ""
+        )
+
+    def get_contact_name(self, obj):
+        identity = obj.intake.normalized_payload.get("identity", {})
+        return " ".join(
+            filter(
+                None,
+                (
+                    identity.get("first_name") or obj.intake.raw_payload.get("first_name"),
+                    identity.get("last_name") or obj.intake.raw_payload.get("last_name"),
+                ),
+            )
+        )
+
+    def validate_allowed_channels(self, values):
+        cleaned = list(dict.fromkeys(str(value).strip().lower() for value in values))
+        if any(value not in SDRComplianceChannel.values for value in cleaned):
+            raise serializers.ValidationError("Select only supported contact channels.")
+        return cleaned
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        lawful_basis = attrs.get(
+            "lawful_basis", getattr(self.instance, "lawful_basis", "unassessed")
+        )
+        consent_at = attrs.get(
+            "consent_at", getattr(self.instance, "consent_at", None)
+        )
+        evidence = attrs.get(
+            "consent_evidence", getattr(self.instance, "consent_evidence", "")
+        )
+        notes = attrs.get(
+            "lawful_basis_notes",
+            getattr(self.instance, "lawful_basis_notes", ""),
+        )
+        if lawful_basis == "consent" and (not consent_at or not evidence.strip()):
+            raise serializers.ValidationError(
+                "Consent requires a timestamp and evidence reference."
+            )
+        if lawful_basis == "legitimate_interest" and not notes.strip():
+            raise serializers.ValidationError(
+                "Legitimate interest requires a documented assessment reference."
+            )
+        return attrs
+
+
+class SDRComplianceEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SDRComplianceEvent
+        fields = (
+            "id",
+            "intake_id",
+            "prospect_id",
+            "event_type",
+            "channel",
+            "allowed",
+            "reason",
+            "snapshot",
+            "occurred_at",
+        )
+        read_only_fields = fields
+
+
+class SDRComplianceDeletionActionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("request", "cancel", "anonymize"))
+    confirm_intake_id = serializers.UUIDField(required=False)
+
+    def validate(self, attrs):
+        if attrs["action"] == "anonymize" and attrs.get("confirm_intake_id") is None:
+            raise serializers.ValidationError(
+                {"confirm_intake_id": "Confirm the intake ID before anonymizing."}
+            )
+        return attrs
+
+
+class SDRComplianceRetentionScanSerializer(serializers.Serializer):
+    execute = serializers.BooleanField(default=False)
+    limit = serializers.IntegerField(min_value=1, max_value=500, default=200)
+
+
+class SDRSalesFeedbackSerializer(serializers.ModelSerializer):
+    feedback_by_name = serializers.SerializerMethodField()
+    decision_label = serializers.CharField(
+        source="get_decision_display", read_only=True
+    )
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+
+    class Meta:
+        model = SDRSalesFeedback
+        fields = (
+            "id",
+            "decision",
+            "decision_label",
+            "reason",
+            "reason_label",
+            "quality_score",
+            "satisfaction_score",
+            "notes",
+            "feedback_by_name",
+            "qualification_score_snapshot",
+            "qualification_band_snapshot",
+            "provider_snapshot",
+            "model_snapshot",
+            "prompt_version_snapshot",
+            "submitted_at",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "decision_label",
+            "reason_label",
+            "feedback_by_name",
+            "qualification_score_snapshot",
+            "qualification_band_snapshot",
+            "provider_snapshot",
+            "model_snapshot",
+            "prompt_version_snapshot",
+            "submitted_at",
+            "created_at",
+            "updated_at",
+        )
+
+    def validate_notes(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        decision = attrs.get("decision", getattr(self.instance, "decision", ""))
+        reason = attrs.get("reason", getattr(self.instance, "reason", ""))
+        notes = attrs.get("notes", getattr(self.instance, "notes", ""))
+        if decision == SalesFeedbackDecision.ACCEPTED:
+            if reason and reason != SalesFeedbackReason.GOOD_FIT:
+                raise serializers.ValidationError(
+                    {"reason": "Accepted feedback may only use the good-fit reason."}
+                )
+            attrs["reason"] = SalesFeedbackReason.GOOD_FIT
+        elif not reason or reason == SalesFeedbackReason.GOOD_FIT:
+            raise serializers.ValidationError(
+                {"reason": "Choose why this lead was rejected or recycled."}
+            )
+        if reason == SalesFeedbackReason.OTHER and not notes:
+            raise serializers.ValidationError(
+                {"notes": "Add notes when the reason is Other."}
+            )
+        return attrs
+
+    def get_feedback_by_name(self, obj):
+        if not obj.feedback_by_id:
+            return "Former team member"
+        return obj.feedback_by.user.name or obj.feedback_by.user.email
 
 
 class SDROutboundCampaignSerializer(serializers.ModelSerializer):
@@ -52,6 +379,7 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
     sequence_name = serializers.SerializerMethodField()
     sequence_ready = serializers.SerializerMethodField()
     metrics = serializers.SerializerMethodField()
+    channel_readiness = serializers.SerializerMethodField()
 
     class Meta:
         model = SDROutboundCampaign
@@ -61,6 +389,9 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
             "description",
             "icp_description",
             "channels",
+            "linkedin_invitation_message",
+            "whatsapp_template_name",
+            "whatsapp_template_language",
             "status",
             "owner_id",
             "owner_name",
@@ -69,10 +400,16 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
             "sequence_ready",
             "daily_send_limit",
             "metrics",
+            "channel_readiness",
             "launched_at",
             "completed_at",
             "run_count",
             "last_refilled_at",
+            "safety_hold",
+            "safety_paused_at",
+            "safety_cleared_at",
+            "safety_pause_reason",
+            "safety_snapshot",
             "created_at",
             "updated_at",
         )
@@ -82,10 +419,16 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
             "sequence_name",
             "sequence_ready",
             "metrics",
+            "channel_readiness",
             "launched_at",
             "completed_at",
             "run_count",
             "last_refilled_at",
+            "safety_hold",
+            "safety_paused_at",
+            "safety_cleared_at",
+            "safety_pause_reason",
+            "safety_snapshot",
             "created_at",
             "updated_at",
         )
@@ -94,7 +437,9 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
         allowed = {"email", "linkedin", "phone", "whatsapp"}
         cleaned = list(dict.fromkeys(str(value).strip().lower() for value in values))
         if any(value not in allowed for value in cleaned):
-            raise serializers.ValidationError("Select only supported outbound channels.")
+            raise serializers.ValidationError(
+                "Select only supported outbound channels."
+            )
         return cleaned
 
     def validate_name(self, value):
@@ -111,12 +456,41 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
             )
         return value.strip()
 
+    def validate_whatsapp_template_name(self, value):
+        cleaned = value.strip()
+        if cleaned and not re.fullmatch(r"[a-z0-9_]{1,512}", cleaned):
+            raise serializers.ValidationError(
+                "Use the approved lowercase WhatsApp template name."
+            )
+        return cleaned
+
+    def validate_linkedin_invitation_message(self, value):
+        from sdr.linkedin_copy import (
+            LinkedInInvitationTemplateError,
+            validate_invitation_template,
+        )
+
+        try:
+            return validate_invitation_template(value)
+        except LinkedInInvitationTemplateError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_whatsapp_template_language(self, value):
+        cleaned = value.strip()
+        if not re.fullmatch(r"[a-z]{2,3}(?:_[A-Z]{2})?", cleaned):
+            raise serializers.ValidationError(
+                "Use a WhatsApp language code such as en_US or zh_CN."
+            )
+        return cleaned
+
     def validate_owner_id(self, value):
         if value is None:
             return None
         org = self.context["org"]
         if not Profile.objects.filter(id=value, org=org, is_active=True).exists():
-            raise serializers.ValidationError("Select an active member of this organization.")
+            raise serializers.ValidationError(
+                "Select an active member of this organization."
+            )
         return value
 
     def validate_sequence_id(self, value):
@@ -153,6 +527,20 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
                     "daily_send_limit", self.instance.daily_send_limit
                 )
                 != self.instance.daily_send_limit,
+                "linkedin_invitation_message": attrs.get(
+                    "linkedin_invitation_message",
+                    self.instance.linkedin_invitation_message,
+                )
+                != self.instance.linkedin_invitation_message,
+                "whatsapp_template_name": attrs.get(
+                    "whatsapp_template_name", self.instance.whatsapp_template_name
+                )
+                != self.instance.whatsapp_template_name,
+                "whatsapp_template_language": attrs.get(
+                    "whatsapp_template_language",
+                    self.instance.whatsapp_template_language,
+                )
+                != self.instance.whatsapp_template_language,
             }
             changed = [field for field, differs in protected_changes.items() if differs]
             if changed:
@@ -203,6 +591,26 @@ class SDROutboundCampaignSerializer(serializers.ModelSerializer):
             and obj.sequence.steps.exists()
         )
 
+    def get_channel_readiness(self, obj):
+        try:
+            whatsapp_ready = outbound_channel_adapter("whatsapp").is_ready(
+                org_id=obj.org_id
+            )
+        except ProviderAdapterUnavailable:
+            whatsapp_ready = False
+        try:
+            linkedin_ready = outbound_channel_adapter("linkedin").is_ready(
+                org_id=obj.org_id
+            )
+        except ProviderAdapterUnavailable:
+            linkedin_ready = False
+        return {
+            "email": self.get_sequence_ready(obj),
+            "whatsapp": bool(whatsapp_ready and obj.whatsapp_template_name),
+            "linkedin": bool(linkedin_ready),
+            "phone": False,
+        }
+
     def get_metrics(self, obj):
         keys = {
             "total": "prospect_total",
@@ -250,8 +658,14 @@ class SDROutboundProspectSerializer(serializers.ModelSerializer):
             "website",
             "industry",
             "country",
+            "recipient_timezone",
             "source_url",
             "notes",
+            "lawful_basis",
+            "lawful_basis_notes",
+            "consent_at",
+            "consent_evidence",
+            "allowed_channels",
             "status",
             "attempt_count",
             "last_error_code",
@@ -267,20 +681,262 @@ class SDROutboundProspectSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class SDROutboundSourceSerializer(serializers.ModelSerializer):
+    campaign_id = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = SDROutboundSource
+        fields = (
+            "id",
+            "campaign_id",
+            "name",
+            "provider",
+            "is_active",
+            "search_filters",
+            "interval_hours",
+            "max_results_per_sync",
+            "enrichment_credits_acknowledged",
+            "next_sync_at",
+            "last_sync_at",
+            "last_job_id",
+            "next_page",
+            "sync_count",
+            "last_sync_stats",
+            "last_error_code",
+            "last_error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "campaign_id",
+            "provider",
+            "next_sync_at",
+            "last_sync_at",
+            "last_job_id",
+            "next_page",
+            "sync_count",
+            "last_sync_stats",
+            "last_error_code",
+            "last_error_message",
+            "created_at",
+            "updated_at",
+        )
+
+    def validate_name(self, value):
+        cleaned = value.strip()
+        campaign = self.context["campaign"]
+        queryset = SDROutboundSource.objects.filter(
+            org=self.context["org"],
+            campaign=campaign,
+            name__iexact=cleaned,
+        )
+        if self.instance:
+            queryset = queryset.exclude(id=self.instance.id)
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "An Apollo source with this name already exists in the campaign."
+            )
+        return cleaned
+
+    def validate_search_filters(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Use an object of Apollo search filters.")
+        unsupported = sorted(set(value) - APOLLO_FILTERS)
+        if unsupported:
+            raise serializers.ValidationError(
+                f"Unsupported Apollo filters: {', '.join(unsupported)}."
+            )
+        cleaned = {}
+        for key, raw_value in value.items():
+            if key == "keywords":
+                keyword = str(raw_value).strip()
+                if len(keyword) > 200:
+                    raise serializers.ValidationError(
+                        "Apollo keywords must be 200 characters or fewer."
+                    )
+                if keyword:
+                    cleaned[key] = keyword
+                continue
+            if not isinstance(raw_value, list):
+                raise serializers.ValidationError(
+                    f"Apollo filter {key} must be a list."
+                )
+            values = list(
+                dict.fromkeys(str(item).strip() for item in raw_value if str(item).strip())
+            )
+            if len(values) > 50 or any(len(item) > 200 for item in values):
+                raise serializers.ValidationError(
+                    f"Apollo filter {key} accepts up to 50 values of 200 characters."
+                )
+            if values:
+                cleaned[key] = values
+        if not cleaned:
+            raise serializers.ValidationError(
+                "Add at least one Apollo people or company filter."
+            )
+        return cleaned
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        acknowledged = attrs.get(
+            "enrichment_credits_acknowledged",
+            self.instance.enrichment_credits_acknowledged if self.instance else False,
+        )
+        active = attrs.get(
+            "is_active",
+            self.instance.is_active if self.instance else False,
+        )
+        filters = attrs.get(
+            "search_filters",
+            self.instance.search_filters if self.instance else {},
+        )
+        if not filters:
+            raise serializers.ValidationError(
+                {"search_filters": "Add at least one Apollo search filter."}
+            )
+        if active and not acknowledged:
+            raise serializers.ValidationError(
+                {
+                    "enrichment_credits_acknowledged": (
+                        "Confirm Apollo enrichment credit usage before enabling sync."
+                    )
+                }
+            )
+        apollo_ready = False
+        if active:
+            try:
+                apollo_ready = prospect_source_adapter("apollo").is_ready(
+                    org_id=self.context["org"].id
+                )
+            except ProviderAdapterUnavailable:
+                pass
+        if active and not apollo_ready:
+            raise serializers.ValidationError(
+                {"is_active": "Enable the Apollo connection before scheduling sync."}
+            )
+        campaign = self.context["campaign"]
+        if campaign.status == OutboundCampaignStatus.ARCHIVED:
+            raise serializers.ValidationError(
+                "Reopen the campaign before configuring automatic sources."
+            )
+        return attrs
+
+    def create(self, validated_data):
+        if validated_data.get("is_active"):
+            validated_data["next_sync_at"] = timezone.now()
+        return SDROutboundSource.objects.create(
+            org=self.context["org"],
+            campaign=self.context["campaign"],
+            **validated_data,
+        )
+
+    def update(self, instance, validated_data):
+        enabling = validated_data.get("is_active") is True and not instance.is_active
+        disabling = validated_data.get("is_active") is False and instance.is_active
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if enabling:
+            instance.next_sync_at = timezone.now()
+        elif disabling:
+            instance.next_sync_at = None
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class SDROutboundCopyGenerateSerializer(serializers.Serializer):
+    language = serializers.CharField(max_length=40, default="English")
+    tone = serializers.CharField(max_length=80, default="concise and consultative")
+    offering_summary = serializers.CharField(max_length=4000)
+    value_proposition = serializers.CharField(max_length=4000)
+    proof_points = serializers.CharField(
+        max_length=4000,
+        required=False,
+        allow_blank=True,
+    )
+    cta_goal = serializers.CharField(max_length=500)
+    step_count = serializers.IntegerField(min_value=1, max_value=5, default=3)
+
+
+class SDROutboundCopyDraftSerializer(serializers.ModelSerializer):
+    campaign_id = serializers.UUIDField(read_only=True)
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SDROutboundCopyDraft
+        fields = (
+            "id",
+            "campaign_id",
+            "status",
+            "language",
+            "tone",
+            "offering_summary",
+            "value_proposition",
+            "proof_points",
+            "cta_goal",
+            "step_count",
+            "generated_steps",
+            "provider",
+            "model",
+            "prompt_version",
+            "provider_attempts",
+            "input_tokens",
+            "output_tokens",
+            "last_job_id",
+            "reviewed_by_name",
+            "generated_at",
+            "reviewed_at",
+            "applied_at",
+            "error_code",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_reviewed_by_name(self, obj):
+        if not obj.reviewed_by_id:
+            return ""
+        return obj.reviewed_by.user.name or obj.reviewed_by.user.email
+
+
+class SDROutboundCopyDraftEditSerializer(serializers.Serializer):
+    generated_steps = serializers.JSONField()
+
+    def validate_generated_steps(self, value):
+        try:
+            return validate_generated_steps(
+                value,
+                expected_count=self.context["draft"].step_count,
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class SDROutboundCopyDraftActionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("apply",))
+
+
 class SDROutboundImportSerializer(serializers.Serializer):
     csv_text = serializers.CharField(max_length=1_000_000, trim_whitespace=False)
     promote_ready = serializers.BooleanField(default=False)
 
 
 class SDROutboundProspectActionSerializer(serializers.Serializer):
-    action = serializers.ChoiceField(
-        choices=("promote", "disqualify", "restore")
-    )
+    action = serializers.ChoiceField(choices=("promote", "disqualify", "restore"))
 
 
 class SDROutboundCampaignActionSerializer(serializers.Serializer):
     action = serializers.ChoiceField(
-        choices=("launch", "pause", "retry_failed", "complete", "archive")
+        choices=(
+            "launch",
+            "pause",
+            "retry_failed",
+            "complete",
+            "archive",
+            "clear_safety_hold",
+        )
     )
 
 
@@ -679,6 +1335,17 @@ class SDRResponseSettingsSerializer(serializers.ModelSerializer):
             "feishu_configured",
             "feishu_webhook_hint",
             "response_sla_seconds",
+            "email_safety_enabled",
+            "org_daily_send_limit",
+            "bounce_rate_threshold",
+            "complaint_rate_threshold",
+            "safety_min_sample_size",
+            "safety_window_days",
+            "enforce_recipient_working_hours",
+            "default_recipient_timezone",
+            "recipient_send_window_start",
+            "recipient_send_window_end",
+            "recipient_send_weekdays",
             "updated_at",
         )
         read_only_fields = (
@@ -710,6 +1377,22 @@ class SDRResponseSettingsSerializer(serializers.ModelSerializer):
         except ValueError as exc:
             raise serializers.ValidationError(str(exc)) from exc
 
+    def validate_default_recipient_timezone(self, value):
+        try:
+            validate_iana_timezone(value)
+        except Exception as exc:
+            raise serializers.ValidationError("Enter a valid IANA timezone.") from exc
+        return value
+
+    def validate_recipient_send_weekdays(self, value):
+        try:
+            validate_send_weekdays(value)
+        except Exception as exc:
+            raise serializers.ValidationError(
+                "Use unique weekday numbers from 0 (Monday) to 6 (Sunday)."
+            ) from exc
+        return value
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         enabled = attrs.get(
@@ -724,6 +1407,22 @@ class SDRResponseSettingsSerializer(serializers.ModelSerializer):
         if enabled and not (supplied or configured):
             raise serializers.ValidationError(
                 {"feishu_webhook_url": "Configure a webhook before enabling Feishu."}
+            )
+        window_start = attrs.get(
+            "recipient_send_window_start",
+            getattr(self.instance, "recipient_send_window_start", None),
+        )
+        window_end = attrs.get(
+            "recipient_send_window_end",
+            getattr(self.instance, "recipient_send_window_end", None),
+        )
+        if window_start and window_end and window_start >= window_end:
+            raise serializers.ValidationError(
+                {
+                    "recipient_send_window_end": (
+                        "The send window must end after it starts."
+                    )
+                }
             )
         return attrs
 
@@ -905,9 +1604,7 @@ class SDRNurtureSequenceSerializer(serializers.ModelSerializer):
             variant_replied = variant_deliveries.filter(
                 replied_at__isnull=False
             ).count()
-            variant_opened = variant_deliveries.filter(
-                opened_at__isnull=False
-            ).count()
+            variant_opened = variant_deliveries.filter(opened_at__isnull=False).count()
             variant_clicked = variant_deliveries.filter(
                 clicked_at__isnull=False
             ).count()
@@ -925,9 +1622,7 @@ class SDRNurtureSequenceSerializer(serializers.ModelSerializer):
                 "complained": variant_complained,
                 "replied": variant_replied,
                 "open_rate": (
-                    round(variant_opened * 100 / variant_sent, 1)
-                    if variant_sent
-                    else 0
+                    round(variant_opened * 100 / variant_sent, 1) if variant_sent else 0
                 ),
                 "click_rate": (
                     round(variant_clicked * 100 / variant_sent, 1)
@@ -947,9 +1642,7 @@ class SDRNurtureSequenceSerializer(serializers.ModelSerializer):
             }
         return {
             "enrollments": enrollments.count(),
-            "active": enrollments.filter(
-                status=NurtureEnrollmentStatus.ACTIVE
-            ).count(),
+            "active": enrollments.filter(status=NurtureEnrollmentStatus.ACTIVE).count(),
             "sent": sent,
             "delivered": delivered,
             "bounced": bounced,

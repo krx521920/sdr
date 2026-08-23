@@ -14,7 +14,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
 
 from common.models import Org, Profile, User
 from common.serializer import OrgAwareRefreshToken
@@ -366,9 +365,9 @@ class TestProfileDetailView:
         assert str(response.data["org"]["id"]) == str(org_a.id)
 
     def test_profile_detail_unauthenticated(self, unauthenticated_client):
-        """Unauthenticated user gets error (401 or PermissionDenied from middleware)."""
-        with pytest.raises((PermissionDenied, Exception)):
-            unauthenticated_client.get(self.url)
+        """Requests without an organization context fail closed."""
+        response = unauthenticated_client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 # ---------------------------------------------------------------------------

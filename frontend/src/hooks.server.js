@@ -1,4 +1,4 @@
-import {sequence} from '@sveltejs/kit/hooks';
+import { sequence } from '@sveltejs/kit/hooks';
 import * as Sentry from '@sentry/sveltekit';
 /**
  * SvelteKit Server Hooks with JWT Authentication
@@ -13,6 +13,7 @@ import * as Sentry from '@sentry/sveltekit';
 import { redirect } from '@sveltejs/kit';
 import axios from 'axios';
 import { env } from '$env/dynamic/public';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
 const API_BASE_URL = `${env.PUBLIC_DJANGO_API_URL}/api`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -130,7 +131,7 @@ async function performTokenRefresh(refreshToken) {
 
     return { access: response.data.access, refresh: response.data.refresh };
   } catch (error) {
-    console.error('Token refresh failed:', error);
+    logSafeServerError('Token refresh failed', error);
     return null;
   }
 }
@@ -164,7 +165,7 @@ async function switchOrg(accessToken, orgId, refreshToken) {
 
     return response.data;
   } catch (error) {
-    console.error('Org switch failed:', error);
+    logSafeServerError('Org switch failed', error);
     return null;
   }
 }
@@ -279,14 +280,14 @@ export const handle = sequence(Sentry.sentryHandle(), async function _handle({ e
           });
 
           // Extract org info from switch result (no additional API call!)
+          const newPayload = decodeJwtPayload(switchResult.access_token);
           event.locals.org = switchResult.current_org;
           /** @type {any} */ (event.locals).profile = {
             org: switchResult.current_org,
-            role: 'USER' // Will be in new JWT
+            role: typeof newPayload?.role === 'string' ? newPayload.role : 'USER'
           };
           event.locals.org_name = switchResult.current_org?.name || 'Organization';
           // Decode new token to get org_settings
-          const newPayload = decodeJwtPayload(switchResult.access_token);
           event.locals.org_settings = newPayload?.org_settings || {
             default_currency: 'USD',
             currency_symbol: '$',

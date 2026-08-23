@@ -14,6 +14,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from sdr.email_safety import evaluate_campaign_safety
 from sdr.models import (
     EmailProviderEventType,
     EmailSuppressionReason,
@@ -145,9 +146,7 @@ def process_ses_feedback(feedback: SESFeedback) -> dict[str, Any]:
     elif feedback.event_type == EmailProviderEventType.BOUNCE:
         delivery.bounced_at = delivery.bounced_at or feedback.event_at
         delivery.bounce_type = str(feedback.details.get("bounce_type") or "")[:32]
-        delivery.bounce_subtype = str(
-            feedback.details.get("bounce_subtype") or ""
-        )[:64]
+        delivery.bounce_subtype = str(feedback.details.get("bounce_subtype") or "")[:64]
         update_fields.extend(["bounced_at", "bounce_type", "bounce_subtype"])
         lifecycle_type = LeadLifecycleEventType.NURTURE_BOUNCED
     else:
@@ -156,7 +155,9 @@ def process_ses_feedback(feedback: SESFeedback) -> dict[str, Any]:
         lifecycle_type = LeadLifecycleEventType.NURTURE_COMPLAINED
     delivery.save(update_fields=update_fields)
 
-    event_key_hash = hashlib.sha256(feedback.provider_event_id.encode()).hexdigest()[:24]
+    event_key_hash = hashlib.sha256(feedback.provider_event_id.encode()).hexdigest()[
+        :24
+    ]
     record_lifecycle_event(
         intake=delivery.enrollment.intake,
         event_type=lifecycle_type,
@@ -194,12 +195,14 @@ def process_ses_feedback(feedback: SESFeedback) -> dict[str, Any]:
         )
         suppression_id = str(suppression.id)
 
+    campaign_safety = evaluate_campaign_safety(delivery)
     return {
         "status": "processed",
         "event_id": str(provider_event.id),
         "delivery_id": str(delivery.id),
         "event_type": feedback.event_type,
         "suppression_id": suppression_id,
+        "campaign_safety": campaign_safety,
     }
 
 

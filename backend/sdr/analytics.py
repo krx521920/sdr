@@ -23,6 +23,7 @@ from sdr.models import (
     NurtureReplySentiment,
     SDRResponseSettings,
 )
+from sdr.sales_feedback import build_sales_feedback_calibration
 
 MQL_BANDS = (QualificationBand.HIGH.value, QualificationBand.MEDIUM.value)
 
@@ -65,6 +66,11 @@ def build_sdr_analytics(*, org, days: int = 30) -> dict[str, Any]:
         start=start,
         end=now,
     )
+    sales_feedback = build_sales_feedback_calibration(
+        org=org,
+        start=start,
+        end=now,
+    )
 
     return {
         "period": {
@@ -103,6 +109,7 @@ def build_sdr_analytics(*, org, days: int = 30) -> dict[str, Any]:
         ),
         "engagement": engagement,
         "response_sla": response_sla,
+        "sales_feedback": sales_feedback,
         "insights": _growth_insights(
             funnel=funnel,
             sources=sources,
@@ -115,6 +122,10 @@ def build_sdr_analytics(*, org, days: int = 30) -> dict[str, Any]:
                 "MQL assigned to a sales profile and linked to a CRM lead."
             ),
             "sql": "Sales-handoff MQL whose CRM lead status is converted.",
+            "sales_feedback": (
+                "Sales verdicts submitted during the selected period; AI model "
+                "calibration activates after 10 aggregate samples."
+            ),
             "engagement_window": (
                 "Nurture emails sent during the selected period; later delivery "
                 "and interaction outcomes are attributed to those sends."

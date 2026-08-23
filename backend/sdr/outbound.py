@@ -16,8 +16,10 @@ from uuid import UUID
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator, validate_email
 from django.db import transaction
+from django.db.models import Q
 from django.db.models.functions import Lower
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from automation.errors import PermanentJobError, RetryableJobError
 from automation.jobs import JobRequest
@@ -25,6 +27,9 @@ from automation.models import AutomationJobStatus
 from automation.services import dispatch_job, enqueue_job, replay_dead_letter
 from leads.models import Lead
 from sdr.domain import CompanySnapshot, LeadCandidate, LeadIdentity, LeadSource
+from sdr.email_safety import (
+    CAMPAIGN_SAFETY_PAUSE_REASON,
+)
 from sdr.models import (
     LeadIntake,
     LeadIntakeSource,
@@ -32,13 +37,21 @@ from sdr.models import (
     NurtureEnrollmentStatus,
     OutboundCampaignStatus,
     OutboundProspectStatus,
+    SDRComplianceChannel,
+    SDRLawfulBasis,
     SDROutboundCampaign,
     SDROutboundProspect,
+    validate_iana_timezone,
 )
 from sdr.nurture import (
     enroll_intake_in_sequence,
     pause_enrollment,
     resume_enrollment,
+)
+from sdr.provider_ports import (
+    ProviderAdapterError,
+    ProviderAdapterUnavailable,
+    outbound_channel_adapter,
 )
 from sdr.routing import normalize_country
 from sdr.services import (
@@ -64,8 +77,14 @@ CSV_HEADERS = (
     "website",
     "industry",
     "country",
+    "recipient_timezone",
     "source_url",
     "notes",
+    "lawful_basis",
+    "lawful_basis_notes",
+    "consent_at",
+    "consent_evidence",
+    "allowed_channels",
 )
 URL_FIELDS = ("linkedin_url", "website", "source_url")
 FIELD_LIMITS = {
@@ -79,7 +98,10 @@ FIELD_LIMITS = {
     "website": 500,
     "industry": 255,
     "country": 100,
+    "recipient_timezone": 64,
     "source_url": 1000,
+    "lawful_basis_notes": 2000,
+    "consent_evidence": 2000,
 }
 
 
@@ -98,7 +120,7 @@ class OutboundCampaignExecutionError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ParsedProspect:
     row_number: int
-    values: dict[str, str]
+    values: dict[str, Any]
     material: str
     dedupe_key: str
 
@@ -173,7 +195,9 @@ def enqueue_outbound_prospect(
     if prospect.status == OutboundProspectStatus.DISQUALIFIED:
         raise OutboundProspectUnavailable("Restore this prospect before promotion.")
     if campaign_run is not None and campaign_run < 1:
-        raise OutboundProspectUnavailable("Launch the campaign before queueing prospects.")
+        raise OutboundProspectUnavailable(
+            "Launch the campaign before queueing prospects."
+        )
     idempotency_key = (
         f"outbound-prospect:{prospect.id}:campaign:{campaign_run}"
         if campaign_run is not None
@@ -269,6 +293,13 @@ def process_outbound_prospect_job(payload: Mapping[str, Any]) -> Mapping[str, An
             "reason": "campaign_not_active",
         }
     if prospect.status == OutboundProspectStatus.PROMOTED and prospect.intake_id:
+        if campaign_run is not None:
+            _ensure_campaign_channel_execution(
+                prospect=prospect,
+                campaign=prospect.campaign,
+                campaign_run=campaign_run,
+                intake=prospect.intake,
+            )
         return _promotion_result(prospect, replayed=True)
     if prospect.status == OutboundProspectStatus.DISQUALIFIED:
         raise PermanentJobError(
@@ -317,15 +348,13 @@ def process_outbound_prospect_job(payload: Mapping[str, Any]) -> Mapping[str, An
             .select_related("sequence")
             .first()
         )
-        if campaign and campaign.sequence_id:
-            try:
-                enroll_intake_in_sequence(intake, campaign.sequence)
-            except ValueError as exc:
-                _mark_failed(prospect, "outbound_enrollment_unavailable", str(exc))
-                raise RetryableJobError(
-                    "The outbound nurture enrollment is temporarily unavailable.",
-                    code="outbound_enrollment_unavailable",
-                ) from exc
+        if campaign:
+            _ensure_campaign_channel_execution(
+                prospect=prospect,
+                campaign=campaign,
+                campaign_run=campaign_run,
+                intake=intake,
+            )
     SDROutboundProspect.objects.filter(id=prospect.id, org_id=org_id).update(
         status=OutboundProspectStatus.PROMOTED,
         intake=intake,
@@ -344,7 +373,9 @@ def restore_outbound_prospect(prospect: SDROutboundProspect) -> None:
         OutboundProspectStatus.DISQUALIFIED,
         OutboundProspectStatus.FAILED,
     }:
-        raise OutboundProspectUnavailable("Only failed or disqualified prospects can be restored.")
+        raise OutboundProspectUnavailable(
+            "Only failed or disqualified prospects can be restored."
+        )
     prospect.status = OutboundProspectStatus.READY
     prospect.last_error_code = ""
     prospect.last_error_message = ""
@@ -439,9 +470,7 @@ def finish_outbound_campaign(
 ) -> dict[str, Any]:
     result = pause_outbound_campaign(campaign)
     next_status = (
-        OutboundCampaignStatus.ARCHIVED
-        if archive
-        else OutboundCampaignStatus.COMPLETED
+        OutboundCampaignStatus.ARCHIVED if archive else OutboundCampaignStatus.COMPLETED
     )
     now = timezone.now()
     SDROutboundCampaign.objects.filter(
@@ -479,13 +508,20 @@ def refill_outbound_campaign(
             queued_at__date=timezone.localdate(),
         ).count()
         remaining = max(0, locked.daily_send_limit - queued_today)
+        contact_filter = Q()
+        if "email" in locked.channels:
+            contact_filter |= ~Q(email="")
+        if "linkedin" in locked.channels:
+            contact_filter |= ~Q(email="")
+        if "whatsapp" in locked.channels:
+            contact_filter |= ~Q(phone="")
         base = (
             SDROutboundProspect.objects.select_for_update()
             .filter(
                 org_id=locked.org_id,
                 campaign=locked,
             )
-            .exclude(email="")
+            .filter(contact_filter)
             .order_by("created_at", "id")
         )
         newly_released = 0
@@ -498,8 +534,9 @@ def refill_outbound_campaign(
                 )[: locked.daily_send_limit]
             )
             older = list(
-                base.filter(status=OutboundProspectStatus.FAILED)
-                .exclude(id__in=[prospect.id for prospect in same_day])[:remaining]
+                base.filter(status=OutboundProspectStatus.FAILED).exclude(
+                    id__in=[prospect.id for prospect in same_day]
+                )[:remaining]
             )
             prospects = [*same_day, *older]
             newly_released = len(older)
@@ -508,12 +545,12 @@ def refill_outbound_campaign(
                 base.filter(
                     status=OutboundProspectStatus.READY,
                     queued_at__date=timezone.localdate(),
-                )
-                .exclude(queued_run=locked.run_count)[: locked.daily_send_limit]
+                ).exclude(queued_run=locked.run_count)[: locked.daily_send_limit]
             )
             new = list(
-                base.filter(status=OutboundProspectStatus.READY)
-                .exclude(id__in=[prospect.id for prospect in same_day])[:remaining]
+                base.filter(status=OutboundProspectStatus.READY).exclude(
+                    id__in=[prospect.id for prospect in same_day]
+                )[:remaining]
             )
             prospects = [*same_day, *new]
             newly_released = len(new)
@@ -554,32 +591,137 @@ def reconcile_outbound_campaigns(*, org_id: UUID, limit: int = 100) -> int:
     return queued
 
 
+def retry_failed_outbound_work(campaign: SDROutboundCampaign) -> dict[str, Any]:
+    promotion = refill_outbound_campaign(campaign, failed_only=True)
+    whatsapp_queued = 0
+    linkedin_queued = 0
+    if "whatsapp" in campaign.channels:
+        try:
+            whatsapp_queued = outbound_channel_adapter("whatsapp").retry_failed(
+                campaign=campaign
+            )
+        except (ProviderAdapterError, ProviderAdapterUnavailable) as exc:
+            raise OutboundCampaignExecutionError(str(exc)) from exc
+    if "linkedin" in campaign.channels:
+        try:
+            linkedin_queued = outbound_channel_adapter("linkedin").retry_failed(
+                campaign=campaign
+            )
+        except (ProviderAdapterError, ProviderAdapterUnavailable) as exc:
+            raise OutboundCampaignExecutionError(str(exc)) from exc
+    return {
+        **promotion,
+        "whatsapp_queued": whatsapp_queued,
+        "linkedin_queued": linkedin_queued,
+    }
+
+
 def _validate_campaign_for_execution(campaign: SDROutboundCampaign) -> None:
-    if "email" not in campaign.channels:
+    if campaign.safety_hold:
         raise OutboundCampaignExecutionError(
-            "Enable the email channel before launching this campaign."
+            "Clear the campaign email safety hold before launching it again."
         )
-    if not campaign.sequence_id:
+    executable_channels = {"email", "linkedin", "whatsapp"}.intersection(
+        campaign.channels
+    )
+    if not executable_channels:
         raise OutboundCampaignExecutionError(
-            "Select an outbound nurture sequence before launching."
+            "Enable at least one executable channel: email, LinkedIn, or WhatsApp."
         )
-    sequence = campaign.sequence
-    if not sequence.is_active:
-        raise OutboundCampaignExecutionError(
-            "Enable the selected nurture sequence before launching."
-        )
-    if LeadIntakeSource.OUTBOUND not in sequence.sources:
-        raise OutboundCampaignExecutionError(
-            "The selected sequence must explicitly include the outbound source."
-        )
-    if not sequence.from_email:
-        raise OutboundCampaignExecutionError(
-            "Configure a sender email on the selected nurture sequence."
-        )
-    if not sequence.steps.exists():
-        raise OutboundCampaignExecutionError(
-            "Add at least one step to the selected nurture sequence."
-        )
+    if "email" in executable_channels:
+        if not campaign.sequence_id:
+            raise OutboundCampaignExecutionError(
+                "Select an outbound nurture sequence before launching email."
+            )
+        sequence = campaign.sequence
+        if not sequence.is_active:
+            raise OutboundCampaignExecutionError(
+                "Enable the selected nurture sequence before launching."
+            )
+        if LeadIntakeSource.OUTBOUND not in sequence.sources:
+            raise OutboundCampaignExecutionError(
+                "The selected sequence must explicitly include the outbound source."
+            )
+        if not sequence.from_email:
+            raise OutboundCampaignExecutionError(
+                "Configure a sender email on the selected nurture sequence."
+            )
+        if not sequence.steps.exists():
+            raise OutboundCampaignExecutionError(
+                "Add at least one step to the selected nurture sequence."
+            )
+    if "whatsapp" in executable_channels:
+        try:
+            whatsapp_ready = outbound_channel_adapter("whatsapp").is_ready(
+                org_id=campaign.org_id
+            )
+        except ProviderAdapterUnavailable:
+            whatsapp_ready = False
+        if not whatsapp_ready:
+            raise OutboundCampaignExecutionError(
+                "Configure and enable a WhatsApp Business connection first."
+            )
+        if not campaign.whatsapp_template_name.strip():
+            raise OutboundCampaignExecutionError(
+                "Configure an approved WhatsApp template name before launching."
+            )
+    if "linkedin" in executable_channels:
+        try:
+            linkedin_ready = outbound_channel_adapter("linkedin").is_ready(
+                org_id=campaign.org_id
+            )
+        except ProviderAdapterUnavailable:
+            linkedin_ready = False
+        if not linkedin_ready:
+            raise OutboundCampaignExecutionError(
+                "Configure an enabled LinkedIn connection with approved partner API access first."
+            )
+
+
+def _ensure_campaign_channel_execution(
+    *,
+    prospect: SDROutboundProspect,
+    campaign: SDROutboundCampaign,
+    campaign_run: int,
+    intake: LeadIntake,
+) -> None:
+    if "email" in campaign.channels and campaign.sequence_id and prospect.email:
+        try:
+            enroll_intake_in_sequence(intake, campaign.sequence)
+        except ValueError as exc:
+            _mark_failed(prospect, "outbound_enrollment_unavailable", str(exc))
+            raise RetryableJobError(
+                "The outbound nurture enrollment is temporarily unavailable.",
+                code="outbound_enrollment_unavailable",
+            ) from exc
+    if "whatsapp" in campaign.channels and prospect.phone:
+        try:
+            outbound_channel_adapter("whatsapp").enqueue(
+                prospect=prospect,
+                campaign=campaign,
+                campaign_run=campaign_run,
+            )
+        except (ProviderAdapterError, ProviderAdapterUnavailable) as exc:
+            error_code = getattr(exc, "error_code", "whatsapp_adapter_unavailable")
+            _mark_failed(prospect, error_code, str(exc))
+            raise PermanentJobError(
+                str(exc),
+                code=error_code,
+            ) from exc
+    if "linkedin" in campaign.channels and prospect.email:
+        try:
+            outbound_channel_adapter("linkedin").enqueue(
+                prospect=prospect,
+                campaign=campaign,
+                campaign_run=campaign_run,
+            )
+        except (ProviderAdapterError, ProviderAdapterUnavailable) as exc:
+            error_code = getattr(exc, "error_code", "linkedin_adapter_unavailable")
+            _mark_failed(prospect, error_code, str(exc))
+            raise PermanentJobError(
+                str(exc),
+                code=error_code,
+            ) from exc
 
 
 def _resume_campaign_enrollments(campaign: SDROutboundCampaign) -> int:
@@ -588,7 +730,7 @@ def _resume_campaign_enrollments(campaign: SDROutboundCampaign) -> int:
         org_id=campaign.org_id,
         intake__outbound_prospect__campaign=campaign,
         status=NurtureEnrollmentStatus.PAUSED,
-        stop_reason=CAMPAIGN_PAUSE_REASON,
+        stop_reason__in=(CAMPAIGN_PAUSE_REASON, CAMPAIGN_SAFETY_PAUSE_REASON),
     )
     for enrollment in enrollments.iterator(chunk_size=100):
         resume_enrollment(enrollment)
@@ -644,13 +786,58 @@ def _parse_csv(csv_text: str) -> tuple[list[ParsedProspect], list[dict[str, Any]
     return parsed, errors
 
 
-def _clean_and_validate(values: dict[str, str]) -> list[tuple[str, str]]:
+def _clean_and_validate(values: dict[str, Any]) -> list[tuple[str, str]]:
     errors: list[tuple[str, str]] = []
     for key, value in list(values.items()):
-        values[key] = re.sub(r"\s+", " ", value).strip() if key != "notes" else value.strip()
+        values[key] = (
+            re.sub(r"\s+", " ", value).strip() if key != "notes" else value.strip()
+        )
     values["email"] = values["email"].lower()
     values["phone"] = re.sub(r"\s+", " ", values["phone"])
     values["country"] = normalize_country(values["country"])
+    lawful_basis = values["lawful_basis"].strip().lower()
+    values["lawful_basis"] = lawful_basis or SDRLawfulBasis.UNASSESSED
+    if values["lawful_basis"] not in SDRLawfulBasis.values:
+        errors.append(("lawful_basis", "Select a supported lawful basis."))
+    allowed_channels = list(
+        dict.fromkeys(
+            item.strip().lower()
+            for item in re.split(r"[,|;]", values["allowed_channels"])
+            if item.strip()
+        )
+    )
+    values["allowed_channels"] = (
+        allowed_channels or list(SDRComplianceChannel.values)
+    )
+    if any(channel not in SDRComplianceChannel.values for channel in allowed_channels):
+        errors.append(("allowed_channels", "Use email, whatsapp, linkedin, or phone."))
+    consent_at = values["consent_at"].strip()
+    values["consent_at"] = parse_datetime(consent_at) if consent_at else None
+    if consent_at and values["consent_at"] is None:
+        errors.append(("consent_at", "Use an ISO-8601 date and time."))
+    elif values["consent_at"] is not None and timezone.is_naive(values["consent_at"]):
+        values["consent_at"] = timezone.make_aware(values["consent_at"])
+    if values["lawful_basis"] == SDRLawfulBasis.CONSENT and (
+        values["consent_at"] is None or not values["consent_evidence"].strip()
+    ):
+        errors.append(
+            ("consent_evidence", "Consent requires a timestamp and evidence reference.")
+        )
+    if (
+        values["lawful_basis"] == SDRLawfulBasis.LEGITIMATE_INTEREST
+        and not values["lawful_basis_notes"].strip()
+    ):
+        errors.append(
+            (
+                "lawful_basis_notes",
+                "Legitimate interest requires a documented assessment reference.",
+            )
+        )
+    if values["recipient_timezone"]:
+        try:
+            validate_iana_timezone(values["recipient_timezone"])
+        except ValidationError:
+            errors.append(("recipient_timezone", "Enter a valid IANA timezone."))
     for field in URL_FIELDS:
         if values[field] and "://" not in values[field]:
             values[field] = f"https://{values[field]}"
@@ -658,8 +845,7 @@ def _clean_and_validate(values: dict[str, str]) -> list[tuple[str, str]]:
     if not values["company_name"]:
         errors.append(("company_name", "Company name is required."))
     if not any(
-        values[field]
-        for field in ("email", "phone", "linkedin_url", "website")
+        values[field] for field in ("email", "phone", "linkedin_url", "website")
     ):
         errors.append(
             (
@@ -686,7 +872,7 @@ def _clean_and_validate(values: dict[str, str]) -> list[tuple[str, str]]:
     return errors
 
 
-def _dedupe_material(values: Mapping[str, str]) -> str:
+def _dedupe_material(values: Mapping[str, Any]) -> str:
     if values["email"]:
         return f"email:{values['email'].casefold()}"
     if values["linkedin_url"]:
@@ -699,9 +885,7 @@ def _dedupe_material(values: Mapping[str, str]) -> str:
     )
 
 
-def _existing_crm_materials(
-    *, org_id: UUID, parsed: list[ParsedProspect]
-) -> set[str]:
+def _existing_crm_materials(*, org_id: UUID, parsed: list[ParsedProspect]) -> set[str]:
     materials = {row.material for row in parsed}
     result: set[str] = set()
     emails = {
@@ -779,20 +963,28 @@ def _candidate_from_prospect(prospect: SDROutboundProspect) -> LeadCandidate:
             "outbound_campaign_id": str(prospect.campaign_id),
             "outbound_campaign_name": prospect.campaign.name,
             "source_url": prospect.source_url,
+            "lawful_basis": prospect.lawful_basis,
+            "lawful_basis_notes": prospect.lawful_basis_notes,
+            "consent_at": (
+                prospect.consent_at.isoformat() if prospect.consent_at else None
+            ),
+            "consent_evidence": prospect.consent_evidence,
+            "allowed_channels": prospect.allowed_channels,
         },
     )
 
 
 def _raw_payload(prospect: SDROutboundProspect) -> dict[str, Any]:
-    return {
+    payload = {
         "prospect_id": str(prospect.id),
         "campaign_id": str(prospect.campaign_id),
         "campaign_name": prospect.campaign.name,
-        **{
-            field: getattr(prospect, field)
-            for field in CSV_HEADERS
-        },
+        **{field: getattr(prospect, field) for field in CSV_HEADERS},
     }
+    payload["consent_at"] = (
+        prospect.consent_at.isoformat() if prospect.consent_at else None
+    )
+    return payload
 
 
 def _mark_failed(prospect: SDROutboundProspect, code: str, message: str) -> None:
@@ -839,4 +1031,6 @@ def _safe_dispatch(job) -> None:
     try:
         dispatch_job(job)
     except Exception:
-        logger.exception("Outbound prospect job %s was persisted but not dispatched", job.id)
+        logger.exception(
+            "Outbound prospect job %s was persisted but not dispatched", job.id
+        )

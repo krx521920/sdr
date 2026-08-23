@@ -8,21 +8,39 @@ from sdr.api.views import (
     LeadNurtureEnrollmentActionView,
     LeadNurtureEnrollmentListView,
     SDRAnalyticsView,
+    SDRComplianceDeletionActionView,
+    SDRComplianceOverviewView,
+    SDRComplianceRetentionScanView,
+    SDRComplianceRuleDetailView,
+    SDRComplianceRuleListCreateView,
+    SDRComplianceSettingsView,
+    SDRDataProvenanceDetailView,
+    SDRDataProvenanceListView,
+    SDRDoNotContactDetailView,
+    SDRDoNotContactListCreateView,
     SDREmailSuppressionDetailView,
     SDREmailSuppressionListCreateView,
     SDRIntelligenceSettingsView,
     SDRNurtureSequenceDetailView,
     SDRNurtureSequenceListCreateView,
     SDROutboundCampaignActionView,
+    SDROutboundCampaignAnalyticsView,
     SDROutboundCampaignDetailView,
     SDROutboundCampaignListCreateView,
+    SDROutboundCopyDraftActionView,
+    SDROutboundCopyDraftDetailView,
+    SDROutboundCopyDraftListCreateView,
     SDROutboundProspectActionView,
     SDROutboundProspectImportView,
     SDROutboundProspectListView,
+    SDROutboundSourceDetailView,
+    SDROutboundSourceListCreateView,
+    SDROutboundSourceSyncView,
     SDRResponseSettingsView,
     SDRRoutingPreviewView,
     SDRRoutingRuleDetailView,
     SDRRoutingRuleListCreateView,
+    SDRSalesFeedbackLeadView,
 )
 from sdr.ses_views import SESFeedbackWebhookView
 from sdr.tracking_views import NurtureClickTrackingView, NurtureOpenTrackingView
@@ -32,6 +50,61 @@ app_name = "api_sdr"
 
 urlpatterns = [
     path("analytics/funnel/", SDRAnalyticsView.as_view(), name="analytics_funnel"),
+    path(
+        "compliance/",
+        SDRComplianceOverviewView.as_view(),
+        name="compliance_overview",
+    ),
+    path(
+        "compliance/settings/",
+        SDRComplianceSettingsView.as_view(),
+        name="compliance_settings",
+    ),
+    path(
+        "compliance/rules/",
+        SDRComplianceRuleListCreateView.as_view(),
+        name="compliance_rule_list_create",
+    ),
+    path(
+        "compliance/rules/<uuid:rule_id>/",
+        SDRComplianceRuleDetailView.as_view(),
+        name="compliance_rule_detail",
+    ),
+    path(
+        "compliance/dnc/",
+        SDRDoNotContactListCreateView.as_view(),
+        name="compliance_dnc_list_create",
+    ),
+    path(
+        "compliance/dnc/<uuid:entry_id>/",
+        SDRDoNotContactDetailView.as_view(),
+        name="compliance_dnc_detail",
+    ),
+    path(
+        "compliance/provenance/",
+        SDRDataProvenanceListView.as_view(),
+        name="compliance_provenance_list",
+    ),
+    path(
+        "compliance/provenance/<uuid:intake_id>/",
+        SDRDataProvenanceDetailView.as_view(),
+        name="compliance_provenance_detail",
+    ),
+    path(
+        "compliance/intakes/<uuid:intake_id>/deletion/",
+        SDRComplianceDeletionActionView.as_view(),
+        name="compliance_deletion_action",
+    ),
+    path(
+        "compliance/retention/scan/",
+        SDRComplianceRetentionScanView.as_view(),
+        name="compliance_retention_scan",
+    ),
+    path(
+        "sales-feedback/leads/<uuid:lead_id>/",
+        SDRSalesFeedbackLeadView.as_view(),
+        name="sales_feedback_lead",
+    ),
     path(
         "outbound/campaigns/",
         SDROutboundCampaignListCreateView.as_view(),
@@ -48,6 +121,11 @@ urlpatterns = [
         name="outbound_campaign_action",
     ),
     path(
+        "outbound/campaigns/<uuid:campaign_id>/analytics/",
+        SDROutboundCampaignAnalyticsView.as_view(),
+        name="outbound_campaign_analytics",
+    ),
+    path(
         "outbound/campaigns/<uuid:campaign_id>/prospects/",
         SDROutboundProspectListView.as_view(),
         name="outbound_prospect_list",
@@ -56,6 +134,36 @@ urlpatterns = [
         "outbound/campaigns/<uuid:campaign_id>/prospects/import/",
         SDROutboundProspectImportView.as_view(),
         name="outbound_prospect_import",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/sources/",
+        SDROutboundSourceListCreateView.as_view(),
+        name="outbound_source_list_create",
+    ),
+    path(
+        "outbound/campaigns/<uuid:campaign_id>/copy-drafts/",
+        SDROutboundCopyDraftListCreateView.as_view(),
+        name="outbound_copy_draft_list_create",
+    ),
+    path(
+        "outbound/copy-drafts/<uuid:draft_id>/",
+        SDROutboundCopyDraftDetailView.as_view(),
+        name="outbound_copy_draft_detail",
+    ),
+    path(
+        "outbound/copy-drafts/<uuid:draft_id>/action/",
+        SDROutboundCopyDraftActionView.as_view(),
+        name="outbound_copy_draft_action",
+    ),
+    path(
+        "outbound/sources/<uuid:source_id>/",
+        SDROutboundSourceDetailView.as_view(),
+        name="outbound_source_detail",
+    ),
+    path(
+        "outbound/sources/<uuid:source_id>/sync/",
+        SDROutboundSourceSyncView.as_view(),
+        name="outbound_source_sync",
     ),
     path(
         "outbound/prospects/<uuid:prospect_id>/action/",

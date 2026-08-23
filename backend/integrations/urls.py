@@ -1,6 +1,7 @@
 from django.urls import path
 
 from integrations.api.views import (
+    ApolloConnectionView,
     FacebookConversionSettingsView,
     FacebookMessengerConversationView,
     FacebookOAuthCallbackView,
@@ -10,11 +11,46 @@ from integrations.api.views import (
     FacebookPageConnectionDetailView,
     FacebookPageConnectionListCreateView,
     FacebookWebhookView,
+    FeishuBaseConnectionTestView,
+    FeishuBaseConnectionView,
+    LinkedInConnectionView,
+    WhatsAppBusinessConnectionView,
+    WhatsAppWebhookView,
 )
 
 app_name = "api_integrations"
 
 urlpatterns = [
+    path(
+        "feishu-base/connection/",
+        FeishuBaseConnectionView.as_view(),
+        name="feishu_base_connection",
+    ),
+    path(
+        "feishu-base/connection/test/",
+        FeishuBaseConnectionTestView.as_view(),
+        name="feishu_base_connection_test",
+    ),
+    path(
+        "linkedin/connection/",
+        LinkedInConnectionView.as_view(),
+        name="linkedin_connection",
+    ),
+    path(
+        "apollo/connection/",
+        ApolloConnectionView.as_view(),
+        name="apollo_connection",
+    ),
+    path(
+        "whatsapp/connection/",
+        WhatsAppBusinessConnectionView.as_view(),
+        name="whatsapp_connection",
+    ),
+    path(
+        "whatsapp/webhook/",
+        WhatsAppWebhookView.as_view(),
+        name="whatsapp_webhook",
+    ),
     path(
         "facebook/oauth/start/",
         FacebookOAuthStartView.as_view(),

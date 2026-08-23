@@ -23,11 +23,17 @@ echo "PostgreSQL is ready."
 echo "Running migrations..."
 python manage.py migrate --noinput
 
-echo "Creating default admin user (if needed)..."
+echo "Applying default admin bootstrap policy..."
 python manage.py create_default_admin
 
 echo "Collecting static files..."
 python manage.py collectstatic --noinput
 
-echo "Starting development server..."
-exec python manage.py runserver 0.0.0.0:8000
+echo "Starting Gunicorn ASGI server..."
+exec gunicorn crm.asgi:application \
+    --bind 0.0.0.0:8000 \
+    --workers "${WEB_CONCURRENCY:-2}" \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --timeout "${GUNICORN_TIMEOUT:-120}" \
+    --access-logfile - \
+    --error-logfile -

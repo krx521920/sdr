@@ -10,6 +10,7 @@
     AlertTriangle,
     CheckCircle2,
     Clock3,
+    DatabaseZap,
     LoaderCircle,
     MailCheck,
     MessageCircle,
@@ -27,6 +28,30 @@
   const intakeSummary = $derived(data.intakes?.summary || {});
   const responseMetrics = $derived(data.intakes?.response_metrics || {});
   const responseSettings = $derived(data.responseSettings || {});
+  const feishuBase = $derived(data.feishuBase || {});
+  const feishuSyncSummary = $derived(feishuBase.sync_summary || {});
+  const feishuMappingFields = [
+    { key: 'intake_id', label: 'Intake ID', required: true, hint: 'Unique text business key' },
+    { key: 'company_name', label: 'Company', hint: 'Text' },
+    { key: 'contact_name', label: 'Contact', hint: 'Text' },
+    { key: 'email', label: 'Email', hint: 'Text' },
+    { key: 'phone', label: 'Phone', hint: 'Text or phone' },
+    { key: 'linkedin_url', label: 'LinkedIn URL', hint: 'Text or URL' },
+    { key: 'website', label: 'Website', hint: 'Text or URL' },
+    { key: 'source', label: 'Source', hint: 'Text or single select' },
+    { key: 'source_record_id', label: 'Source record ID', hint: 'Text' },
+    { key: 'research_summary', label: 'Research summary', hint: 'Text' },
+    { key: 'research_facts', label: 'Research facts', hint: 'Text (JSON)' },
+    { key: 'source_urls', label: 'Source URLs', hint: 'Text (JSON)' },
+    { key: 'qualification_score', label: 'Qualification score', hint: 'Number' },
+    { key: 'qualification_band', label: 'Qualification band', hint: 'Text or single select' },
+    { key: 'qualification_reasons', label: 'Qualification reasons', hint: 'Text (JSON)' },
+    { key: 'assigned_sales', label: 'Assigned sales', hint: 'Text' },
+    { key: 'routing_reason', label: 'Routing reason', hint: 'Text' },
+    { key: 'crm_lead_id', label: 'CRM lead ID', hint: 'Text' },
+    { key: 'processed_at', label: 'Processed at', hint: 'Date/time' },
+    { key: 'inspection_status', label: 'Inspection status', hint: 'Text or single select' }
+  ];
   const activeCount = $derived(
     (summary.pending || 0) +
       (summary.queued || 0) +
@@ -39,6 +64,10 @@
     if (form?.actionError) toast.error(form.actionError);
     if (form?.retried) toast.success('Dead-letter job reopened for processing.');
     if (form?.responseSaved) toast.success('Lead response settings saved.');
+    if (form?.feishuBaseSaved) toast.success('Feishu Base connection saved.');
+    if (form?.feishuBaseTested) {
+      toast.success(`Feishu Base mapping validated against ${form.feishuBaseFieldCount} fields.`);
+    }
   });
 
   /** @param {string} status */
@@ -78,7 +107,8 @@
         'sdr.process_intake': 'Website lead intake',
         'sdr.send_acknowledgement': 'Acknowledgement email',
         'sdr.notify_sales_in_app': 'Sales in-app notification',
-        'sdr.notify_sales_feishu': 'Sales Feishu notification'
+        'sdr.notify_sales_feishu': 'Sales Feishu notification',
+        'feishu_base.sync_research_result': 'Feishu Base research sync'
       }[name] || name
     );
   }
@@ -362,6 +392,119 @@
         <Button type="submit">Save response policy</Button>
       </div>
     </form>
+  </SectionCard>
+
+  <SectionCard>
+    {#snippet title()}
+      <div>
+        <h3 class="flex items-center gap-2 text-[16px] font-medium text-[color:var(--text-primary)]">
+          <DatabaseZap class="size-4 text-violet-500" />Feishu Base research sync
+        </h3>
+        <p class="text-[12px] text-[color:var(--text-muted)]">
+          Upsert each completed research result by intake ID through the official Base API.
+        </p>
+      </div>
+    {/snippet}
+
+    <div class="mb-5 grid gap-3 sm:grid-cols-3">
+      <div class="rounded-md border border-[color:var(--border-faint)] p-3">
+        <p class="text-xs text-[color:var(--text-muted)]">Synced</p>
+        <p class="mt-1 text-xl font-semibold text-emerald-600">{feishuSyncSummary.succeeded || 0}</p>
+      </div>
+      <div class="rounded-md border border-[color:var(--border-faint)] p-3">
+        <p class="text-xs text-[color:var(--text-muted)]">In progress</p>
+        <p class="mt-1 text-xl font-semibold text-blue-600">
+          {(feishuSyncSummary.pending || 0) + (feishuSyncSummary.queued || 0) + (feishuSyncSummary.syncing || 0)}
+        </p>
+      </div>
+      <div class="rounded-md border border-[color:var(--border-faint)] p-3">
+        <p class="text-xs text-[color:var(--text-muted)]">Failed</p>
+        <p class="mt-1 text-xl font-semibold text-red-600">{feishuSyncSummary.failed || 0}</p>
+      </div>
+    </div>
+
+    <form method="POST" action="?/saveFeishuBase" use:enhance class="space-y-5">
+      <label class="flex items-start gap-2 rounded-md border border-[color:var(--border-faint)] p-3 text-sm">
+        <input type="checkbox" name="is_active" checked={feishuBase.is_active} class="mt-0.5" />
+        <span>
+          <strong class="block">Enable automatic Base sync</strong>
+          <span class="text-xs text-[color:var(--text-muted)]">
+            New and recently completed intakes are queued through the durable job ledger.
+          </span>
+        </span>
+      </label>
+
+      <div class="grid gap-4 md:grid-cols-2">
+        <label class="space-y-1.5 text-sm">
+          <span class="font-medium text-[color:var(--text-primary)]">Feishu app ID</span>
+          <Input name="app_id" value={feishuBase.app_id || ''} placeholder="cli_..." />
+        </label>
+        <label class="space-y-1.5 text-sm">
+          <span class="font-medium text-[color:var(--text-primary)]">App secret</span>
+          <Input
+            type="password"
+            name="app_secret"
+            autocomplete="new-password"
+            placeholder={feishuBase.app_secret_configured
+              ? `Configured …${feishuBase.app_secret_hint}`
+              : 'App secret'}
+          />
+        </label>
+        <label class="space-y-1.5 text-sm">
+          <span class="font-medium text-[color:var(--text-primary)]">Base app token</span>
+          <Input name="app_token" value={feishuBase.app_token || ''} placeholder="bascn..." />
+        </label>
+        <label class="space-y-1.5 text-sm">
+          <span class="font-medium text-[color:var(--text-primary)]">Table ID</span>
+          <Input name="table_id" value={feishuBase.table_id || ''} placeholder="tbl..." />
+        </label>
+      </div>
+
+      <div class="space-y-3">
+        <div>
+          <p class="text-sm font-medium text-[color:var(--text-primary)]">Field mapping</p>
+          <p class="text-xs text-[color:var(--text-muted)]">
+            Enter existing field names exactly as they appear in the target table. Formula, lookup,
+            attachment, and system fields are not writable.
+          </p>
+        </div>
+        <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {#each feishuMappingFields as item (item.key)}
+            <label class="space-y-1 text-xs">
+              <span class="flex items-center justify-between gap-2">
+                <span class="font-medium text-[color:var(--text-primary)]">
+                  {item.label}{item.required ? ' *' : ''}
+                </span>
+                <span class="text-[color:var(--text-muted)]">{item.hint}</span>
+              </span>
+              <Input
+                name={`mapping_${item.key}`}
+                value={feishuBase.field_mapping?.[item.key] || ''}
+                placeholder="Exact Base field name"
+                required={item.required}
+              />
+            </label>
+          {/each}
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <p class="max-w-2xl text-xs text-[color:var(--text-muted)]">
+          Add the custom app to this Base with management permission and grant record/field read-write
+          scopes. Credentials are encrypted at rest.
+        </p>
+        <Button type="submit">Save Base connection</Button>
+      </div>
+    </form>
+
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-4">
+      <p class="text-xs text-[color:var(--text-muted)]">
+        Last validated: {formatDate(feishuBase.last_validated_at)} · Last sync: {formatDate(feishuBase.last_sync_at)}
+      </p>
+      <form method="POST" action="?/testFeishuBase" use:enhance>
+        <Button type="submit" variant="outline" disabled={!feishuBase.id}>Validate credentials & fields</Button>
+      </form>
+    </div>
   </SectionCard>
 
   <SectionCard>

@@ -8,3 +8,6 @@ class IntegrationsConfig(AppConfig):
 
     def ready(self):
         from integrations import signals  # noqa: F401
+        from integrations.providers.sdr_adapters import register_sdr_provider_adapters
+
+        register_sdr_provider_adapters()

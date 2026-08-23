@@ -27,9 +27,9 @@
   const trend = $derived(analytics.trend || []);
   const engagement = $derived(analytics.engagement || {});
   const responseSla = $derived(analytics.response_sla || {});
-  const maxTrend = $derived(
-    Math.max(1, ...trend.map((item) => Number(item.received || 0)))
-  );
+  const salesFeedback = $derived(analytics.sales_feedback || {});
+  const feedbackSummary = $derived(salesFeedback.summary || {});
+  const maxTrend = $derived(Math.max(1, ...trend.map((item) => Number(item.received || 0))));
   const maxFunnel = $derived(Math.max(1, Number(funnel[0]?.count || 0)));
 
   const kpiCards = $derived([
@@ -186,7 +186,7 @@
             <card.icon class="size-4" />
           </span>
         </div>
-        <p class="mt-3 text-2xl font-semibold tabular-nums text-[color:var(--text)]">
+        <p class="mt-3 text-2xl font-semibold text-[color:var(--text)] tabular-nums">
           {card.value}
         </p>
         <p class="mt-1 text-[11px] text-[color:var(--text-subtle)]">{card.comparison}</p>
@@ -225,7 +225,7 @@
                     </span>
                   {/if}
                 </div>
-                <span class="font-semibold tabular-nums text-[color:var(--text)]">
+                <span class="font-semibold text-[color:var(--text)] tabular-nums">
                   {formatNumber(stage.count)}
                 </span>
               </div>
@@ -240,7 +240,7 @@
                 </div>
               </div>
               {#if index < funnel.length - 1}
-                <div class="ml-3 mt-1 flex h-2 items-center text-[color:var(--text-subtle)]">
+                <div class="mt-1 ml-3 flex h-2 items-center text-[color:var(--text-subtle)]">
                   <ArrowDown class="size-3" />
                 </div>
               {/if}
@@ -248,7 +248,9 @@
           {/each}
         </div>
       {:else}
-        <div class="mt-6 rounded-lg bg-[color:var(--bg-muted)] p-8 text-center text-sm text-[color:var(--text-muted)]">
+        <div
+          class="mt-6 rounded-lg bg-[color:var(--bg-muted)] p-8 text-center text-sm text-[color:var(--text-muted)]"
+        >
           No funnel data is available for this period.
         </div>
       {/if}
@@ -274,12 +276,14 @@
               <div class="min-w-0">
                 <p class="text-xs font-semibold">{insight.title}</p>
                 <p class="mt-1 text-[11px] leading-5 opacity-80">{insight.detail}</p>
-                <p class="mt-2 text-[11px] font-medium leading-5">{insight.action}</p>
+                <p class="mt-2 text-[11px] leading-5 font-medium">{insight.action}</p>
               </div>
             </div>
           </div>
         {:else}
-          <div class="rounded-lg bg-[color:var(--bg-muted)] p-5 text-center text-xs text-[color:var(--text-muted)]">
+          <div
+            class="rounded-lg bg-[color:var(--bg-muted)] p-5 text-center text-xs text-[color:var(--text-muted)]"
+          >
             More data is needed before recommending an optimization.
           </div>
         {/each}
@@ -298,9 +302,15 @@
         </p>
       </div>
       <div class="flex items-center gap-4 text-[11px] text-[color:var(--text-muted)]">
-        <span class="flex items-center gap-1.5"><span class="size-2 rounded-sm bg-blue-200"></span>Received</span>
-        <span class="flex items-center gap-1.5"><span class="size-2 rounded-sm bg-violet-400"></span>MQL</span>
-        <span class="flex items-center gap-1.5"><span class="size-2 rounded-sm bg-emerald-500"></span>SQL</span>
+        <span class="flex items-center gap-1.5"
+          ><span class="size-2 rounded-sm bg-blue-200"></span>Received</span
+        >
+        <span class="flex items-center gap-1.5"
+          ><span class="size-2 rounded-sm bg-violet-400"></span>MQL</span
+        >
+        <span class="flex items-center gap-1.5"
+          ><span class="size-2 rounded-sm bg-emerald-500"></span>SQL</span
+        >
       </div>
     </div>
 
@@ -336,7 +346,9 @@
   <section
     class="overflow-hidden rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)]"
   >
-    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[color:var(--border-faint)] p-5">
+    <div
+      class="flex flex-wrap items-center justify-between gap-3 border-b border-[color:var(--border-faint)] p-5"
+    >
       <div>
         <h2 class="text-sm font-semibold text-[color:var(--text)]">Source quality</h2>
         <p class="mt-1 text-xs text-[color:var(--text-muted)]">
@@ -364,12 +376,14 @@
                 <td class="px-5 py-3 font-medium text-[color:var(--text)]">{source.label}</td>
                 <td class="px-4 py-3 text-right tabular-nums">{formatNumber(source.received)}</td>
                 <td class="px-4 py-3 text-right tabular-nums">{formatNumber(source.mql)}</td>
-                <td class="px-4 py-3 text-right font-medium tabular-nums text-violet-600">
+                <td class="px-4 py-3 text-right font-medium text-violet-600 tabular-nums">
                   {formatPercent(source.mql_rate)}
                 </td>
-                <td class="px-4 py-3 text-right tabular-nums">{formatNumber(source.sales_handoff)}</td>
+                <td class="px-4 py-3 text-right tabular-nums"
+                  >{formatNumber(source.sales_handoff)}</td
+                >
                 <td class="px-4 py-3 text-right tabular-nums">{formatNumber(source.sql)}</td>
-                <td class="px-5 py-3 text-right font-medium tabular-nums text-emerald-600">
+                <td class="px-5 py-3 text-right font-medium text-emerald-600 tabular-nums">
                   {formatPercent(source.sql_rate)}
                 </td>
               </tr>
@@ -411,7 +425,9 @@
         {#each engagement.variants || [] as variant (variant.variant)}
           <div class="rounded-lg border border-[color:var(--border-faint)] p-4">
             <div class="flex items-center justify-between">
-              <span class="flex size-8 items-center justify-center rounded-full bg-violet-100 text-sm font-semibold text-violet-700">
+              <span
+                class="flex size-8 items-center justify-center rounded-full bg-violet-100 text-sm font-semibold text-violet-700"
+              >
                 {variant.variant}
               </span>
               <span class="text-[11px] text-[color:var(--text-muted)]">
@@ -420,16 +436,26 @@
             </div>
             <dl class="mt-4 grid grid-cols-3 gap-3 text-center">
               <div>
-                <dt class="text-[10px] uppercase tracking-wide text-[color:var(--text-subtle)]">Open</dt>
-                <dd class="mt-1 text-sm font-semibold tabular-nums">{formatPercent(variant.open_rate)}</dd>
+                <dt class="text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase">
+                  Open
+                </dt>
+                <dd class="mt-1 text-sm font-semibold tabular-nums">
+                  {formatPercent(variant.open_rate)}
+                </dd>
               </div>
               <div>
-                <dt class="text-[10px] uppercase tracking-wide text-[color:var(--text-subtle)]">Reply</dt>
-                <dd class="mt-1 text-sm font-semibold tabular-nums">{formatPercent(variant.reply_rate)}</dd>
+                <dt class="text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase">
+                  Reply
+                </dt>
+                <dd class="mt-1 text-sm font-semibold tabular-nums">
+                  {formatPercent(variant.reply_rate)}
+                </dd>
               </div>
               <div>
-                <dt class="text-[10px] uppercase tracking-wide text-[color:var(--text-subtle)]">Positive</dt>
-                <dd class="mt-1 text-sm font-semibold tabular-nums text-emerald-600">
+                <dt class="text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase">
+                  Positive
+                </dt>
+                <dd class="mt-1 text-sm font-semibold text-emerald-600 tabular-nums">
                   {formatPercent(variant.positive_reply_rate)}
                 </dd>
               </div>
@@ -454,11 +480,21 @@
           <p class="text-3xl font-semibold tabular-nums">
             {formatPercent(responseSla.within_sla_rate)}
           </p>
-          <p class="mt-1 text-xs text-[color:var(--text-muted)]">within {formatSeconds(responseSla.sla_seconds)}</p>
+          <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+            within {formatSeconds(responseSla.sla_seconds)}
+          </p>
         </div>
         <div class="text-right text-xs text-[color:var(--text-muted)]">
-          <p><span class="font-semibold text-[color:var(--text)]">{formatSeconds(responseSla.median_seconds)}</span> median</p>
-          <p class="mt-1"><span class="font-semibold text-[color:var(--text)]">{formatNumber(responseSla.sample_size)}</span> responses</p>
+          <p>
+            <span class="font-semibold text-[color:var(--text)]"
+              >{formatSeconds(responseSla.median_seconds)}</span
+            > median
+          </p>
+          <p class="mt-1">
+            <span class="font-semibold text-[color:var(--text)]"
+              >{formatNumber(responseSla.sample_size)}</span
+            > responses
+          </p>
         </div>
       </div>
       <div class="mt-5 h-2 overflow-hidden rounded-full bg-[color:var(--bg-muted)]">
@@ -479,10 +515,151 @@
     </section>
   </div>
 
-  <section class="rounded-lg bg-[color:var(--bg-muted)] p-4 text-[11px] leading-5 text-[color:var(--text-muted)]">
+  <section
+    class="overflow-hidden rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)]"
+  >
+    <div
+      class="flex flex-wrap items-start justify-between gap-3 border-b border-[color:var(--border-faint)] p-5"
+    >
+      <div>
+        <h2 class="text-sm font-semibold text-[color:var(--text)]">Sales feedback calibration</h2>
+        <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+          Sales acceptance, lead quality, and rejection reasons by the AI prediction captured at
+          handoff
+        </p>
+      </div>
+      <span
+        class={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+          feedbackSummary.calibration_ready
+            ? 'bg-emerald-50 text-emerald-700'
+            : 'bg-amber-50 text-amber-700'
+        }`}
+      >
+        {feedbackSummary.calibration_ready
+          ? 'AI calibration active'
+          : `${formatNumber(feedbackSummary.total)} / ${formatNumber(feedbackSummary.minimum_calibration_samples || 10)} samples`}
+      </span>
+    </div>
+
+    <div
+      class="grid gap-3 border-b border-[color:var(--border-faint)] p-5 sm:grid-cols-2 xl:grid-cols-6"
+    >
+      {#each [['Reviews', formatNumber(feedbackSummary.total)], ['Coverage', formatPercent(feedbackSummary.coverage_rate)], ['Accepted', formatNumber(feedbackSummary.accepted)], ['Acceptance', formatPercent(feedbackSummary.acceptance_rate)], ['Avg quality', feedbackSummary.average_quality == null ? '-' : `${Number(feedbackSummary.average_quality).toFixed(1)} / 5`], ['SDR satisfaction', feedbackSummary.average_satisfaction == null ? '-' : `${Number(feedbackSummary.average_satisfaction).toFixed(1)} / 5`]] as metric (metric[0])}
+        <div class="rounded-lg bg-[color:var(--bg-muted)] p-3">
+          <p class="text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase">
+            {metric[0]}
+          </p>
+          <p class="mt-2 text-lg font-semibold text-[color:var(--text)] tabular-nums">
+            {metric[1]}
+          </p>
+        </div>
+      {/each}
+    </div>
+
+    <div class="grid xl:grid-cols-2">
+      <div class="border-b border-[color:var(--border-faint)] p-5 xl:border-r xl:border-b-0">
+        <h3 class="text-xs font-semibold text-[color:var(--text)]">
+          Calibration by predicted band
+        </h3>
+        {#if salesFeedback.by_qualification_band?.length}
+          <div class="mt-4 overflow-x-auto">
+            <table class="w-full min-w-[480px] text-left text-xs">
+              <thead class="text-[color:var(--text-muted)]">
+                <tr>
+                  <th class="pb-2 font-medium">AI band</th>
+                  <th class="pb-2 text-right font-medium">Samples</th>
+                  <th class="pb-2 text-right font-medium">Accepted</th>
+                  <th class="pb-2 text-right font-medium">Acceptance</th>
+                  <th class="pb-2 text-right font-medium">Quality</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-[color:var(--border-faint)]">
+                {#each salesFeedback.by_qualification_band as row (row.band)}
+                  <tr>
+                    <td class="py-2.5 font-medium">{row.label}</td>
+                    <td class="py-2.5 text-right tabular-nums">{formatNumber(row.sample_size)}</td>
+                    <td class="py-2.5 text-right tabular-nums">{formatNumber(row.accepted)}</td>
+                    <td class="py-2.5 text-right font-medium text-emerald-600 tabular-nums"
+                      >{formatPercent(row.acceptance_rate)}</td
+                    >
+                    <td class="py-2.5 text-right tabular-nums"
+                      >{row.average_quality == null
+                        ? '-'
+                        : Number(row.average_quality).toFixed(1)}</td
+                    >
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else}
+          <p
+            class="mt-4 rounded-lg bg-[color:var(--bg-muted)] p-5 text-center text-xs text-[color:var(--text-muted)]"
+          >
+            No sales reviews were submitted in this period.
+          </p>
+        {/if}
+      </div>
+
+      <div class="p-5">
+        <h3 class="text-xs font-semibold text-[color:var(--text)]">
+          Top rejection and recycle reasons
+        </h3>
+        {#if salesFeedback.rejection_reasons?.length}
+          <div class="mt-4 space-y-3">
+            {#each salesFeedback.rejection_reasons as reason (reason.reason)}
+              <div>
+                <div class="flex items-center justify-between gap-3 text-xs">
+                  <span class="text-[color:var(--text)]">{reason.label}</span>
+                  <span class="text-[color:var(--text-muted)] tabular-nums">
+                    {formatNumber(reason.count)} · {formatPercent(reason.rate)}
+                  </span>
+                </div>
+                <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-[color:var(--bg-muted)]">
+                  <div
+                    class="h-full rounded-full bg-amber-500"
+                    style={`width: ${Math.min(100, Number(reason.rate || 0))}%`}
+                  ></div>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p
+            class="mt-4 rounded-lg bg-[color:var(--bg-muted)] p-5 text-center text-xs text-[color:var(--text-muted)]"
+          >
+            No rejection reasons are available yet.
+          </p>
+        {/if}
+      </div>
+    </div>
+
+    {#if salesFeedback.by_model?.length}
+      <div class="border-t border-[color:var(--border-faint)] p-5">
+        <h3 class="text-xs font-semibold text-[color:var(--text)]">Model versions</h3>
+        <div class="mt-3 flex flex-wrap gap-2">
+          {#each salesFeedback.by_model as model (model.provider + model.model + model.prompt_version)}
+            <div class="rounded-lg border border-[color:var(--border-faint)] px-3 py-2 text-[11px]">
+              <span class="font-medium text-[color:var(--text)]"
+                >{model.provider} · {model.model}</span
+              >
+              <span class="ml-2 text-[color:var(--text-muted)]">
+                {formatNumber(model.sample_size)} reviews · {formatPercent(model.acceptance_rate)} accepted
+              </span>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+  </section>
+
+  <section
+    class="rounded-lg bg-[color:var(--bg-muted)] p-4 text-[11px] leading-5 text-[color:var(--text-muted)]"
+  >
     <p class="font-semibold text-[color:var(--text)]">Metric definitions</p>
     <p class="mt-1"><strong>MQL:</strong> {analytics.definitions?.mql}</p>
     <p><strong>Sales handoff:</strong> {analytics.definitions?.sales_handoff}</p>
     <p><strong>SQL:</strong> {analytics.definitions?.sql}</p>
+    <p><strong>Sales feedback:</strong> {analytics.definitions?.sales_feedback}</p>
   </section>
 </div>

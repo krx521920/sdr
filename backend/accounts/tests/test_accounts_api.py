@@ -4,7 +4,7 @@ import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from rest_framework.exceptions import PermissionDenied
+from rest_framework import status
 
 from accounts.models import Account, AccountEmail, AccountEmailLog
 from common.models import Attachments, Comment, Org, Profile, Tags, Teams
@@ -46,10 +46,10 @@ class TestAccountListView:
         assert data["error"] is True
 
     def test_create_account_unauthenticated(self, unauthenticated_client):
-        with pytest.raises(PermissionDenied):
-            unauthenticated_client.post(
-                "/api/accounts/", {"name": "Test"}
-            )
+        response = unauthenticated_client.post(
+            "/api/accounts/", {"name": "Test"}
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
     def test_create_account_with_all_fields(self, admin_client, org_a, admin_profile):
         """Test creating an account with all optional fields populated."""

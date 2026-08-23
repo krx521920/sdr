@@ -12,6 +12,7 @@
 import { env } from '$env/dynamic/private';
 import { env as publicEnv } from '$env/dynamic/public';
 import axios from 'axios';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
 /** @type {import('./$types').PageServerLoad} */
 export async function load({ cookies }) {
@@ -89,7 +90,7 @@ export const actions = {
         }
       };
     } catch (err) {
-      console.error('Error creating organization:', err);
+      logSafeServerError('Organization creation request failed', err);
 
       // Check if it's a duplicate name error
       if (err.response?.status === 400) {

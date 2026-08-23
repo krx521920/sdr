@@ -92,4 +92,12 @@ app.conf.beat_schedule = {
         "task": "sdr.reconcile_outbound_campaigns",
         "schedule": crontab(minute="*/15"),
     },
+    "reconcile-sdr-outbound-sources": {
+        "task": "sdr.reconcile_outbound_sources",
+        "schedule": crontab(minute="*/15"),
+    },
+    "scan-sdr-compliance-retention": {
+        "task": "sdr.scan_compliance_retention",
+        "schedule": crontab(hour=2, minute=15),
+    },
 }

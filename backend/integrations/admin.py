@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from integrations.models import (
+    ApolloConnection,
     FacebookConversionEvent,
     FacebookConversionSettings,
     FacebookMessengerMessage,
@@ -8,7 +9,166 @@ from integrations.models import (
     FacebookOAuthSession,
     FacebookPageConnection,
     FacebookPageRoute,
+    FeishuBaseConnection,
+    FeishuBaseSync,
+    LinkedInConnection,
+    LinkedInInvitation,
+    WhatsAppBusinessConnection,
+    WhatsAppMessage,
+    WhatsAppPhoneRoute,
 )
+
+
+@admin.register(FeishuBaseConnection)
+class FeishuBaseConnectionAdmin(admin.ModelAdmin):
+    list_display = (
+        "org",
+        "app_id",
+        "table_id",
+        "is_active",
+        "last_validated_at",
+        "last_sync_at",
+    )
+    list_filter = ("is_active",)
+    search_fields = ("org__name", "app_id", "app_token", "table_id")
+    list_select_related = ("org",)
+    readonly_fields = (
+        "id",
+        "app_secret_ciphertext",
+        "app_secret_hint",
+        "last_validated_at",
+        "last_sync_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(FeishuBaseSync)
+class FeishuBaseSyncAdmin(admin.ModelAdmin):
+    list_display = (
+        "intake",
+        "org",
+        "status",
+        "attempt_count",
+        "record_id",
+        "synced_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("record_id", "intake__source_record_id", "org__name")
+    list_select_related = ("org", "connection", "intake")
+    readonly_fields = (
+        "id",
+        "org",
+        "connection",
+        "intake",
+        "status",
+        "record_id",
+        "destination_sha256",
+        "payload_sha256",
+        "attempt_count",
+        "synced_field_names",
+        "error_code",
+        "error_message",
+        "last_attempted_at",
+        "synced_at",
+        "failed_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(LinkedInConnection)
+class LinkedInConnectionAdmin(admin.ModelAdmin):
+    list_display = (
+        "org",
+        "is_active",
+        "partner_access_confirmed",
+        "access_token_hint",
+        "last_invitation_sent_at",
+    )
+    list_filter = ("is_active", "partner_access_confirmed")
+    search_fields = ("org__name", "access_token_hint")
+    list_select_related = ("org",)
+    readonly_fields = (
+        "id",
+        "access_token_ciphertext",
+        "access_token_hint",
+        "last_invitation_sent_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(LinkedInInvitation)
+class LinkedInInvitationAdmin(admin.ModelAdmin):
+    list_display = (
+        "recipient",
+        "campaign",
+        "campaign_run",
+        "status",
+        "attempt_count",
+        "sent_at",
+    )
+    list_filter = ("status",)
+    search_fields = (
+        "recipient",
+        "provider_invitation_id",
+        "campaign__name",
+        "prospect__company_name",
+        "org__name",
+    )
+    list_select_related = ("org", "connection", "campaign", "prospect")
+    readonly_fields = (
+        "id",
+        "org",
+        "connection",
+        "campaign",
+        "prospect",
+        "campaign_run",
+        "recipient",
+        "message_body",
+        "status",
+        "attempt_count",
+        "provider_invitation_id",
+        "error_code",
+        "error_message",
+        "sent_at",
+        "failed_at",
+        "provider_status_snapshot",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(ApolloConnection)
+class ApolloConnectionAdmin(admin.ModelAdmin):
+    list_display = ("org", "is_active", "api_key_hint", "last_sync_at")
+    list_filter = ("is_active",)
+    search_fields = ("org__name", "api_key_hint")
+    list_select_related = ("org",)
+    readonly_fields = (
+        "id",
+        "api_key_ciphertext",
+        "api_key_hint",
+        "last_sync_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(FacebookPageRoute)
@@ -215,6 +375,90 @@ class FacebookMessengerReplyAdmin(admin.ModelAdmin):
         "error_code",
         "error_message",
         "sent_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(WhatsAppPhoneRoute)
+class WhatsAppPhoneRouteAdmin(admin.ModelAdmin):
+    list_display = ("phone_number_id", "org", "created_at")
+    search_fields = ("phone_number_id", "org__name")
+    list_select_related = ("org",)
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(WhatsAppBusinessConnection)
+class WhatsAppBusinessConnectionAdmin(admin.ModelAdmin):
+    list_display = (
+        "display_phone_number",
+        "phone_number_id",
+        "org",
+        "is_active",
+        "last_message_sent_at",
+        "last_webhook_at",
+    )
+    list_filter = ("is_active",)
+    search_fields = ("display_phone_number", "route__phone_number_id", "org__name")
+    list_select_related = ("route", "org")
+    readonly_fields = (
+        "id",
+        "access_token_ciphertext",
+        "access_token_hint",
+        "last_message_sent_at",
+        "last_webhook_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(WhatsAppMessage)
+class WhatsAppMessageAdmin(admin.ModelAdmin):
+    list_display = (
+        "recipient",
+        "campaign",
+        "campaign_run",
+        "status",
+        "attempt_count",
+        "sent_at",
+        "delivered_at",
+        "read_at",
+    )
+    list_filter = ("status", "template_language")
+    search_fields = (
+        "recipient",
+        "provider_message_id",
+        "campaign__name",
+        "prospect__company_name",
+        "org__name",
+    )
+    list_select_related = ("org", "connection", "campaign", "prospect")
+    readonly_fields = (
+        "id",
+        "org",
+        "connection",
+        "campaign",
+        "prospect",
+        "campaign_run",
+        "recipient",
+        "template_name",
+        "template_language",
+        "status",
+        "attempt_count",
+        "provider_message_id",
+        "error_code",
+        "error_message",
+        "sent_at",
+        "delivered_at",
+        "read_at",
+        "failed_at",
+        "provider_status_snapshot",
         "created_at",
         "updated_at",
     )

@@ -13,6 +13,11 @@ env/
 .venv/
 *.egg-info
 .pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/
+.mypy_cache/
+**/.mypy_cache/
 .coverage
 htmlcov/
 

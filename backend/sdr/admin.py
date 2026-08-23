@@ -8,6 +8,11 @@ from sdr.models import (
     LeadNurtureDelivery,
     LeadNurtureEnrollment,
     LeadNurtureInteraction,
+    SDRChannelComplianceRule,
+    SDRComplianceEvent,
+    SDRComplianceSettings,
+    SDRDataProvenance,
+    SDRDoNotContactEntry,
     SDREmailProviderEvent,
     SDREmailSuppression,
     SDRIntelligenceSettings,
@@ -15,11 +20,100 @@ from sdr.models import (
     SDRNurtureSequence,
     SDRNurtureStep,
     SDROutboundCampaign,
+    SDROutboundCopyDraft,
     SDROutboundProspect,
     SDRResponseSettings,
     SDRRoutingRule,
     SDRRoutingRuleMember,
+    SDRSalesFeedback,
 )
+
+
+@admin.register(SDRComplianceSettings)
+class SDRComplianceSettingsAdmin(admin.ModelAdmin):
+    list_display = (
+        "org",
+        "enforcement_enabled",
+        "require_lawful_basis",
+        "retention_mode",
+        "retention_days",
+        "last_retention_scan_at",
+    )
+
+
+@admin.register(SDRChannelComplianceRule)
+class SDRChannelComplianceRuleAdmin(admin.ModelAdmin):
+    list_display = (
+        "org",
+        "country_code",
+        "channel",
+        "is_allowed",
+        "requires_consent",
+    )
+    list_filter = ("channel", "is_allowed", "requires_consent")
+
+
+@admin.register(SDRDoNotContactEntry)
+class SDRDoNotContactEntryAdmin(admin.ModelAdmin):
+    list_display = (
+        "identifier",
+        "channel",
+        "org",
+        "reason",
+        "source",
+        "is_active",
+        "blocked_at",
+    )
+    list_filter = ("channel", "reason", "source", "is_active")
+    search_fields = ("identifier", "identifier_hash")
+
+
+@admin.register(SDRDataProvenance)
+class SDRDataProvenanceAdmin(admin.ModelAdmin):
+    list_display = (
+        "intake",
+        "org",
+        "collection_method",
+        "lawful_basis",
+        "country_code",
+        "status",
+        "retention_until",
+    )
+    list_filter = ("collection_method", "lawful_basis", "status")
+    search_fields = ("intake__source_record_id", "source_url")
+
+
+@admin.register(SDRComplianceEvent)
+class SDRComplianceEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "event_type",
+        "channel",
+        "allowed",
+        "org",
+        "intake",
+        "prospect",
+        "occurred_at",
+    )
+    list_filter = ("event_type", "channel", "allowed")
+    search_fields = ("event_key", "reason")
+    readonly_fields = (
+        "org",
+        "intake",
+        "prospect",
+        "event_type",
+        "channel",
+        "allowed",
+        "reason",
+        "event_key",
+        "snapshot",
+        "occurred_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 class SDROutboundProspectInline(admin.TabularInline):
@@ -45,6 +139,55 @@ class SDROutboundCampaignAdmin(admin.ModelAdmin):
     list_filter = ("status",)
     search_fields = ("name", "description", "icp_description", "org__name")
     inlines = (SDROutboundProspectInline,)
+
+
+@admin.register(SDROutboundCopyDraft)
+class SDROutboundCopyDraftAdmin(admin.ModelAdmin):
+    list_display = (
+        "campaign",
+        "org",
+        "status",
+        "provider",
+        "model",
+        "reviewed_by",
+        "generated_at",
+        "applied_at",
+        "created_at",
+    )
+    list_filter = ("status", "provider", "language")
+    search_fields = ("campaign__name", "org__name", "offering_summary")
+    readonly_fields = (
+        "org",
+        "campaign",
+        "status",
+        "language",
+        "tone",
+        "offering_summary",
+        "value_proposition",
+        "proof_points",
+        "cta_goal",
+        "step_count",
+        "generated_steps",
+        "provider",
+        "model",
+        "prompt_version",
+        "provider_response_id",
+        "provider_attempts",
+        "input_tokens",
+        "output_tokens",
+        "last_job_id",
+        "reviewed_by",
+        "generated_at",
+        "reviewed_at",
+        "applied_at",
+        "error_code",
+        "error_message",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(SDROutboundProspect)
@@ -93,6 +236,33 @@ class LeadLifecycleEventAdmin(admin.ModelAdmin):
     list_filter = ("event_type",)
     search_fields = ("intake__source_record_id", "event_key")
     readonly_fields = ("data",)
+
+
+@admin.register(SDRSalesFeedback)
+class SDRSalesFeedbackAdmin(admin.ModelAdmin):
+    list_display = (
+        "intake",
+        "org",
+        "decision",
+        "quality_score",
+        "satisfaction_score",
+        "feedback_by",
+        "submitted_at",
+    )
+    list_filter = ("decision", "reason", "qualification_band_snapshot")
+    search_fields = (
+        "intake__source_record_id",
+        "intake__crm_lead__email",
+        "model_snapshot",
+    )
+    readonly_fields = (
+        "qualification_score_snapshot",
+        "qualification_band_snapshot",
+        "provider_snapshot",
+        "model_snapshot",
+        "prompt_version_snapshot",
+        "submitted_at",
+    )
 
 
 @admin.register(LeadDelivery)

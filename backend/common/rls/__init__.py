@@ -77,6 +77,14 @@ ORG_SCOPED_TABLES = [
     "sdr_email_provider_event",
     "sdr_outbound_campaign",
     "sdr_outbound_prospect",
+    "sdr_outbound_source",
+    "sdr_outbound_copy_draft",
+    "sdr_sales_feedback",
+    "sdr_compliance_settings",
+    "sdr_channel_compliance_rule",
+    "sdr_compliance_event",
+    "sdr_data_provenance",
+    "sdr_do_not_contact",
     # Tenant-owned external credentials. The companion Page route is
     # intentionally a non-RLS bootstrap table and contains no token or lead PII.
     "integration_facebook_page_connection",
@@ -85,6 +93,13 @@ ORG_SCOPED_TABLES = [
     "integration_facebook_conversion_event",
     "integration_facebook_messenger_message",
     "integration_facebook_messenger_reply",
+    "integration_whatsapp_connection",
+    "integration_whatsapp_message",
+    "integration_apollo_connection",
+    "integration_linkedin_connection",
+    "integration_linkedin_invitation",
+    "integration_feishu_base_connection",
+    "integration_feishu_base_sync",
     # Durable tenant workflow state and attempt audit history.
     "automation_job",
     "automation_job_attempt",
