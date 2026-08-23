@@ -6,7 +6,6 @@ Run with: pytest common/tests/test_settings.py -v
 
 import pytest
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
 
 from common.models import APISettings
 
@@ -45,9 +44,9 @@ class TestDomainListView:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
     def test_unauthenticated(self, unauthenticated_client):
-        """Unauthenticated user gets PermissionDenied."""
-        with pytest.raises(PermissionDenied):
-            unauthenticated_client.get(self.url)
+        """Requests without an organization context fail closed."""
+        response = unauthenticated_client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 @pytest.mark.django_db

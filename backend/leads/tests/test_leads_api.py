@@ -4,7 +4,7 @@ import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
-from rest_framework.exceptions import PermissionDenied
+from rest_framework import status
 
 from common.models import Attachments, Comment, Profile, Tags, Teams
 from contacts.models import Contact
@@ -76,11 +76,11 @@ class TestLeadListView:
         assert data["error"] is True
 
     def test_create_lead_unauthenticated(self, unauthenticated_client):
-        with pytest.raises(PermissionDenied):
-            unauthenticated_client.post(
-                "/api/leads/",
-                {"first_name": "Test", "last_name": "Lead", "email": "t@t.com"},
-            )
+        response = unauthenticated_client.post(
+            "/api/leads/",
+            {"first_name": "Test", "last_name": "Lead", "email": "t@t.com"},
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
     def test_org_isolation(self, org_b_client, admin_user, org_a):
         Lead.objects.create(

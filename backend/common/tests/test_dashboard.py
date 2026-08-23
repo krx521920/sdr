@@ -8,7 +8,6 @@ import uuid
 
 import pytest
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
 
 from accounts.models import Account
 from common.models import Activity
@@ -34,9 +33,9 @@ class TestDashboardView:
         assert "opportunities_count" in data
 
     def test_dashboard_unauthenticated(self, unauthenticated_client):
-        """Unauthenticated user gets PermissionDenied."""
-        with pytest.raises(PermissionDenied):
-            unauthenticated_client.get(self.url)
+        """Requests without an organization context fail closed."""
+        response = unauthenticated_client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
     def test_dashboard_counts(self, admin_client, org_a, admin_user):
         """Dashboard should return accurate counts."""

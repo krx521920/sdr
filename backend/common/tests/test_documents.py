@@ -7,7 +7,6 @@ Run with: pytest common/tests/test_documents.py -v
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
 
 from common.models import Document, Profile, Teams
 
@@ -36,8 +35,8 @@ class TestDocumentListView:
         assert response.data["error"] is False
 
     def test_unauthenticated(self, unauthenticated_client):
-        with pytest.raises(PermissionDenied):
-            unauthenticated_client.get(self.url)
+        response = unauthenticated_client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
     def test_list_documents_context_keys(self, admin_client, org_a):
         """Document list should include all expected context keys."""

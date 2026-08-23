@@ -10,6 +10,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.models import Account
+from accounts.serializer import AccountSerializer
 from common.custom_fields import validate_payload as validate_custom_fields_payload
 from common.models import Attachments, Comment, CustomFieldDefinition, Profile, Tags, Teams
 from common.permissions import HasOrgContext
@@ -20,8 +22,9 @@ from common.serializer import (
     ProfileSerializer,
     TeamsSerializer,
 )
-from contacts.models import Contact
 from cases.models import Case
+from contacts.models import Contact
+from contacts.serializer import ContactSerializer
 from leads.models import Lead
 from opportunity.models import Opportunity
 from tasks import swagger_params
@@ -34,6 +37,7 @@ from tasks.serializer import (
     TaskListSerializer,
     TaskSerializer,
 )
+from tasks.utils import PRIORITY_CHOICES, STATUS_CHOICES
 
 
 class TaskListView(APIView, LimitOffsetPagination):
@@ -48,11 +52,21 @@ class TaskListView(APIView, LimitOffsetPagination):
             .prefetch_related("assigned_to__user", "tags")
             .order_by("-id")
         )
+        accounts = Account.objects.filter(org=self.request.profile.org)
+        contacts = Contact.objects.filter(org=self.request.profile.org)
         if self.request.profile.role != "ADMIN" and not self.request.profile.is_admin:
             queryset = queryset.filter(
                 Q(assigned_to__in=[self.request.profile])
                 | Q(created_by=self.request.profile.user)
             )
+            accounts = accounts.filter(
+                Q(created_by=self.request.profile.user)
+                | Q(assigned_to=self.request.profile)
+            ).distinct()
+            contacts = contacts.filter(
+                Q(created_by=self.request.profile.user)
+                | Q(assigned_to=self.request.profile)
+            ).distinct()
 
         if params:
             if params.get("title"):
@@ -117,6 +131,10 @@ class TaskListView(APIView, LimitOffsetPagination):
                 "tasks_count": self.count,
                 "offset": offset,
                 "tasks": tasks,
+                "status": STATUS_CHOICES,
+                "priority": PRIORITY_CHOICES,
+                "accounts_list": AccountSerializer(accounts, many=True).data,
+                "contacts_list": ContactSerializer(contacts, many=True).data,
             }
         )
         return context
@@ -132,6 +150,10 @@ class TaskListView(APIView, LimitOffsetPagination):
                     "tasks_count": serializers.IntegerField(),
                     "offset": serializers.IntegerField(allow_null=True),
                     "tasks": TaskListSerializer(many=True),
+                    "status": serializers.ListField(),
+                    "priority": serializers.ListField(),
+                    "accounts_list": AccountSerializer(many=True),
+                    "contacts_list": ContactSerializer(many=True),
                 },
             )
         },

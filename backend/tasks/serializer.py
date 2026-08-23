@@ -249,6 +249,14 @@ class TaskCreateSerializer(serializers.ModelSerializer):
 
         self.fields["title"].required = True
 
+    def validate_title(self, title):
+        queryset = Task.objects.filter(title__iexact=title, org=self.org)
+        if self.instance:
+            queryset = queryset.exclude(id=self.instance.id)
+        if queryset.exists():
+            raise serializers.ValidationError("Task already exists with this title")
+        return title
+
     def validate(self, attrs):
         """Validate that task has at most one parent entity."""
         attrs = super().validate(attrs)
