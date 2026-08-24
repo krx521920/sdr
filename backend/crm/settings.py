@@ -2,6 +2,8 @@ import os
 from datetime import timedelta
 
 from corsheaders.defaults import default_headers
+from cryptography.fernet import Fernet
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
@@ -592,7 +594,19 @@ SDR_FEISHU_TIMEOUT_SECONDS = max(
     1, min(15, int(os.environ.get("SDR_FEISHU_TIMEOUT_SECONDS", "5")))
 )
 
-# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-# When omitted, dev falls back to a key derived from SECRET_KEY. Production
-# should always use a dedicated value so Django key rotation is independent.
-INTEGRATION_ENCRYPTION_KEY = os.environ.get("INTEGRATION_ENCRYPTION_KEY", "")
+# Generate once with a trusted Fernet key generator and store the result in the
+# deployment secret manager. Local development may omit this and derive a key
+# from SECRET_KEY; production must use an independent, stable key so Django key
+# rotation cannot make stored integration credentials unreadable.
+INTEGRATION_ENCRYPTION_KEY = os.environ.get("INTEGRATION_ENCRYPTION_KEY", "").strip()
+if IS_PRODUCTION and not INTEGRATION_ENCRYPTION_KEY:
+    raise ImproperlyConfigured(
+        "INTEGRATION_ENCRYPTION_KEY is required in production"
+    )
+if INTEGRATION_ENCRYPTION_KEY:
+    try:
+        Fernet(INTEGRATION_ENCRYPTION_KEY.encode("ascii"))
+    except (TypeError, UnicodeError, ValueError):
+        raise ImproperlyConfigured(
+            "INTEGRATION_ENCRYPTION_KEY must be a valid Fernet key"
+        ) from None

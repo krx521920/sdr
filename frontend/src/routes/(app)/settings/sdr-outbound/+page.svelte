@@ -70,8 +70,12 @@
   let whatsappDisplayNumber = $state('');
   let whatsappActive = $state(false);
   let apolloActive = $state(false);
+  let whatsappConfigTest = $state(null);
+  let linkedinConfigTest = $state(null);
+  let apolloConfigTest = $state(null);
   let csvText = $state('');
-  const prospectCsvPlaceholder = 'company_name,email,phone,first_name,last_name,job_title,linkedin_url,website,industry,country,recipient_timezone,source_url,notes,lawful_basis,lawful_basis_notes,consent_at,consent_evidence,allowed_channels\nAcme Robotics,ada@acme.example,+15551234567,Ada,Lovelace,CTO,https://linkedin.com/in/ada,https://acme.example,Robotics,US,America/New_York,https://source.example,Research note,legitimate_interest,Review LI-42,,,email|linkedin';
+  const prospectCsvPlaceholder =
+    'company_name,email,phone,first_name,last_name,job_title,linkedin_url,website,industry,country,recipient_timezone,source_url,notes,lawful_basis,lawful_basis_notes,consent_at,consent_evidence,allowed_channels\nAcme Robotics,ada@acme.example,+15551234567,Ada,Lovelace,CTO,https://linkedin.com/in/ada,https://acme.example,Robotics,US,America/New_York,https://source.example,Research note,legitimate_interest,Review LI-42,,,email|linkedin';
 
   $effect(() => {
     const campaign = selected;
@@ -117,9 +121,30 @@
       toast.success('Outbound campaign saved.');
       creating = false;
     }
-    if (form?.whatsappSaved) toast.success('WhatsApp Business connection saved.');
-    if (form?.linkedinSaved) toast.success('LinkedIn partner connection saved.');
-    if (form?.apolloSaved) toast.success('Apollo connection saved.');
+    if (form?.whatsappSaved) {
+      whatsappConfigTest = null;
+      toast.success('WhatsApp Business connection saved.');
+    }
+    if (form?.linkedinSaved) {
+      linkedinConfigTest = null;
+      toast.success('LinkedIn partner connection saved.');
+    }
+    if (form?.apolloSaved) {
+      apolloConfigTest = null;
+      toast.success('Apollo connection saved.');
+    }
+    if (form?.whatsappConfigTest) {
+      whatsappConfigTest = form.whatsappConfigTest;
+      if (form.whatsappConfigTest.ok) toast.success('WhatsApp local configuration is ready.');
+    }
+    if (form?.linkedinConfigTest) {
+      linkedinConfigTest = form.linkedinConfigTest;
+      if (form.linkedinConfigTest.ok) toast.success('LinkedIn local configuration is ready.');
+    }
+    if (form?.apolloConfigTest) {
+      apolloConfigTest = form.apolloConfigTest;
+      if (form.apolloConfigTest.ok) toast.success('Apollo local configuration is ready.');
+    }
     if (form?.apolloSourceSaved) toast.success('Apollo prospect source saved.');
     if (form?.apolloSourceQueued) toast.success('Apollo source sync queued.');
     if (form?.outboundCopyQueued) toast.success('AI copy generation queued for review.');
@@ -190,6 +215,22 @@
   /** @param {number | string | null | undefined} value */
   function formatPercent(value) {
     return `${Number(value || 0).toFixed(1)}%`;
+  }
+
+  /** @param {{ code?: string } | null} result */
+  function localConnectionTestMessage(result) {
+    /** @type {Record<string, string>} */
+    const messages = {
+      connection_ready: 'Saved configuration is locally complete.',
+      connection_missing: 'Save this connection before checking it.',
+      connection_inactive: 'Enable and save this connection before checking it.',
+      required_identifier_missing: 'A required saved provider identifier is missing.',
+      credential_missing: 'No saved credential is available.',
+      credential_decryption_failed: 'The saved credential cannot be read. Save it again.',
+      partner_access_not_confirmed: 'Confirm and save approved LinkedIn partner access first.',
+      permission_denied: 'Organization administrator access is required.'
+    };
+    return messages[result?.code] || 'The saved configuration could not be checked.';
   }
 
   /** @param {any} prospect */
@@ -345,6 +386,37 @@
         <Button size="sm" variant="outline" type="submit">Save WhatsApp connection</Button>
       </div>
     </form>
+    <div
+      class="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-3"
+    >
+      <div>
+        <p class="text-xs font-medium">Local configuration check</p>
+        <p class="mt-0.5 text-[11px] text-[color:var(--text-muted)]">
+          Checks saved values only. No external provider request is made and nothing is sent.
+        </p>
+      </div>
+      <form method="POST" action="?/testWhatsAppConnection" use:enhance>
+        <Button size="sm" variant="outline" type="submit">
+          <ShieldCheck class="size-3.5" />
+          Check local configuration
+        </Button>
+      </form>
+    </div>
+    {#if whatsappConfigTest}
+      <div
+        aria-live="polite"
+        class={`mt-3 flex gap-2 rounded-md px-3 py-2 text-xs ${whatsappConfigTest.ok ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}
+      >
+        {#if whatsappConfigTest.ok}
+          <CheckCircle2 class="mt-0.5 size-3.5 shrink-0" />
+        {:else}
+          <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+        {/if}
+        <span
+          >{localConnectionTestMessage(whatsappConfigTest)} No external provider call or message was sent.</span
+        >
+      </div>
+    {/if}
   </section>
 
   <section
@@ -432,6 +504,37 @@
       </div>
       <Button size="sm" variant="outline" type="submit">Save LinkedIn connection</Button>
     </form>
+    <div
+      class="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-3"
+    >
+      <div>
+        <p class="text-xs font-medium">Local configuration check</p>
+        <p class="mt-0.5 text-[11px] text-[color:var(--text-muted)]">
+          Checks saved values only. No external provider request is made and nothing is sent.
+        </p>
+      </div>
+      <form method="POST" action="?/testLinkedInConnection" use:enhance>
+        <Button size="sm" variant="outline" type="submit">
+          <ShieldCheck class="size-3.5" />
+          Check local configuration
+        </Button>
+      </form>
+    </div>
+    {#if linkedinConfigTest}
+      <div
+        aria-live="polite"
+        class={`mt-3 flex gap-2 rounded-md px-3 py-2 text-xs ${linkedinConfigTest.ok ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}
+      >
+        {#if linkedinConfigTest.ok}
+          <CheckCircle2 class="mt-0.5 size-3.5 shrink-0" />
+        {:else}
+          <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+        {/if}
+        <span
+          >{localConnectionTestMessage(linkedinConfigTest)} No external provider call or message was sent.</span
+        >
+      </div>
+    {/if}
   </section>
 
   <section
@@ -493,6 +596,37 @@
       </label>
       <Button size="sm" variant="outline" type="submit">Save Apollo connection</Button>
     </form>
+    <div
+      class="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-3"
+    >
+      <div>
+        <p class="text-xs font-medium">Local configuration check</p>
+        <p class="mt-0.5 text-[11px] text-[color:var(--text-muted)]">
+          Checks saved values only. No external provider request is made and nothing is sent.
+        </p>
+      </div>
+      <form method="POST" action="?/testApolloConnection" use:enhance>
+        <Button size="sm" variant="outline" type="submit">
+          <ShieldCheck class="size-3.5" />
+          Check local configuration
+        </Button>
+      </form>
+    </div>
+    {#if apolloConfigTest}
+      <div
+        aria-live="polite"
+        class={`mt-3 flex gap-2 rounded-md px-3 py-2 text-xs ${apolloConfigTest.ok ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}
+      >
+        {#if apolloConfigTest.ok}
+          <CheckCircle2 class="mt-0.5 size-3.5 shrink-0" />
+        {:else}
+          <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+        {/if}
+        <span
+          >{localConnectionTestMessage(apolloConfigTest)} No external provider call or message was sent.</span
+        >
+      </div>
+    {/if}
   </section>
 
   <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
@@ -889,7 +1023,9 @@
                   placeholder={'Hi {{ first_name }}, I would like to connect and learn more about {{ company_name }}.'}
                 ></textarea>
               </label>
-              <div class="flex flex-wrap items-center justify-between gap-2 text-[10px] text-[color:var(--text-muted)]">
+              <div
+                class="flex flex-wrap items-center justify-between gap-2 text-[10px] text-[color:var(--text-muted)]"
+              >
                 <span>
                   Optional · variables: first_name, last_name, full_name, company_name, job_title
                 </span>
@@ -1484,8 +1620,7 @@
           rows="8"
           required
           class="w-full rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg)] px-3 py-2 font-mono text-xs leading-5"
-          placeholder={prospectCsvPlaceholder}
-        ></textarea>
+          placeholder={prospectCsvPlaceholder}></textarea>
         <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
           <label class="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
             <input

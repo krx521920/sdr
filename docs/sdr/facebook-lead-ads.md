@@ -56,7 +56,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Do not rotate this key without first re-encrypting stored Page tokens. In local
 development only, an omitted value falls back to a key derived from Django's
-`SECRET_KEY`.
+`SECRET_KEY`; production refuses to start without an explicit valid Fernet key.
+New credentials carry a versioned encryption prefix. Existing unprefixed
+Fernet ciphertext remains readable for backwards-compatible rotation.
 
 ## Meta configuration
 

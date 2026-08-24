@@ -47,6 +47,12 @@ are encrypted with `INTEGRATION_ENCRYPTION_KEY`; the API returns only the last
 eight characters. Keys, ciphertext, and provider response bodies are never
 included in inspection records.
 
+Production requires an explicit valid Fernet `INTEGRATION_ENCRYPTION_KEY` and
+refuses to start without it. New ciphertext is version-prefixed while legacy
+unprefixed Fernet values remain decryptable. Rotate this key only through an
+explicit re-encryption procedure; changing it directly makes stored tenant
+credentials unreadable.
+
 Provider base URLs and model allow-lists are deployment-owned. A tenant cannot
 submit a custom URL, which prevents credential exfiltration through an
 attacker-controlled OpenAI-compatible endpoint.

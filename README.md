@@ -190,7 +190,10 @@ docker compose exec backend python manage.py manage_rls --status
 The default env vars live in `.env.docker` (committed). To override locally without touching git:
 
 1. Copy `.env.docker` to `.env.docker.local` (gitignored)
-2. Edit values as needed — set your own `SECRET_KEY` here, not in `.env.docker`
+2. Edit values as needed — set your own `SECRET_KEY` here, not in `.env.docker`.
+   For local production acceptance, initialize the dedicated Fernet key once
+   with `.\docker\initialize-integration-encryption-key.ps1`. Real deployments
+   should store the same value in their secret manager and keep it stable.
 3. Rebuild/restart: `docker compose up --build`
 
 Every service loads `.env.docker` first and then `.env.docker.local` if it exists, so

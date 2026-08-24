@@ -1,6 +1,7 @@
 from django.urls import path
 
 from integrations.api.views import (
+    ApolloConnectionTestView,
     ApolloConnectionView,
     FacebookConversionSettingsView,
     FacebookMessengerConversationView,
@@ -13,7 +14,9 @@ from integrations.api.views import (
     FacebookWebhookView,
     FeishuBaseConnectionTestView,
     FeishuBaseConnectionView,
+    LinkedInConnectionTestView,
     LinkedInConnectionView,
+    WhatsAppBusinessConnectionTestView,
     WhatsAppBusinessConnectionView,
     WhatsAppWebhookView,
 )
@@ -37,14 +40,29 @@ urlpatterns = [
         name="linkedin_connection",
     ),
     path(
+        "linkedin/connection/test/",
+        LinkedInConnectionTestView.as_view(),
+        name="linkedin_connection_test",
+    ),
+    path(
         "apollo/connection/",
         ApolloConnectionView.as_view(),
         name="apollo_connection",
     ),
     path(
+        "apollo/connection/test/",
+        ApolloConnectionTestView.as_view(),
+        name="apollo_connection_test",
+    ),
+    path(
         "whatsapp/connection/",
         WhatsAppBusinessConnectionView.as_view(),
         name="whatsapp_connection",
+    ),
+    path(
+        "whatsapp/connection/test/",
+        WhatsAppBusinessConnectionTestView.as_view(),
+        name="whatsapp_connection_test",
     ),
     path(
         "whatsapp/webhook/",

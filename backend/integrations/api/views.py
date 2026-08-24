@@ -8,7 +8,7 @@ from django.http import HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -84,10 +84,125 @@ from integrations.providers.whatsapp.webhooks import (
     process_whatsapp_status_webhook,
     verify_whatsapp_signature,
 )
+from integrations.secrets import SecretDecryptionError
 from leads.models import Lead
 from sdr.models import LeadIntake
 
 logger = logging.getLogger(__name__)
+
+
+def _local_connection_test_payload(code: str, *, ok: bool = False) -> dict:
+    """Return a deliberately small, provider-data-free local test result."""
+
+    return {"code": code, "ok": ok, "local_only": True}
+
+
+class BaseLocalConnectionTestView(APIView):
+    """Validate stored connection state without provider calls or data writes."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+    connection_model = None
+    credential_ciphertext_field = ""
+    credential_getter_name = ""
+    required_identifier_fields: tuple[str, ...] = ()
+    select_related_fields: tuple[str, ...] = ()
+    requires_partner_access = False
+
+    def permission_denied(self, request, message=None, code=None):
+        payload = _local_connection_test_payload("permission_denied")
+        if request.authenticators and not request.successful_authenticator:
+            raise NotAuthenticated(payload)
+        raise PermissionDenied(payload)
+
+    def handle_exception(self, exc):
+        response = super().handle_exception(exc)
+        if isinstance(exc, (NotAuthenticated, PermissionDenied)):
+            # DRF converts primitive values inside exception ``detail`` mappings
+            # to ErrorDetail strings. Restore the endpoint's boolean-only contract.
+            response.data = _local_connection_test_payload("permission_denied")
+        return response
+
+    def _connection(self, request):
+        queryset = self.connection_model.objects.filter(org=request.org)
+        if self.select_related_fields:
+            queryset = queryset.select_related(*self.select_related_fields)
+        return queryset.first()
+
+    @staticmethod
+    def _required_value_present(value) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        return value is not None
+
+    def post(self, request):
+        connection = self._connection(request)
+        if connection is None:
+            return Response(
+                _local_connection_test_payload("connection_missing"),
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not connection.is_active:
+            return Response(
+                _local_connection_test_payload("connection_inactive"),
+                status=status.HTTP_409_CONFLICT,
+            )
+        if any(
+            not self._required_value_present(getattr(connection, field_name, None))
+            for field_name in self.required_identifier_fields
+        ):
+            return Response(
+                _local_connection_test_payload("required_identifier_missing"),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ciphertext = getattr(connection, self.credential_ciphertext_field, "")
+        if not self._required_value_present(ciphertext):
+            return Response(
+                _local_connection_test_payload("credential_missing"),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            credential = getattr(connection, self.credential_getter_name)()
+        except SecretDecryptionError:
+            return Response(
+                _local_connection_test_payload("credential_decryption_failed"),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not self._required_value_present(credential):
+            return Response(
+                _local_connection_test_payload("credential_decryption_failed"),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if self.requires_partner_access and not connection.partner_access_confirmed:
+            return Response(
+                _local_connection_test_payload("partner_access_not_confirmed"),
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            _local_connection_test_payload("connection_ready", ok=True),
+            status=status.HTTP_200_OK,
+        )
+
+
+class ApolloConnectionTestView(BaseLocalConnectionTestView):
+    connection_model = ApolloConnection
+    credential_ciphertext_field = "api_key_ciphertext"
+    credential_getter_name = "get_api_key"
+
+
+class WhatsAppBusinessConnectionTestView(BaseLocalConnectionTestView):
+    connection_model = WhatsAppBusinessConnection
+    credential_ciphertext_field = "access_token_ciphertext"
+    credential_getter_name = "get_access_token"
+    required_identifier_fields = ("phone_number_id",)
+    select_related_fields = ("route",)
+
+
+class LinkedInConnectionTestView(BaseLocalConnectionTestView):
+    connection_model = LinkedInConnection
+    credential_ciphertext_field = "access_token_ciphertext"
+    credential_getter_name = "get_access_token"
+    requires_partner_access = True
 
 
 class ApolloConnectionView(APIView):
