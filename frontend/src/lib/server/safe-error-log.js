@@ -110,7 +110,7 @@ export function getSafeErrorMetadata(error) {
     const errorRecord = /** @type {Record<string, any>} */ (error);
     /** @type {SafeErrorMetadata} */
     const metadata = {};
-    const status = errorRecord.response?.status;
+    const status = errorRecord.response?.status ?? errorRecord.status;
     const code = safeErrorCode(errorRecord.code);
     const traceId = getTraceId(errorRecord);
     if (Number.isInteger(status) && status >= 100 && status <= 599) metadata.status = status;

@@ -73,6 +73,12 @@ test('rejects arbitrary and incorrectly cased error codes', () => {
   });
 });
 
+test('preserves a direct HTTP status without exposing the error message', () => {
+  const metadata = getSafeErrorMetadata({ status: 403, message: 'PRIVATE_PROVIDER_DETAIL' });
+  assert.deepEqual(metadata, { status: 403 });
+  assert.equal(JSON.stringify(metadata).includes('PRIVATE_PROVIDER_DETAIL'), false);
+});
+
 test('ignores trace IDs outside trusted response headers', () => {
   const untrustedTraceId = 'abcdef0123456789abcdef0123456789';
   assert.deepEqual(
@@ -149,4 +155,10 @@ test('authentication boundaries use only their approved static safe-log events',
       );
     }
   }
+});
+
+test('the shared API helper never logs response bodies, endpoints or thrown errors', () => {
+  const source = readFileSync(resolve(TEST_DIR, '../src/lib/api-helpers.js'), 'utf8');
+  assert.doesNotMatch(source, /console\.error\([^\n]*(?:errorData|endpoint|,\s*error\b)/);
+  assert.equal(source.includes("console.error('API transport request failed')"), true);
 });

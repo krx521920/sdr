@@ -1,5 +1,6 @@
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from django.core.exceptions import ValidationError
@@ -134,6 +135,42 @@ def test_expired_evidence_is_not_used(org_a):
     assert all(
         item["evidence"].id != expired.id for item in evaluation.evidence_contributions
     )
+
+
+@pytest.mark.django_db
+def test_future_evidence_is_not_used_and_recompute_locks_opportunity(org_a):
+    person = Person.objects.create(org=org_a, display_name="Alice")
+    future = Evidence.objects.create(
+        org=org_a,
+        person=person,
+        kind="skill",
+        source="manual",
+        summary="Certification is not observable yet",
+        facts={"skills": ["python"]},
+        observed_at=timezone.now() + timedelta(days=1),
+        confidence=Decimal("1.000"),
+    )
+    opportunity = MatchOpportunity.objects.create(
+        org=org_a,
+        opportunity_type="project",
+        title="Python project",
+        required_criteria={"skills": ["python"]},
+    )
+
+    manager = MatchOpportunity.objects
+    with patch.object(
+        manager,
+        "select_for_update",
+        wraps=manager.select_for_update,
+    ) as select_for_update:
+        match = recompute_opportunity_matches(
+            org=org_a,
+            opportunity=opportunity,
+        )[0]
+
+    select_for_update.assert_called_once_with()
+    assert match.eligibility_score == 0
+    assert not match.evidence_links.filter(evidence=future).exists()
 
 
 @pytest.mark.django_db

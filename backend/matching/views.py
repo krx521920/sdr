@@ -17,7 +17,7 @@ from matching.serializers import (
     PersonSerializer,
     RecomputeMatchesSerializer,
 )
-from matching.services import recompute_opportunity_matches
+from matching.services import MAX_SYNC_RECOMPUTE_PEOPLE, recompute_opportunity_matches
 
 
 class MatchingAPIView(APIView):
@@ -254,16 +254,37 @@ class OpportunityMatchListRecomputeView(MatchingAPIView):
         )
         serializer.is_valid(raise_exception=True)
         person_ids = serializer.validated_data.get("person_ids")
+        if person_ids is None:
+            active_people = Person.objects.filter(org=request.org, status="active")
+            active_people_count = active_people[
+                : MAX_SYNC_RECOMPUTE_PEOPLE + 1
+            ].count()
+            if active_people_count > MAX_SYNC_RECOMPUTE_PEOPLE:
+                return Response(
+                    {
+                        "person_ids": [
+                            "Synchronous recompute is limited to "
+                            f"{MAX_SYNC_RECOMPUTE_PEOPLE} people; provide an explicit subset."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         people = (
             Person.objects.filter(org=request.org, id__in=person_ids)
             if person_ids is not None
             else None
         )
-        matches = recompute_opportunity_matches(
-            org=request.org,
-            opportunity=opportunity,
-            people=people,
-        )
+        try:
+            matches = recompute_opportunity_matches(
+                org=request.org,
+                opportunity=opportunity,
+                people=people,
+            )
+        except ValueError as exc:
+            return Response(
+                {"person_ids": [str(exc)]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         match_ids = [item.id for item in matches]
         matches = (
             Match.objects.filter(org=request.org, id__in=match_ids)

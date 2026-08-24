@@ -49,6 +49,7 @@
     ShieldCheck,
     BookOpen,
     Activity,
+    Network,
     Smartphone,
     KeyRound
   } from '@lucide/svelte';
@@ -177,7 +178,8 @@
   // Five-section IA per spec §4
   const workspaceItems = [
     { href: '/', label: 'Home', icon: Home, type: 'link', preload: 'off', count: undefined },
-    { href: '/leads', label: 'Pipeline', icon: Activity, type: 'link', preload: 'off', count: undefined }
+    { href: '/leads', label: 'Pipeline', icon: Activity, type: 'link', preload: 'off', count: undefined },
+    { href: '/matching', label: 'Matching', icon: Network, type: 'link', preload: 'off', count: undefined }
   ];
 
   const recordsItems = [

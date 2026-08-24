@@ -1,7 +1,7 @@
 import pytest
 from django.test import override_settings
 
-from matching.models import Person
+from matching.models import Match, MatchOpportunity, Person
 
 
 @pytest.mark.django_db
@@ -74,6 +74,7 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
                 "skills": ["Python", "Django"],
                 "titles": ["Growth Engineer"],
             },
+            "source_uri": "https://example.com/private/profile?token=secret",
             "source_record_id": "li-123",
             "confidence": "0.900",
         },
@@ -121,10 +122,22 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
     assert body["count"] == 1
     assert body["results"][0]["eligibility_score"] == 100
     assert body["results"][0]["rank"] == 1
+    assert body["results"][0]["person_summary"] == {
+        "id": person_id,
+        "display_name": "Alice Zhang",
+        "current_title": "Growth Engineer",
+        "current_company": "",
+        "location": "Shanghai",
+        "availability": "open_to_offers",
+    }
     assert (
         body["results"][0]["evidence_links"][0]["evidence"]["id"]
         == evidence_response.json()["id"]
     )
+    safe_evidence = body["results"][0]["evidence_links"][0]["evidence"]
+    assert "facts" not in safe_evidence
+    assert "source_uri" not in safe_evidence
+    assert "source_record_id" not in safe_evidence
 
     match_id = body["results"][0]["id"]
     reviewed = admin_client.patch(
@@ -158,3 +171,90 @@ def test_evidence_cannot_reference_a_person_from_another_org(
 
     assert response.status_code == 400
     assert response.json()["person"]
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="matching.tests.urls")
+def test_cross_org_matching_details_and_recompute_are_hidden(
+    admin_client,
+    org_a,
+    org_b,
+):
+    own_opportunity = MatchOpportunity.objects.create(
+        org=org_a,
+        opportunity_type="project",
+        title="Own opportunity",
+    )
+    foreign_person = Person.objects.create(org=org_b, display_name="Foreign person")
+    foreign_opportunity = MatchOpportunity.objects.create(
+        org=org_b,
+        opportunity_type="employment",
+        title="Foreign opportunity",
+    )
+    foreign_match = Match.objects.create(
+        org=org_b,
+        person=foreign_person,
+        opportunity=foreign_opportunity,
+    )
+
+    assert (
+        admin_client.get(f"/api/matching/people/{foreign_person.id}/").status_code
+        == 404
+    )
+    assert (
+        admin_client.get(
+            f"/api/matching/opportunities/{foreign_opportunity.id}/"
+        ).status_code
+        == 404
+    )
+    assert (
+        admin_client.get(f"/api/matching/matches/{foreign_match.id}/").status_code
+        == 404
+    )
+    assert (
+        admin_client.post(
+            f"/api/matching/opportunities/{foreign_opportunity.id}/matches/",
+            {},
+            format="json",
+        ).status_code
+        == 404
+    )
+    foreign_person_response = admin_client.post(
+        f"/api/matching/opportunities/{own_opportunity.id}/matches/",
+        {"person_ids": [str(foreign_person.id)]},
+        format="json",
+    )
+    assert foreign_person_response.status_code == 400
+    assert foreign_person_response.json()["person_ids"]
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="matching.tests.urls")
+def test_sync_recompute_rejects_more_than_100_people(admin_client, org_a):
+    opportunity = MatchOpportunity.objects.create(
+        org=org_a,
+        opportunity_type="project",
+        title="Bounded opportunity",
+    )
+    people = Person.objects.bulk_create(
+        [
+            Person(org=org_a, display_name=f"Person {index:03d}")
+            for index in range(101)
+        ]
+    )
+
+    implicit = admin_client.post(
+        f"/api/matching/opportunities/{opportunity.id}/matches/",
+        {},
+        format="json",
+    )
+    explicit = admin_client.post(
+        f"/api/matching/opportunities/{opportunity.id}/matches/",
+        {"person_ids": [str(person.id) for person in people]},
+        format="json",
+    )
+
+    assert implicit.status_code == 400
+    assert "100" in str(implicit.json()["person_ids"])
+    assert explicit.status_code == 400
+    assert "100" in str(explicit.json()["person_ids"])

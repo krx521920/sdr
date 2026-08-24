@@ -106,8 +106,12 @@ export async function apiRequest(endpoint, options = {}, locals) {
         }
       }
 
-      console.error(`API Error Response:`, errorData);
-      throw new Error(errorMessage);
+      console.error('API request returned a non-success status', {
+        status: response.status
+      });
+      const requestError = /** @type {Error & { status?: number }} */ (new Error(errorMessage));
+      requestError.status = response.status;
+      throw requestError;
     }
 
     // Handle 204 No Content
@@ -118,7 +122,10 @@ export async function apiRequest(endpoint, options = {}, locals) {
     // Return JSON response
     return await response.json();
   } catch (error) {
-    console.error(`API request failed: ${method} ${endpoint}`, error);
+    const status = Number(/** @type {{ status?: number }} */ (error)?.status);
+    if (!Number.isInteger(status)) {
+      console.error('API transport request failed');
+    }
     throw error;
   }
 }

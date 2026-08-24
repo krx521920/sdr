@@ -17,7 +17,7 @@ from matching.models import (
     PersonIdentity,
     PersonIdentityKind,
 )
-from matching.services import SUPPORTED_DIMENSIONS
+from matching.services import MAX_SYNC_RECOMPUTE_PEOPLE, SUPPORTED_DIMENSIONS
 
 
 def _validate_string_list(value, field_name):
@@ -320,8 +320,42 @@ class MatchOpportunitySerializer(
         return attrs
 
 
+class MatchPersonSummarySerializer(serializers.ModelSerializer):
+    """Minimal person projection safe to embed in ranked match responses."""
+
+    class Meta:
+        model = Person
+        fields = (
+            "id",
+            "display_name",
+            "current_title",
+            "current_company",
+            "location",
+            "availability",
+        )
+        read_only_fields = fields
+
+
+class MatchEvidenceSummarySerializer(serializers.ModelSerializer):
+    """Citation metadata without raw facts or provider record locators."""
+
+    class Meta:
+        model = Evidence
+        fields = (
+            "id",
+            "kind",
+            "source",
+            "summary",
+            "observed_at",
+            "valid_until",
+            "confidence",
+            "content_hash",
+        )
+        read_only_fields = fields
+
+
 class MatchEvidenceSerializer(serializers.ModelSerializer):
-    evidence = EvidenceSerializer(read_only=True)
+    evidence = MatchEvidenceSummarySerializer(read_only=True)
 
     class Meta:
         model = MatchEvidence
@@ -337,6 +371,7 @@ class MatchEvidenceSerializer(serializers.ModelSerializer):
 
 class MatchSerializer(serializers.ModelSerializer):
     person_name = serializers.CharField(source="person.display_name", read_only=True)
+    person_summary = MatchPersonSummarySerializer(source="person", read_only=True)
     opportunity_title = serializers.CharField(
         source="opportunity.title", read_only=True
     )
@@ -348,6 +383,7 @@ class MatchSerializer(serializers.ModelSerializer):
             "id",
             "person",
             "person_name",
+            "person_summary",
             "opportunity",
             "opportunity_title",
             "status",
@@ -382,7 +418,7 @@ class RecomputeMatchesSerializer(OrgRelatedSerializerMixin, serializers.Serializ
         child=serializers.UUIDField(),
         required=False,
         allow_empty=False,
-        max_length=500,
+        max_length=MAX_SYNC_RECOMPUTE_PEOPLE,
     )
 
     def validate_person_ids(self, values):

@@ -13,10 +13,12 @@ from matching.models import (
     Match,
     MatchEvidence,
     MatchEvidenceDirection,
+    MatchOpportunity,
     Person,
 )
 
 ENGINE_VERSION = "rules-v1"
+MAX_SYNC_RECOMPUTE_PEOPLE = 100
 SUPPORTED_DIMENSIONS = ("skills", "titles", "locations", "availability")
 FACT_ALIASES = {
     "skills": ("skills", "skill"),
@@ -77,13 +79,21 @@ def evaluate_person(person, opportunity, evidence_items=None):
     """Return a reproducible assessment using only stored structured facts."""
 
     now = timezone.now()
-    evidence_items = list(
-        evidence_items
-        if evidence_items is not None
-        else Evidence.objects.filter(org=person.org, person=person).filter(
-            Q(valid_until__isnull=True) | Q(valid_until__gte=now)
+    if evidence_items is None:
+        evidence_items = list(
+            Evidence.objects.filter(
+                org=person.org,
+                person=person,
+                observed_at__lte=now,
+            ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
         )
-    )
+    else:
+        evidence_items = [
+            item
+            for item in evidence_items
+            if item.observed_at <= now
+            and (item.valid_until is None or item.valid_until >= now)
+        ]
 
     candidate = {
         "skills": _values(person.skills),
@@ -302,17 +312,29 @@ def recompute_opportunity_matches(*, org, opportunity, people=None):
 
     if opportunity.org_id != org.id:
         raise ValueError("Opportunity does not belong to the requested org")
+    opportunity = MatchOpportunity.objects.select_for_update().get(
+        org=org,
+        id=opportunity.id,
+    )
     queryset = (
         Person.objects.filter(org=org, status="active")
         if people is None
         else people.filter(org=org, status="active")
     )
-    people_list = list(queryset.order_by("display_name", "id"))
+    people_list = list(
+        queryset.order_by("display_name", "id")[: MAX_SYNC_RECOMPUTE_PEOPLE + 1]
+    )
+    if len(people_list) > MAX_SYNC_RECOMPUTE_PEOPLE:
+        raise ValueError(
+            f"Synchronous recompute is limited to {MAX_SYNC_RECOMPUTE_PEOPLE} people."
+        )
     evidence_by_person = {}
+    now = timezone.now()
     evidence_queryset = Evidence.objects.filter(
         org=org,
         person_id__in=[person.id for person in people_list],
-    ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=timezone.now()))
+        observed_at__lte=now,
+    ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
     for evidence in evidence_queryset:
         evidence_by_person.setdefault(evidence.person_id, []).append(evidence)
 

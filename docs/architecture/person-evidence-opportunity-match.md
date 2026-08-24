@@ -15,9 +15,11 @@ request, referral, contractor engagement, or partnership.
 - `MatchOpportunity` is a matching demand and deliberately does not replace the
   existing CRM sales `Opportunity`. Its type can be customer, employment,
   contractor, project, expert, referral, or partnership.
-- `Match` is a versioned assessment. It contains eligibility, fit, trust,
-  relationship, availability, confidence, reasons, gaps, and a stable rank.
-- `MatchEvidence` cites the exact evidence records contributing to a match.
+- `Match` is the current assessment projection. It contains eligibility, fit,
+  trust, relationship, availability, confidence, reasons, gaps, and rank.
+- `MatchEvidence` cites evidence records contributing to the current projection.
+  Immutable runs, revisions, and decision events are not implemented yet and
+  remain required before production decision auditing.
 
 Every table owns an `org_id`, is filtered in the API, and has PostgreSQL RLS
 enabled and forced. This gives both application-layer and database-layer tenant
@@ -65,7 +67,16 @@ All endpoints require authentication, organization context, and sales access.
 
 Evidence is append-only through the first API slice: there is no update or
 delete endpoint. Recompute accepts an optional `person_ids` list; without it,
-all active people in the tenant are evaluated.
+all active people in the tenant are evaluated only when there are at most 100.
+Synchronous recompute accepts at most 100 people; larger populations must be
+submitted as explicit subsets for controlled testing or handled by a future
+background job. A partial synchronous run is not an immutable ranking snapshot.
+Embedded match responses expose a minimal person summary and evidence citation
+metadata, never raw evidence facts, source URLs, or provider record identifiers.
+
+The first operator UI is available at `/matching`. It keeps opportunity and
+filter selection in the URL, requires confirmation before recompute, and lets a
+sales-enabled reviewer move the current match through review statuses.
 
 ## Channel integration path
 
