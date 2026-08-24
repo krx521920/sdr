@@ -125,9 +125,11 @@ def test_cross_org_pat_cannot_read_other_orgs_leads(org_a, admin_profile):
         pytest.skip("RLS isolation is enforced by PostgreSQL; skipping on non-Postgres DB")
 
     from leads.models import Lead
+    from conftest import set_rls_context
 
     # Create org B and a lead in it directly, with org explicitly set.
     org_b = Org.objects.create(name="Cross-Org Isolation Org B")
+    set_rls_context(org_b)
     lead_b = Lead.objects.create(
         first_name="Hidden",
         last_name="Lead-OrgB",
@@ -136,6 +138,7 @@ def test_cross_org_pat_cannot_read_other_orgs_leads(org_a, admin_profile):
     )
 
     # Mint a PAT for the org-A admin profile and call the leads list as that token.
+    set_rls_context(org_a)
     raw, _ = PersonalAccessToken.generate(profile=admin_profile, name="cross-org-cli")
     client = Client()
     response = client.get("/api/leads/", HTTP_AUTHORIZATION=f"Bearer {raw}")

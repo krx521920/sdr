@@ -1,7 +1,75 @@
 import { apiRequest } from '$lib/api-helpers.js';
+import { env } from '$env/dynamic/public';
 import { error, fail } from '@sveltejs/kit';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LOCAL_CONNECTION_TEST_PROVIDERS = new Set(['apollo', 'whatsapp', 'linkedin']);
+const LOCAL_CONNECTION_TEST_CODES = new Set([
+  'connection_ready',
+  'connection_missing',
+  'connection_inactive',
+  'required_identifier_missing',
+  'credential_missing',
+  'credential_decryption_failed',
+  'partner_access_not_confirmed',
+  'permission_denied'
+]);
+
+/**
+ * Check only the locally stored connection state. The backend endpoint is
+ * deliberately read-only and returns no provider data, credential, or hint.
+ * Keep the action response equally small even if the upstream contract changes.
+ *
+ * @param {'apollo' | 'whatsapp' | 'linkedin'} provider
+ * @param {import('@sveltejs/kit').Cookies} cookies
+ */
+async function checkLocalConnection(provider, cookies) {
+  if (!LOCAL_CONNECTION_TEST_PROVIDERS.has(provider)) {
+    throw new Error('Unsupported local connection check.');
+  }
+
+  const accessToken = cookies.get('jwt_access');
+  const response = await fetch(
+    `${env.PUBLIC_DJANGO_API_URL}/api/integrations/${provider}/connection/test/`,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+      },
+      body: '{}'
+    }
+  );
+  const payload = await response.json().catch(() => null);
+  const code = typeof payload?.code === 'string' ? payload.code : '';
+
+  if (
+    !LOCAL_CONNECTION_TEST_CODES.has(code) ||
+    typeof payload?.ok !== 'boolean' ||
+    payload?.local_only !== true
+  ) {
+    throw new Error('Unexpected local connection check response.');
+  }
+
+  return {
+    code,
+    ok: payload.ok,
+    localOnly: true
+  };
+}
+
+/**
+ * @param {'apollo' | 'whatsapp' | 'linkedin'} provider
+ * @param {import('@sveltejs/kit').Cookies} cookies
+ */
+async function localConnectionTestAction(provider, cookies) {
+  try {
+    return await checkLocalConnection(provider, cookies);
+  } catch {
+    return null;
+  }
+}
 
 function csvValues(value) {
   return [
@@ -133,6 +201,27 @@ export async function load({ cookies, locals, url }) {
 
 /** @type {import('./$types').Actions} */
 export const actions = {
+  testWhatsAppConnection: async ({ cookies }) => {
+    const result = await localConnectionTestAction('whatsapp', cookies);
+    if (!result) {
+      return fail(502, { actionError: 'Could not run the local WhatsApp configuration check.' });
+    }
+    return { whatsappConfigTest: result };
+  },
+  testLinkedInConnection: async ({ cookies }) => {
+    const result = await localConnectionTestAction('linkedin', cookies);
+    if (!result) {
+      return fail(502, { actionError: 'Could not run the local LinkedIn configuration check.' });
+    }
+    return { linkedinConfigTest: result };
+  },
+  testApolloConnection: async ({ cookies }) => {
+    const result = await localConnectionTestAction('apollo', cookies);
+    if (!result) {
+      return fail(502, { actionError: 'Could not run the local Apollo configuration check.' });
+    }
+    return { apolloConfigTest: result };
+  },
   saveCampaign: async ({ request, cookies, locals }) => {
     const formData = await request.formData();
     const campaignId = String(formData.get('campaign_id') || '');
@@ -147,9 +236,7 @@ export const actions = {
       status: String(formData.get('status') || 'draft'),
       sequence_id: String(formData.get('sequence_id') || '') || null,
       daily_send_limit: Number(formData.get('daily_send_limit') || 50),
-      linkedin_invitation_message: String(
-        formData.get('linkedin_invitation_message') || ''
-      ).trim(),
+      linkedin_invitation_message: String(formData.get('linkedin_invitation_message') || '').trim(),
       whatsapp_template_name: String(formData.get('whatsapp_template_name') || '').trim(),
       whatsapp_template_language: String(
         formData.get('whatsapp_template_language') || 'en_US'

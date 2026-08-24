@@ -68,6 +68,9 @@ logs/
 # Docker local overrides
 .env.docker.local
 
+# Local diagnostics and database backups
+.tmp/
+
 # OS
 .DS_Store
 Thumbs.db

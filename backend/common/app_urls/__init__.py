@@ -21,6 +21,10 @@ urlpatterns = [
         include("automation.urls", namespace="api_automation"),
     ),
     path(
+        "matching/",
+        include("matching.urls", namespace="api_matching"),
+    ),
+    path(
         "integrations/",
         include("integrations.urls", namespace="api_integrations"),
     ),

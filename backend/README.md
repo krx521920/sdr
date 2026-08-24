@@ -437,6 +437,7 @@ uv lock --upgrade
 | `CELERY_RESULT_BACKEND` | Redis URL for Celery results |
 | `DOMAIN_NAME` | Application domain |
 | `SWAGGER_ROOT_URL` | Swagger documentation root URL |
+| `INTEGRATION_ENCRYPTION_KEY` | Dedicated Fernet key; required in production for encrypted provider credentials |
 
 ## Troubleshooting
 

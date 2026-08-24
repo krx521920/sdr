@@ -15,6 +15,8 @@ from common.serializer import OrgAwareRefreshToken
 
 def set_rls_context(org):
     """Set the PostgreSQL RLS session variable for direct ORM operations in tests."""
+    if connection.vendor != "postgresql":
+        return
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT set_config('app.current_org', %s, false)", [str(org.id)]
@@ -23,6 +25,8 @@ def set_rls_context(org):
 
 def clear_rls_context():
     """Clear the PostgreSQL RLS session variable."""
+    if connection.vendor != "postgresql":
+        return
     with connection.cursor() as cursor:
         cursor.execute("SELECT set_config('app.current_org', '', false)")
 
@@ -59,6 +63,7 @@ def user_b():
 
 @pytest.fixture
 def admin_profile(admin_user, org_a):
+    set_rls_context(org_a)
     return Profile.objects.create(
         user=admin_user, org=org_a, role="ADMIN", is_active=True
     )
@@ -66,6 +71,7 @@ def admin_profile(admin_user, org_a):
 
 @pytest.fixture
 def user_profile(regular_user, org_a):
+    set_rls_context(org_a)
     return Profile.objects.create(
         user=regular_user, org=org_a, role="USER", is_active=True
     )
@@ -73,6 +79,7 @@ def user_profile(regular_user, org_a):
 
 @pytest.fixture
 def profile_b(user_b, org_b):
+    set_rls_context(org_b)
     return Profile.objects.create(
         user=user_b, org=org_b, role="ADMIN", is_active=True
     )
