@@ -139,6 +139,24 @@ class TestUsersListView:
             user__email="new-member@test.com", org=org_a
         ).exists()
 
+    def test_create_user_can_assign_matching_access(self, admin_client, org_a):
+        response = admin_client.post(
+            self.url,
+            {
+                "email": "matching-reader@test.com",
+                "role": "USER",
+                "matching_access_level": "read",
+            },
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        profile = Profile.objects.get(
+            org=org_a,
+            user__email="matching-reader@test.com",
+        )
+        assert profile.matching_access_level == "read"
+
     def test_create_user_minimal_payload_creates_no_address(self, admin_client, org_a):
         """No address fields sent -> no empty Address row is created."""
         response = admin_client.post(
@@ -351,6 +369,54 @@ class TestUserDetailView:
             format="json",
         )
         assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("role", "ADMIN"),
+            ("is_organization_admin", True),
+            ("has_sales_access", True),
+            ("has_marketing_access", True),
+            ("matching_access_level", "decide"),
+        ],
+    )
+    def test_non_admin_cannot_escalate_own_profile_permissions(
+        self,
+        user_client,
+        regular_user,
+        user_profile,
+        field,
+        value,
+    ):
+        response = user_client.patch(
+            self._url(regular_user.id),
+            {field: value},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        user_profile.refresh_from_db()
+        assert getattr(user_profile, field) != value
+
+    def test_org_admin_can_grant_matching_access_in_own_org(
+        self,
+        admin_client,
+        admin_profile,
+        regular_user,
+        user_profile,
+    ):
+        admin_profile.role = "USER"
+        admin_profile.is_organization_admin = True
+        admin_profile.save(update_fields=["role", "is_organization_admin"])
+        response = admin_client.patch(
+            self._url(regular_user.id),
+            {"matching_access_level": "recompute"},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        user_profile.refresh_from_db()
+        assert user_profile.matching_access_level == "recompute"
 
     def test_update_user_non_admin_other(
         self, user_client, admin_user, admin_profile, user_profile

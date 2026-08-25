@@ -87,6 +87,7 @@
   let polledRunHistory = $state(/** @type {any[]} */ ([]));
   let pollFailures = $state(0);
   let handledTerminalRunId = $state('');
+  let permissionRevoked = $state(false);
   /** @type {ReturnType<typeof setInterval> | null} */
   let pollTimer = null;
   let pollInFlight = false;
@@ -103,9 +104,17 @@
     polledRunHistory.length > 0 ? polledRunHistory : data.runHistory || []
   );
   const runActive = $derived(isMatchRunActive(currentRun));
+  const canManage = $derived(data.permissions?.manage === true && !permissionRevoked);
+  const canRecompute = $derived(data.permissions?.recompute === true && !permissionRevoked);
+  const canDecide = $derived(data.permissions?.decide === true && !permissionRevoked);
+  const isReadOnly = $derived(!canManage && !canRecompute && !canDecide);
   const recomputeBusy = $derived(recomputing || runActive);
   const activeRunKey = $derived(
-    runActive && data.selectedOpportunity?.id && currentRun?.id
+    !permissionRevoked &&
+      data.permissions?.read === true &&
+      runActive &&
+      data.selectedOpportunity?.id &&
+      currentRun?.id
       ? `${data.selectedOpportunity.id}:${currentRun.id}`
       : ''
   );
@@ -169,7 +178,7 @@
 
   /** @param {string} status */
   function openDecision(status) {
-    if (!selectedMatch || decisionBusyId) return;
+    if (!canDecide || !selectedMatch || decisionBusyId) return;
     if (!decisionTargetsForStatus(selectedMatch.status).includes(status)) return;
     pendingDecision = status;
     pendingReasonCode = decisionReasonCodes[status] || '';
@@ -179,6 +188,7 @@
   }
 
   function openRecompute() {
+    if (!canRecompute || recomputeBusy) return;
     recomputeIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
     recomputeDialogOpen = true;
   }
@@ -257,6 +267,17 @@
         _: String(Date.now())
       });
       const response = await fetch(`/api/matching-run-poll?${params}`);
+      if (response.status === 403) {
+        stopPolling();
+        if (!permissionRevoked) {
+          permissionRevoked = true;
+          recomputeDialogOpen = false;
+          decisionDialogOpen = false;
+          liveMessage = 'Your matching access changed. Ranking updates have stopped.';
+          toast.error('Matching access changed');
+        }
+        return;
+      }
       if (!response.ok) throw new Error('poll unavailable');
       const result = await response.json();
       if (!result.run?.id) throw new Error('run unavailable');
@@ -362,18 +383,26 @@
     subtitle="Place the right person into the right opportunity with evidence-backed ranking"
   >
     {#snippet actions()}
-      <Button
-        size="sm"
-        class="gap-1.5"
-        disabled={!data.selectedOpportunity || recomputeBusy}
-        aria-busy={recomputeBusy}
-        onclick={openRecompute}
-      >
-        <RefreshCw
-          class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
-        />
-        {runActive ? 'Ranking in progress…' : recomputing ? 'Queueing…' : 'Recompute candidates'}
-      </Button>
+      {#if canRecompute}
+        <Button
+          size="sm"
+          class="gap-1.5"
+          disabled={!data.selectedOpportunity || recomputeBusy}
+          aria-busy={recomputeBusy}
+          onclick={openRecompute}
+        >
+          <RefreshCw
+            class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
+          />
+          {runActive ? 'Ranking in progress…' : recomputing ? 'Queueing…' : 'Recompute candidates'}
+        </Button>
+      {:else if permissionRevoked}
+        <Badge variant="outline">Access changed</Badge>
+      {:else if canManage}
+        <Badge variant="outline">Manage access</Badge>
+      {:else if isReadOnly}
+        <Badge variant="outline">Read only</Badge>
+      {/if}
     {/snippet}
   </PageHeader>
 
@@ -766,7 +795,7 @@
           >
         </div>
       </div>
-      {#if decisionTargetsForStatus(match.status).length > 0}
+      {#if canDecide && decisionTargetsForStatus(match.status).length > 0}
         <div class="mt-4 grid grid-cols-2 gap-2">
           {#if decisionTargetsForStatus(match.status).includes('reviewing')}
             <Button
@@ -809,9 +838,13 @@
             </Button>
           {/if}
         </div>
-      {:else}
+      {:else if decisionTargetsForStatus(match.status).length === 0}
         <p class="mt-4 text-xs text-[color:var(--text-subtle)]">
           This decision is final. No further manual transition is available.
+        </p>
+      {:else}
+        <p class="mt-4 text-xs text-[color:var(--text-subtle)]">
+          You do not have permission to change this decision.
         </p>
       {/if}
       {#if match.decisionReason}

@@ -13,6 +13,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from django.utils.timesince import timesince
 from django.utils.translation import gettext_lazy as _
+
 from common.base import BaseModel, BaseOrgModel
 from common.utils import (
     COUNTRIES,
@@ -29,6 +30,14 @@ from common.utils import (
 )
 
 from .manager import UserManager
+
+
+class MatchingAccessLevel(models.TextChoices):
+    NONE = "none", "None"
+    READ = "read", "Read"
+    MANAGE = "manage", "Manage"
+    RECOMPUTE = "recompute", "Recompute"
+    DECIDE = "decide", "Decide"
 
 
 class User(AbstractBaseUser, PermissionsMixin):
@@ -213,6 +222,11 @@ class Profile(BaseModel):
     role = models.CharField(max_length=50, choices=ROLES, default="USER")
     has_sales_access = models.BooleanField(default=False)
     has_marketing_access = models.BooleanField(default=False)
+    matching_access_level = models.CharField(
+        max_length=16,
+        choices=MatchingAccessLevel.choices,
+        default=MatchingAccessLevel.NONE,
+    )
     is_active = models.BooleanField(default=True)
     is_organization_admin = models.BooleanField(default=False)
     date_of_joining = models.DateField(null=True, blank=True)
@@ -896,4 +910,4 @@ class PersonalAccessToken(BaseOrgModel):
 
 
 # Import SecurityAuditLog so Django discovers it for migrations
-from common.audit_log import SecurityAuditLog  # noqa: F401,E402  # pylint: disable=unused-import
+from common.audit_log import SecurityAuditLog  # noqa: E402,F401,I001  # pylint: disable=unused-import

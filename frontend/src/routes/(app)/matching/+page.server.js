@@ -10,6 +10,7 @@ import {
   isUuid,
   normalizeMatch,
   normalizeMatchRun,
+  normalizeMatchingCapabilities,
   normalizeOpportunity,
   parseWorkbenchFilters
 } from '$lib/matching/workbench.js';
@@ -21,6 +22,13 @@ function requireOrg(locals) {
   if (!locals.user?.id || !locals.org?.id) {
     throw error(401, 'Organization context required');
   }
+}
+
+/** @param {import('@sveltejs/kit').Cookies} cookies @param {App.Locals} locals */
+async function getMatchingPermissions(cookies, locals) {
+  return normalizeMatchingCapabilities(
+    await apiRequest('/matching/capabilities/', {}, { cookies, org: locals.org })
+  );
 }
 
 /** @param {unknown} requestError */
@@ -38,6 +46,21 @@ function requestStatus(requestError) {
 export async function load({ cookies, locals, url }) {
   requireOrg(locals);
   const filters = parseWorkbenchFilters(url.searchParams);
+  let permissions;
+
+  try {
+    permissions = await getMatchingPermissions(cookies, locals);
+  } catch (requestError) {
+    const status = requestStatus(requestError);
+    if (status === 401 || status === 403) {
+      throw error(status, 'Matching access is required to use the matching workbench');
+    }
+    logSafeServerError('Matching capability load failed', requestError);
+    throw error(502, 'Matching permissions could not be loaded');
+  }
+  if (!permissions.read) {
+    throw error(403, 'Matching read access is required to use the matching workbench');
+  }
 
   try {
     const opportunityResponse = await apiRequest(
@@ -115,6 +138,7 @@ export async function load({ cookies, locals, url }) {
       totalMatches,
       runHistory,
       currentRun,
+      permissions,
       filters,
       counts: {
         proposed: matches.filter((match) => match.status === 'proposed').length,
@@ -136,6 +160,19 @@ export async function load({ cookies, locals, url }) {
 export const actions = {
   recompute: async ({ request, cookies, locals }) => {
     requireOrg(locals);
+    let permissions;
+    try {
+      permissions = await getMatchingPermissions(cookies, locals);
+    } catch (requestError) {
+      logSafeServerError('Matching recompute permission check failed', requestError);
+      const status = requestStatus(requestError);
+      return fail(status === 401 || status === 403 ? status : 503, {
+        actionError: 'Recompute permission could not be verified.'
+      });
+    }
+    if (!permissions.recompute) {
+      return fail(403, { actionError: 'You do not have permission to recompute matches.' });
+    }
     const form = await request.formData();
     const opportunityId = String(form.get('opportunity_id') || '');
     if (!isUuid(opportunityId)) {
@@ -168,7 +205,7 @@ export const actions = {
       return fail(status === 401 || status === 403 ? status : 400, {
         actionError:
           status === 401 || status === 403
-            ? 'Sales access is required to recompute matches.'
+            ? 'You do not have permission to recompute matches.'
             : 'Candidates could not be recomputed. Try again.'
       });
     }
@@ -176,6 +213,19 @@ export const actions = {
 
   setStatus: async ({ request, cookies, locals }) => {
     requireOrg(locals);
+    let permissions;
+    try {
+      permissions = await getMatchingPermissions(cookies, locals);
+    } catch (requestError) {
+      logSafeServerError('Matching decision permission check failed', requestError);
+      const status = requestStatus(requestError);
+      return fail(status === 401 || status === 403 ? status : 503, {
+        actionError: 'Decision permission could not be verified.'
+      });
+    }
+    if (!permissions.decide) {
+      return fail(403, { actionError: 'You do not have permission to decide matches.' });
+    }
     const form = await request.formData();
     const matchId = String(form.get('match_id') || '');
     const status = String(form.get('status') || '');
@@ -235,7 +285,7 @@ export const actions = {
         {
           actionError:
             requestErrorStatus === 401 || requestErrorStatus === 403
-              ? 'Sales access is required to update match decisions.'
+              ? 'You do not have permission to decide matches.'
               : 'The match decision could not be saved. Try again.'
         }
       );

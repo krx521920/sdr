@@ -13,6 +13,7 @@ import {
   isMatchRunTerminal,
   normalizeMatch,
   normalizeMatchRun,
+  normalizeMatchingCapabilities,
   parseWorkbenchFilters,
   scoreLabel
 } from '../src/lib/matching/workbench.js';
@@ -20,6 +21,31 @@ import {
 const OPEN_ID = '10000000-0000-4000-8000-000000000001';
 const DRAFT_ID = '10000000-0000-4000-8000-000000000002';
 const RUN_ID = '10000000-0000-4000-8000-000000000003';
+
+test('normalizes matching capabilities with strict fail-closed booleans', () => {
+  assert.deepEqual(
+    normalizeMatchingCapabilities({
+      read: true,
+      manage: false,
+      recompute: 'true',
+      decide: 1,
+      payload: { admin: true }
+    }),
+    { read: true, manage: false, recompute: false, decide: false }
+  );
+  assert.deepEqual(normalizeMatchingCapabilities(null), {
+    read: false,
+    manage: false,
+    recompute: false,
+    decide: false
+  });
+  assert.deepEqual(normalizeMatchingCapabilities(['read', 'decide']), {
+    read: false,
+    manage: false,
+    recompute: false,
+    decide: false
+  });
+});
 
 test('parses only bounded URL filter values and valid UUID selections', () => {
   const parsed = parseWorkbenchFilters(

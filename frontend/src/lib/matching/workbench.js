@@ -31,6 +31,25 @@ const DECISION_TARGETS = {
   expired: []
 };
 
+/**
+ * Capabilities are authorization hints rendered by the UI, never a substitute
+ * for the API's permission checks. Fail closed unless the API returns literal
+ * booleans.
+ *
+ * @param {unknown} raw
+ */
+export function normalizeMatchingCapabilities(raw) {
+  const value = /** @type {any} */ (
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  );
+  return {
+    read: value.read === true,
+    manage: value.manage === true,
+    recompute: value.recompute === true,
+    decide: value.decide === true
+  };
+}
+
 /** @param {unknown} value */
 export function isUuid(value) {
   return typeof value === 'string' && UUID_PATTERN.test(value);

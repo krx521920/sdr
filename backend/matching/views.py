@@ -8,7 +8,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from common.permissions import HasOrgContext, HasSalesAccess
+from common.models import MatchingAccessLevel
+from common.permissions import HasOrgContext
 from matching.decisions import MatchDecisionError, apply_match_decision
 from matching.models import (
     Evidence,
@@ -20,10 +21,12 @@ from matching.models import (
     Person,
     PersonIdentity,
 )
+from matching.permissions import HasMatchingAccess, matching_capabilities
 from matching.serializers import (
     AsyncRecomputeMatchesSerializer,
     EvidenceSerializer,
     MatchDecisionEventSerializer,
+    MatchingCapabilitiesSerializer,
     MatchOpportunitySerializer,
     MatchRevisionSerializer,
     MatchRunSerializer,
@@ -40,7 +43,8 @@ from matching.services import (
 
 
 class MatchingAPIView(APIView):
-    permission_classes = (IsAuthenticated, HasOrgContext, HasSalesAccess)
+    permission_classes = (IsAuthenticated, HasOrgContext, HasMatchingAccess)
+    matching_access_by_method = {}
 
     @staticmethod
     def limit(request):
@@ -66,6 +70,11 @@ class MatchingAPIView(APIView):
 
 
 class PersonListCreateView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "POST": MatchingAccessLevel.MANAGE,
+    }
+
     def get(self, request):
         queryset = (
             Person.objects.filter(org=request.org)
@@ -95,6 +104,11 @@ class PersonListCreateView(MatchingAPIView):
 
 
 class PersonDetailView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "PATCH": MatchingAccessLevel.MANAGE,
+    }
+
     @staticmethod
     def get_object(request, person_id):
         return (
@@ -126,6 +140,11 @@ class PersonDetailView(MatchingAPIView):
 
 
 class PersonIdentityListCreateView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "POST": MatchingAccessLevel.MANAGE,
+    }
+
     def get(self, request):
         queryset = PersonIdentity.objects.filter(org=request.org).select_related(
             "person"
@@ -149,6 +168,11 @@ class PersonIdentityListCreateView(MatchingAPIView):
 
 
 class EvidenceListCreateView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "POST": MatchingAccessLevel.MANAGE,
+    }
+
     def get(self, request):
         queryset = Evidence.objects.filter(org=request.org).select_related("person")
         for field in ("person", "source", "kind"):
@@ -170,6 +194,11 @@ class EvidenceListCreateView(MatchingAPIView):
 
 
 class MatchOpportunityListCreateView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "POST": MatchingAccessLevel.MANAGE,
+    }
+
     def get(self, request):
         queryset = (
             MatchOpportunity.objects.filter(org=request.org)
@@ -202,6 +231,11 @@ class MatchOpportunityListCreateView(MatchingAPIView):
 
 
 class MatchOpportunityDetailView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "PATCH": MatchingAccessLevel.MANAGE,
+    }
+
     @staticmethod
     def get_object(request, opportunity_id):
         return (
@@ -243,6 +277,11 @@ class MatchOpportunityDetailView(MatchingAPIView):
 
 
 class OpportunityMatchListRecomputeView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "POST": MatchingAccessLevel.RECOMPUTE,
+    }
+
     @staticmethod
     def get_opportunity(request, opportunity_id):
         return MatchOpportunity.objects.filter(
@@ -270,6 +309,8 @@ class OpportunityMatchListRecomputeView(MatchingAPIView):
 
 
 class OpportunityRecomputeView(MatchingAPIView):
+    matching_access_by_method = {"POST": MatchingAccessLevel.RECOMPUTE}
+
     def post(self, request, opportunity_id):
         opportunity = MatchOpportunity.objects.filter(
             org=request.org,
@@ -317,6 +358,8 @@ class OpportunityRecomputeView(MatchingAPIView):
 
 
 class MatchRunDetailView(MatchingAPIView):
+    matching_access_by_method = {"GET": MatchingAccessLevel.READ}
+
     def get(self, request, run_id):
         run = (
             MatchRun.objects.filter(org=request.org, id=run_id)
@@ -329,6 +372,8 @@ class MatchRunDetailView(MatchingAPIView):
 
 
 class OpportunityMatchRunListView(MatchingAPIView):
+    matching_access_by_method = {"GET": MatchingAccessLevel.READ}
+
     def get(self, request, opportunity_id):
         if not MatchOpportunity.objects.filter(
             org=request.org,
@@ -358,6 +403,11 @@ class OpportunityMatchRunListView(MatchingAPIView):
 
 
 class MatchDetailView(MatchingAPIView):
+    matching_access_by_method = {
+        "GET": MatchingAccessLevel.READ,
+        "PATCH": MatchingAccessLevel.DECIDE,
+    }
+
     @staticmethod
     def get_object(request, match_id):
         return (
@@ -414,6 +464,8 @@ class MatchDetailView(MatchingAPIView):
 
 
 class MatchRevisionListView(MatchingAPIView):
+    matching_access_by_method = {"GET": MatchingAccessLevel.READ}
+
     def get(self, request, match_id):
         if not Match.objects.filter(org=request.org, id=match_id).exists():
             return Response(status=status.HTTP_404_NOT_FOUND)
@@ -425,6 +477,8 @@ class MatchRevisionListView(MatchingAPIView):
 
 
 class MatchDecisionEventListView(MatchingAPIView):
+    matching_access_by_method = {"GET": MatchingAccessLevel.READ}
+
     def get(self, request, match_id):
         if not Match.objects.filter(org=request.org, id=match_id).exists():
             return Response(status=status.HTTP_404_NOT_FOUND)
@@ -433,3 +487,15 @@ class MatchDecisionEventListView(MatchingAPIView):
             match_id=match_id,
         )
         return self.list_response(queryset, MatchDecisionEventSerializer, request)
+
+
+class MatchingCapabilitiesView(APIView):
+    """Return the current profile's effective matching capabilities."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext)
+
+    def get(self, request):
+        serializer = MatchingCapabilitiesSerializer(
+            matching_capabilities(request.profile)
+        )
+        return Response(serializer.data)

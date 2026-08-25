@@ -4,6 +4,7 @@ from matching.views import (
     EvidenceListCreateView,
     MatchDecisionEventListView,
     MatchDetailView,
+    MatchingCapabilitiesView,
     MatchOpportunityDetailView,
     MatchOpportunityListCreateView,
     MatchRevisionListView,
@@ -19,6 +20,11 @@ from matching.views import (
 app_name = "api_matching"
 
 urlpatterns = [
+    path(
+        "capabilities/",
+        MatchingCapabilitiesView.as_view(),
+        name="capabilities",
+    ),
     path("people/", PersonListCreateView.as_view(), name="person_list_create"),
     path("people/<uuid:person_id>/", PersonDetailView.as_view(), name="person_detail"),
     path(

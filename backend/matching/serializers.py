@@ -27,6 +27,13 @@ from matching.services import (
 )
 
 
+class MatchingCapabilitiesSerializer(serializers.Serializer):
+    read = serializers.BooleanField(read_only=True)
+    manage = serializers.BooleanField(read_only=True)
+    recompute = serializers.BooleanField(read_only=True)
+    decide = serializers.BooleanField(read_only=True)
+
+
 def _validate_string_list(value, field_name):
     if not isinstance(value, list):
         raise serializers.ValidationError(f"{field_name} must be a list of strings.")
