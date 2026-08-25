@@ -1,5 +1,7 @@
 """Tenant-isolated API views for people, evidence, opportunities, and matches."""
 
+from uuid import UUID
+
 from django.db.models import Count
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -7,17 +9,34 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.permissions import HasOrgContext, HasSalesAccess
-from matching.models import Evidence, Match, MatchOpportunity, Person, PersonIdentity
+from matching.decisions import MatchDecisionError, apply_match_decision
+from matching.models import (
+    Evidence,
+    Match,
+    MatchDecisionEvent,
+    MatchOpportunity,
+    MatchRevision,
+    MatchRun,
+    Person,
+    PersonIdentity,
+)
 from matching.serializers import (
+    AsyncRecomputeMatchesSerializer,
     EvidenceSerializer,
+    MatchDecisionEventSerializer,
     MatchOpportunitySerializer,
+    MatchRevisionSerializer,
+    MatchRunSerializer,
     MatchSerializer,
     MatchStatusSerializer,
     PersonIdentitySerializer,
     PersonSerializer,
-    RecomputeMatchesSerializer,
 )
-from matching.services import MAX_SYNC_RECOMPUTE_PEOPLE, recompute_opportunity_matches
+from matching.services import (
+    RecomputeEnqueueError,
+    RecomputeIdempotencyConflict,
+    enqueue_opportunity_recompute,
+)
 
 
 class MatchingAPIView(APIView):
@@ -245,63 +264,96 @@ class OpportunityMatchListRecomputeView(MatchingAPIView):
         return self.list_response(queryset, MatchSerializer, request)
 
     def post(self, request, opportunity_id):
-        opportunity = self.get_opportunity(request, opportunity_id)
+        # Compatibility path for early matching clients. All ranking writes now
+        # flow through the durable, audited background-run endpoint.
+        return OpportunityRecomputeView().post(request, opportunity_id)
+
+
+class OpportunityRecomputeView(MatchingAPIView):
+    def post(self, request, opportunity_id):
+        opportunity = MatchOpportunity.objects.filter(
+            org=request.org,
+            id=opportunity_id,
+        ).first()
         if opportunity is None:
             return Response(status=status.HTTP_404_NOT_FOUND)
-        serializer = RecomputeMatchesSerializer(
+
+        raw_key = request.headers.get("Idempotency-Key", "").strip()
+        try:
+            idempotency_key = UUID(raw_key)
+        except (TypeError, ValueError):
+            return Response(
+                {"idempotency_key": ["A valid UUID Idempotency-Key is required."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = AsyncRecomputeMatchesSerializer(
             data=request.data,
             context={"org": request.org},
         )
         serializer.is_valid(raise_exception=True)
-        person_ids = serializer.validated_data.get("person_ids")
-        if person_ids is None:
-            active_people = Person.objects.filter(org=request.org, status="active")
-            active_people_count = active_people[
-                : MAX_SYNC_RECOMPUTE_PEOPLE + 1
-            ].count()
-            if active_people_count > MAX_SYNC_RECOMPUTE_PEOPLE:
-                return Response(
-                    {
-                        "person_ids": [
-                            "Synchronous recompute is limited to "
-                            f"{MAX_SYNC_RECOMPUTE_PEOPLE} people; provide an explicit subset."
-                        ]
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        people = (
-            Person.objects.filter(org=request.org, id__in=person_ids)
-            if person_ids is not None
-            else None
-        )
         try:
-            matches = recompute_opportunity_matches(
+            run = enqueue_opportunity_recompute(
                 org=request.org,
                 opportunity=opportunity,
-                people=people,
+                requested_by=request.profile,
+                person_ids=serializer.validated_data.get("person_ids"),
+                idempotency_key=idempotency_key,
             )
-        except ValueError as exc:
+        except RecomputeIdempotencyConflict as exc:
+            return Response(
+                {"idempotency_key": [str(exc)]},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except RecomputeEnqueueError as exc:
             return Response(
                 {"person_ids": [str(exc)]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        match_ids = [item.id for item in matches]
-        matches = (
-            Match.objects.filter(org=request.org, id__in=match_ids)
-            .select_related("person", "opportunity")
-            .prefetch_related("evidence_links__evidence")
+        return Response(
+            MatchRunSerializer(run, context={"request": request}).data,
+            status=status.HTTP_202_ACCEPTED,
+            headers={"Retry-After": "2"},
         )
-        ordered = sorted(matches, key=lambda item: item.rank or 0)
+
+
+class MatchRunDetailView(MatchingAPIView):
+    def get(self, request, run_id):
+        run = (
+            MatchRun.objects.filter(org=request.org, id=run_id)
+            .select_related("automation_job", "opportunity", "requested_by")
+            .first()
+        )
+        if run is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(MatchRunSerializer(run, context={"request": request}).data)
+
+
+class OpportunityMatchRunListView(MatchingAPIView):
+    def get(self, request, opportunity_id):
+        if not MatchOpportunity.objects.filter(
+            org=request.org,
+            id=opportunity_id,
+        ).exists():
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        queryset = MatchRun.objects.filter(
+            org=request.org,
+            opportunity_id=opportunity_id,
+        ).select_related("automation_job", "opportunity", "requested_by")
+        try:
+            limit = min(max(int(request.query_params.get("limit", 50)), 1), 100)
+            offset = max(int(request.query_params.get("offset", 0)), 0)
+        except (TypeError, ValueError):
+            limit, offset = 50, 0
+        count = queryset.count()
         return Response(
             {
-                "count": len(ordered),
-                "results": MatchSerializer(
-                    ordered,
+                "count": count,
+                "results": MatchRunSerializer(
+                    queryset[offset : offset + limit],
                     many=True,
-                    context={"org": request.org},
+                    context={"request": request},
                 ).data,
-            },
-            status=status.HTTP_200_OK,
+            }
         )
 
 
@@ -322,11 +374,62 @@ class MatchDetailView(MatchingAPIView):
         return Response(MatchSerializer(match, context={"org": request.org}).data)
 
     def patch(self, request, match_id):
-        match = self.get_object(request, match_id)
-        if match is None:
+        if self.get_object(request, match_id) is None:
             return Response(status=status.HTTP_404_NOT_FOUND)
         serializer = MatchStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        match.status = serializer.validated_data["status"]
-        match.save(update_fields=["status", "updated_at", "updated_by"])
+        header_key = request.headers.get("Idempotency-Key", "").strip()
+        body_key = serializer.validated_data.get("idempotency_key", "")
+        if header_key and body_key and header_key != body_key:
+            return Response(
+                {"idempotency_key": ["Header and body keys must match."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        idempotency_key = header_key or body_key
+        if not idempotency_key:
+            return Response(
+                {"idempotency_key": ["Idempotency-Key is required."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = apply_match_decision(
+                org=request.org,
+                match_id=match_id,
+                to_status=serializer.validated_data["status"],
+                expected_decision_revision=serializer.validated_data[
+                    "expected_revision"
+                ],
+                expected_ranking_revision=serializer.validated_data[
+                    "expected_ranking_revision"
+                ],
+                reason_code=serializer.validated_data["reason_code"],
+                reason=serializer.validated_data["reason"],
+                actor=request.profile,
+                idempotency_key=idempotency_key,
+            )
+        except MatchDecisionError as exc:
+            return Response(exc.as_dict(), status=exc.status_code)
+        match = self.get_object(request, result.match.id)
         return Response(MatchSerializer(match, context={"org": request.org}).data)
+
+
+class MatchRevisionListView(MatchingAPIView):
+    def get(self, request, match_id):
+        if not Match.objects.filter(org=request.org, id=match_id).exists():
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        queryset = MatchRevision.objects.filter(
+            org=request.org,
+            match_id=match_id,
+        )
+        return self.list_response(queryset, MatchRevisionSerializer, request)
+
+
+class MatchDecisionEventListView(MatchingAPIView):
+    def get(self, request, match_id):
+        if not Match.objects.filter(org=request.org, id=match_id).exists():
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        queryset = MatchDecisionEvent.objects.filter(
+            org=request.org,
+            match_id=match_id,
+        )
+        return self.list_response(queryset, MatchDecisionEventSerializer, request)

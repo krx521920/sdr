@@ -110,6 +110,9 @@ ORG_SCOPED_TABLES = [
     "matching_opportunity",
     "matching_match",
     "matching_match_evidence",
+    "matching_match_run",
+    "matching_match_revision",
+    "matching_match_decision_event",
     # Boards (Kanban)
     "board",
     "board_column",

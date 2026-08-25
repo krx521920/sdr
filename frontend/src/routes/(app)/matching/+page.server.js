@@ -1,4 +1,5 @@
 import { error, fail } from '@sveltejs/kit';
+import { randomUUID } from 'node:crypto';
 
 import { apiRequest } from '$lib/api-helpers.js';
 import {
@@ -8,10 +9,13 @@ import {
   isDecisionStatus,
   isUuid,
   normalizeMatch,
+  normalizeMatchRun,
   normalizeOpportunity,
   parseWorkbenchFilters
 } from '$lib/matching/workbench.js';
 import { logSafeServerError } from '$lib/server/safe-error-log.js';
+
+const DECISION_REASON_CODES = new Set(['needs_review', 'strong_fit', 'approved', 'not_a_fit']);
 
 function requireOrg(locals) {
   if (!locals.user?.id || !locals.org?.id) {
@@ -49,18 +53,58 @@ export async function load({ cookies, locals, url }) {
 
     let matches = [];
     let totalMatches = 0;
+    let runHistory = [];
+    let currentRun = null;
     if (selectedOpportunity) {
       const matchParams = new URLSearchParams({ limit: '500' });
       if (filters.matchStatus) matchParams.set('status', filters.matchStatus);
-      const matchResponse = await apiRequest(
-        `/matching/opportunities/${selectedOpportunity.id}/matches/?${matchParams}`,
-        {},
-        { cookies, org: locals.org }
-      );
+      const [matchResponse, runHistoryResponse] = await Promise.all([
+        apiRequest(
+          `/matching/opportunities/${selectedOpportunity.id}/matches/?${matchParams}`,
+          {},
+          { cookies, org: locals.org }
+        ),
+        apiRequest(
+          `/matching/opportunities/${selectedOpportunity.id}/match-runs/?limit=10`,
+          {},
+          { cookies, org: locals.org }
+        ).catch((requestError) => {
+          logSafeServerError('Matching run history load failed', requestError);
+          return { results: [] };
+        })
+      ]);
       totalMatches = Number(matchResponse?.count) || 0;
       matches = Array.isArray(matchResponse?.results)
         ? matchResponse.results.map(normalizeMatch)
         : [];
+      runHistory = Array.isArray(runHistoryResponse?.results)
+        ? runHistoryResponse.results.map(normalizeMatchRun).filter((run) => run.id)
+        : [];
+
+      currentRun =
+        runHistory.find((run) => run.id === filters.run) ||
+        runHistory.find((run) =>
+          ['pending', 'queued', 'running', 'retry_scheduled'].includes(run.status)
+        ) ||
+        runHistory[0] ||
+        null;
+
+      if (filters.run && currentRun?.id !== filters.run) {
+        try {
+          const requestedRun = normalizeMatchRun(
+            await apiRequest(
+              `/matching/match-runs/${filters.run}/`,
+              {},
+              { cookies, org: locals.org }
+            )
+          );
+          if (requestedRun.id && requestedRun.opportunityId === selectedOpportunity.id) {
+            currentRun = requestedRun;
+          }
+        } catch (requestError) {
+          logSafeServerError('Requested matching run load failed', requestError);
+        }
+      }
     }
 
     return {
@@ -69,6 +113,8 @@ export async function load({ cookies, locals, url }) {
       selectedOpportunity,
       matches,
       totalMatches,
+      runHistory,
+      currentRun,
       filters,
       counts: {
         proposed: matches.filter((match) => match.status === 'proposed').length,
@@ -97,14 +143,24 @@ export const actions = {
     }
 
     try {
+      const submittedKey = String(form.get('idempotency_key') || '');
+      const idempotencyKey = isUuid(submittedKey) ? submittedKey : randomUUID();
       const result = await apiRequest(
-        `/matching/opportunities/${opportunityId}/matches/`,
-        { method: 'POST', body: {} },
+        `/matching/opportunities/${opportunityId}/recompute/`,
+        {
+          method: 'POST',
+          headers: { 'Idempotency-Key': idempotencyKey },
+          body: { idempotency_key: idempotencyKey }
+        },
         { cookies, org: locals.org }
       );
+      const run = normalizeMatchRun(result);
+      if (!run.id || run.opportunityId !== opportunityId) {
+        return fail(502, { actionError: 'The recompute run could not be started safely.' });
+      }
       return {
-        recomputed: true,
-        recomputedCount: Number(result?.count) || 0
+        recomputeQueued: true,
+        run
       };
     } catch (requestError) {
       logSafeServerError('Matching recompute failed', requestError);
@@ -123,14 +179,41 @@ export const actions = {
     const form = await request.formData();
     const matchId = String(form.get('match_id') || '');
     const status = String(form.get('status') || '');
-    if (!isUuid(matchId) || !isDecisionStatus(status)) {
+    const reasonCode = String(form.get('reason_code') || '');
+    const reason = String(form.get('reason') || '')
+      .trim()
+      .slice(0, 1000);
+    const expectedRevision = Number(form.get('expected_revision'));
+    const expectedRankingRevision = Number(form.get('expected_ranking_revision'));
+    if (
+      !isUuid(matchId) ||
+      !isDecisionStatus(status) ||
+      !DECISION_REASON_CODES.has(reasonCode) ||
+      !Number.isSafeInteger(expectedRevision) ||
+      expectedRevision < 0 ||
+      !Number.isSafeInteger(expectedRankingRevision) ||
+      expectedRankingRevision < 0
+    ) {
       return fail(400, { actionError: 'The match decision is invalid.' });
     }
 
     try {
+      const submittedKey = String(form.get('idempotency_key') || '');
+      const idempotencyKey = isUuid(submittedKey) ? submittedKey : randomUUID();
       const updated = await apiRequest(
         `/matching/matches/${matchId}/`,
-        { method: 'PATCH', body: { status } },
+        {
+          method: 'PATCH',
+          headers: { 'Idempotency-Key': idempotencyKey },
+          body: {
+            status,
+            reason_code: reasonCode,
+            reason,
+            expected_revision: expectedRevision,
+            expected_ranking_revision: expectedRankingRevision,
+            idempotency_key: idempotencyKey
+          }
+        },
         { cookies, org: locals.org }
       );
       return {
@@ -140,6 +223,13 @@ export const actions = {
     } catch (requestError) {
       logSafeServerError('Matching decision update failed', requestError);
       const requestErrorStatus = requestStatus(requestError);
+      if (requestErrorStatus === 409) {
+        return fail(409, {
+          conflict: true,
+          actionError:
+            'This candidate changed while you were reviewing it. Review the latest version and try again.'
+        });
+      }
       return fail(
         requestErrorStatus === 401 || requestErrorStatus === 403 ? requestErrorStatus : 400,
         {

@@ -1,8 +1,7 @@
 <script>
   import { enhance } from '$app/forms';
-  import { goto } from '$app/navigation';
+  import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/stores';
-  import { tick } from 'svelte';
   import { toast } from 'svelte-sonner';
   import {
     Activity,
@@ -25,10 +24,19 @@
   import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
+  import * as Dialog from '$lib/components/ui/dialog/index.js';
   import { SearchInput, SelectFilter } from '$lib/components/ui/filter';
   import { Progress } from '$lib/components/ui/progress/index.js';
   import * as Sheet from '$lib/components/ui/sheet/index.js';
-  import { scoreLabel } from '$lib/matching/workbench.js';
+  import { Textarea } from '$lib/components/ui/textarea/index.js';
+  import {
+    decisionTargetsForStatus,
+    isMatchRunActive,
+    isMatchRunSkipped,
+    isMatchRunSuccessful,
+    isMatchRunTerminal,
+    scoreLabel
+  } from '$lib/matching/workbench.js';
 
   let { data } = $props();
 
@@ -56,21 +64,50 @@
     { value: 'rejected', label: 'Rejected' },
     { value: 'expired', label: 'Expired' }
   ];
+  const decisionReasonCodes = {
+    reviewing: 'needs_review',
+    shortlisted: 'strong_fit',
+    accepted: 'approved',
+    rejected: 'not_a_fit'
+  };
 
   let selectedMatchId = $state(/** @type {string | null} */ (null));
   let evidenceSheetOpen = $state(false);
   let recomputeDialogOpen = $state(false);
+  let decisionDialogOpen = $state(false);
   let recomputing = $state(false);
   let decisionBusyId = $state(/** @type {string | null} */ (null));
   let pendingDecision = $state('');
+  let pendingReasonCode = $state('');
+  let decisionReason = $state('');
+  let recomputeIdempotencyKey = $state('');
+  let decisionIdempotencyKey = $state('');
   let liveMessage = $state('');
+  let polledRun = $state(/** @type {any} */ (null));
+  let polledRunHistory = $state(/** @type {any[]} */ ([]));
+  let pollFailures = $state(0);
+  let handledTerminalRunId = $state('');
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let pollTimer = null;
+  let pollInFlight = false;
   /** @type {HTMLFormElement} */
   let recomputeForm;
-  /** @type {HTMLFormElement} */
-  let statusForm;
 
   const selectedMatch = $derived(
     data.matches.find((match) => match.id === selectedMatchId) || data.matches[0] || null
+  );
+  const currentRun = $derived(
+    polledRun?.opportunityId === data.selectedOpportunity?.id ? polledRun : data.currentRun
+  );
+  const runHistory = $derived(
+    polledRunHistory.length > 0 ? polledRunHistory : data.runHistory || []
+  );
+  const runActive = $derived(isMatchRunActive(currentRun));
+  const recomputeBusy = $derived(recomputing || runActive);
+  const activeRunKey = $derived(
+    runActive && data.selectedOpportunity?.id && currentRun?.id
+      ? `${data.selectedOpportunity.id}:${currentRun.id}`
+      : ''
   );
   const activeFilterCount = $derived(
     [data.filters.q, data.filters.status, data.filters.type, data.filters.matchStatus].filter(
@@ -96,18 +133,27 @@
     }
     // The destination is the current URL object, so it already includes any configured base path.
     // eslint-disable-next-line svelte/no-navigation-without-resolve
-    goto(url, { keepFocus: true, noScroll: true });
+    return goto(url, { keepFocus: true, noScroll: true, replaceState: true });
   }
 
   /** @param {string} id */
   function selectOpportunity(id) {
     selectedMatchId = null;
     evidenceSheetOpen = false;
-    updateQuery({ opportunity: id });
+    polledRun = null;
+    polledRunHistory = [];
+    updateQuery({ opportunity: id, run: null });
   }
 
   function clearFilters() {
-    updateQuery({ q: null, status: null, type: null, match_status: null, opportunity: null });
+    updateQuery({
+      q: null,
+      status: null,
+      type: null,
+      match_status: null,
+      opportunity: null,
+      run: null
+    });
   }
 
   /** @param {any} match */
@@ -122,26 +168,40 @@
   }
 
   /** @param {string} status */
-  async function submitDecision(status) {
+  function openDecision(status) {
     if (!selectedMatch || decisionBusyId) return;
+    if (!decisionTargetsForStatus(selectedMatch.status).includes(status)) return;
     pendingDecision = status;
-    decisionBusyId = selectedMatch.id;
-    liveMessage = `Saving ${status} decision for ${selectedMatch.personName}.`;
-    await tick();
-    statusForm.requestSubmit();
+    pendingReasonCode = decisionReasonCodes[status] || '';
+    decisionReason = '';
+    decisionIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    decisionDialogOpen = true;
+  }
+
+  function openRecompute() {
+    recomputeIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    recomputeDialogOpen = true;
   }
 
   function recomputeEnhance() {
     recomputing = true;
-    liveMessage = 'Recomputing candidates. Please wait.';
+    liveMessage = 'Queueing candidate ranking. Please wait.';
     return async ({ result, update }) => {
       recomputing = false;
       const actionData = /** @type {any} */ (result).data;
-      if (result.type === 'success') {
-        const count = Number(actionData?.recomputedCount) || 0;
-        liveMessage = `Candidate ranking recomputed. ${count} candidates evaluated.`;
-        toast.success(`Recomputed ${count} candidates`);
-        await update({ reset: false });
+      if (result.type === 'success' && actionData?.run?.id) {
+        recomputeDialogOpen = false;
+        recomputeIdempotencyKey = '';
+        polledRun = actionData.run;
+        polledRunHistory = [
+          actionData.run,
+          ...runHistory.filter((run) => run.id !== actionData.run.id)
+        ].slice(0, 10);
+        handledTerminalRunId = '';
+        liveMessage = 'Candidate ranking was queued and will update in the background.';
+        toast.success('Candidate ranking queued');
+        await update({ reset: false, invalidateAll: false });
+        await updateQuery({ run: actionData.run.id });
       } else {
         liveMessage = actionData?.actionError || 'Candidates could not be recomputed.';
         toast.error(liveMessage);
@@ -150,21 +210,103 @@
   }
 
   function statusEnhance() {
+    if (!selectedMatch) return;
+    decisionBusyId = selectedMatch.id;
+    liveMessage = `Saving ${pendingDecision} decision for ${selectedMatch.personName}.`;
     return async ({ result, update }) => {
       const actionData = /** @type {any} */ (result).data;
       const personName = selectedMatch?.personName || 'candidate';
       decisionBusyId = null;
       if (result.type === 'success') {
+        decisionDialogOpen = false;
         liveMessage = `${personName} is now ${pendingDecision}.`;
         toast.success(`Decision saved: ${pendingDecision}`);
         await update({ reset: false });
+        pendingDecision = '';
+        pendingReasonCode = '';
+        decisionReason = '';
+        decisionIdempotencyKey = '';
+      } else if (actionData?.conflict) {
+        liveMessage = actionData.actionError;
+        toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
+        await invalidateAll();
+        decisionDialogOpen = true;
       } else {
         liveMessage = actionData?.actionError || 'The decision could not be saved.';
         toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
       }
-      pendingDecision = '';
     };
   }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollRunStatus() {
+    if (pollInFlight || !currentRun?.id || !data.selectedOpportunity?.id) return;
+    pollInFlight = true;
+    try {
+      const params = new URLSearchParams({
+        run: currentRun.id,
+        opportunity: data.selectedOpportunity.id,
+        _: String(Date.now())
+      });
+      const response = await fetch(`/api/matching-run-poll?${params}`);
+      if (!response.ok) throw new Error('poll unavailable');
+      const result = await response.json();
+      if (!result.run?.id) throw new Error('run unavailable');
+      polledRun = result.run;
+      if (Array.isArray(result.runs)) polledRunHistory = result.runs;
+      pollFailures = 0;
+
+      if (isMatchRunTerminal(result.run)) {
+        stopPolling();
+        if (handledTerminalRunId !== result.run.id) {
+          handledTerminalRunId = result.run.id;
+          if (isMatchRunSkipped(result.run)) {
+            liveMessage =
+              'Candidate ranking was skipped because the opportunity is no longer active.';
+            toast.info('Ranking skipped');
+            await invalidateAll();
+          } else if (isMatchRunSuccessful(result.run)) {
+            const count = Number(result.run.resultCount) || 0;
+            liveMessage = `Candidate ranking completed. ${count} candidates ranked.`;
+            toast.success(`Ranking completed: ${count} candidates`);
+            await invalidateAll();
+          } else {
+            const errorCode = result.run.errorCode || 'MATCH_RECOMPUTE_FAILED';
+            liveMessage = `Candidate ranking stopped. Error code: ${errorCode}.`;
+            toast.error(`Ranking failed: ${errorCode}`);
+          }
+        }
+      }
+    } catch {
+      pollFailures += 1;
+      if (pollFailures === 3) {
+        liveMessage = 'Ranking status is temporarily unavailable. Retrying.';
+      }
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    pollRunStatus();
+    pollTimer = setInterval(pollRunStatus, 3000);
+  }
+
+  $effect(() => {
+    const key = activeRunKey;
+    if (key) startPolling();
+    else stopPolling();
+    return () => stopPolling();
+  });
 
   /** @param {string} value */
   function label(value) {
@@ -223,14 +365,14 @@
       <Button
         size="sm"
         class="gap-1.5"
-        disabled={!data.selectedOpportunity || recomputing}
-        aria-busy={recomputing}
-        onclick={() => (recomputeDialogOpen = true)}
+        disabled={!data.selectedOpportunity || recomputeBusy}
+        aria-busy={recomputeBusy}
+        onclick={openRecompute}
       >
         <RefreshCw
-          class="size-3.5 {recomputing ? 'animate-spin motion-reduce:animate-none' : ''}"
+          class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
         />
-        {recomputing ? 'Recomputing…' : 'Recompute candidates'}
+        {runActive ? 'Ranking in progress…' : recomputing ? 'Queueing…' : 'Recompute candidates'}
       </Button>
     {/snippet}
   </PageHeader>
@@ -239,20 +381,20 @@
     <SearchInput
       value={data.filters.q}
       placeholder="Search opportunities…"
-      onchange={(value) => updateQuery({ q: value, opportunity: null })}
+      onchange={(value) => updateQuery({ q: value, opportunity: null, run: null })}
       class="w-full sm:w-56"
     />
     <SelectFilter
       options={opportunityStatusOptions}
       value={data.filters.status || 'ALL'}
       allLabel="All opportunity statuses"
-      onchange={(value) => updateQuery({ status: String(value), opportunity: null })}
+      onchange={(value) => updateQuery({ status: String(value), opportunity: null, run: null })}
     />
     <SelectFilter
       options={opportunityTypeOptions}
       value={data.filters.type || 'ALL'}
       allLabel="All opportunity types"
-      onchange={(value) => updateQuery({ type: String(value), opportunity: null })}
+      onchange={(value) => updateQuery({ type: String(value), opportunity: null, run: null })}
     />
     <SelectFilter
       options={matchStatusOptions}
@@ -402,6 +544,94 @@
             {/if}
           </section>
 
+          {#if currentRun}
+            <section
+              class="border-b border-[color:var(--border-faint)] bg-[color:var(--bg-card)] px-5 py-3 md:px-6"
+              aria-labelledby="ranking-run-title"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0">
+                  <h3 id="ranking-run-title" class="text-xs font-semibold text-[color:var(--text)]">
+                    Ranking run
+                    {#if currentRun.rankingRevision > 0}
+                      · version {currentRun.rankingRevision}
+                    {/if}
+                  </h3>
+                  <p class="mt-0.5 text-[11px] text-[color:var(--text-subtle)]">
+                    {label(currentRun.status || currentRun.outcome)} · created {formatDate(
+                      currentRun.createdAt
+                    )}
+                    {#if currentRun.engineVersion}
+                      · engine {currentRun.engineVersion}{/if}
+                  </p>
+                </div>
+                <Badge variant="outline">{label(currentRun.status || currentRun.outcome)}</Badge>
+              </div>
+
+              {#if runActive}
+                <div class="mt-3">
+                  <div
+                    class="mb-1 flex items-center justify-between text-xs text-[color:var(--text-muted)]"
+                  >
+                    <span
+                      >{currentRun.processedCount} of {currentRun.totalCount || '…'} processed</span
+                    >
+                    <span class="tabular-nums">{currentRun.progress}%</span>
+                  </div>
+                  <Progress
+                    value={currentRun.progress}
+                    max={100}
+                    aria-label="Ranking progress: {currentRun.progress}%"
+                    class="h-1.5"
+                  />
+                  {#if pollFailures >= 3}
+                    <p class="mt-2 text-xs text-[color:var(--amber-soft-text)]">
+                      Status connection interrupted; retrying automatically.
+                    </p>
+                  {/if}
+                </div>
+              {:else if isMatchRunSkipped(currentRun)}
+                <p class="mt-3 text-xs text-[color:var(--text-muted)]">
+                  Skipped because the opportunity is paused, filled, or closed.
+                </p>
+              {:else if isMatchRunSuccessful(currentRun)}
+                <p class="mt-2 text-xs text-[color:var(--green-soft-text)]">
+                  Completed with {currentRun.resultCount} ranked candidates.
+                </p>
+              {:else if isMatchRunTerminal(currentRun)}
+                <p class="mt-2 flex items-center gap-1.5 text-xs text-[color:var(--red)]">
+                  <CircleAlert class="size-3.5" />Ranking stopped. Error code:
+                  <code>{currentRun.errorCode || 'MATCH_RECOMPUTE_FAILED'}</code>
+                </p>
+              {/if}
+
+              {#if runHistory.length > 0}
+                <details class="mt-3 text-xs text-[color:var(--text-muted)]">
+                  <summary
+                    class="cursor-pointer rounded-sm font-medium focus-visible:ring-2 focus-visible:ring-[color:var(--focus-ring)] focus-visible:outline-none"
+                  >
+                    Recent ranking versions ({runHistory.length})
+                  </summary>
+                  <ol class="mt-2 grid gap-1 sm:grid-cols-2">
+                    {#each runHistory as run (run.id)}
+                      <li
+                        class="flex items-center justify-between gap-3 rounded-md border border-[color:var(--border-faint)] px-2.5 py-2"
+                      >
+                        <span class="min-w-0 truncate">
+                          {run.rankingRevision > 0
+                            ? `Version ${run.rankingRevision}`
+                            : 'Pending version'}
+                          · {label(run.status || run.outcome)}
+                        </span>
+                        <span class="shrink-0 tabular-nums">{run.resultCount} results</span>
+                      </li>
+                    {/each}
+                  </ol>
+                </details>
+              {/if}
+            </section>
+          {/if}
+
           {#if data.matches.length === 0}
             <section class="flex flex-col items-center justify-center px-6 py-20 text-center">
               <Users class="size-9 text-[color:var(--text-subtle)]" />
@@ -411,7 +641,9 @@
               <p class="mt-1 max-w-md text-sm text-[color:var(--text-muted)]">
                 {data.filters.matchStatus
                   ? 'No candidates have this decision status.'
-                  : 'Run an explicit recompute when people and evidence are ready.'}
+                  : runActive
+                    ? 'Candidate ranking is running in the background.'
+                    : 'Run an explicit recompute when people and evidence are ready.'}
               </p>
             </section>
           {:else}
@@ -534,40 +766,61 @@
           >
         </div>
       </div>
-      <div class="mt-4 grid grid-cols-2 gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={decisionBusyId === match.id || match.status === 'reviewing'}
-          onclick={() => submitDecision('reviewing')}
+      {#if decisionTargetsForStatus(match.status).length > 0}
+        <div class="mt-4 grid grid-cols-2 gap-2">
+          {#if decisionTargetsForStatus(match.status).includes('reviewing')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('reviewing')}
+            >
+              <Activity />Review
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('shortlisted')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('shortlisted')}
+            >
+              <Sparkles />Shortlist
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('accepted')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('accepted')}
+            >
+              <Check />Accept
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('rejected')}
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('rejected')}
+            >
+              <X />Reject
+            </Button>
+          {/if}
+        </div>
+      {:else}
+        <p class="mt-4 text-xs text-[color:var(--text-subtle)]">
+          This decision is final. No further manual transition is available.
+        </p>
+      {/if}
+      {#if match.decisionReason}
+        <p
+          class="mt-3 rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
         >
-          <Activity />Review
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={decisionBusyId === match.id || match.status === 'shortlisted'}
-          onclick={() => submitDecision('shortlisted')}
-        >
-          <Sparkles />Shortlist
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={decisionBusyId === match.id || match.status === 'accepted'}
-          onclick={() => submitDecision('accepted')}
-        >
-          <Check />Accept
-        </Button>
-        <Button
-          size="sm"
-          variant="destructive"
-          disabled={decisionBusyId === match.id || match.status === 'rejected'}
-          onclick={() => submitDecision('rejected')}
-        >
-          <X />Reject
-        </Button>
-      </div>
+          Decision note: {match.decisionReason}
+        </p>
+      {/if}
     </div>
 
     <div class="flex-1 space-y-6 overflow-y-auto px-5 py-5">
@@ -699,6 +952,9 @@
         Evaluated <time datetime={match.evaluatedAt}>{formatDate(match.evaluatedAt)}</time>
         {#if match.engineVersion}
           · Engine {match.engineVersion}{/if}
+        {#if match.rankingRevision > 0}
+          · Ranking version {match.rankingRevision}{/if}
+        · Decision revision {match.decisionRevision}
       </p>
     </div>
   </div>
@@ -724,15 +980,15 @@
     <AlertDialog.Header>
       <AlertDialog.Title>Recompute candidate ranking?</AlertDialog.Title>
       <AlertDialog.Description>
-        This explicitly evaluates up to 100 active people for “{data.selectedOpportunity?.title ||
-          'this opportunity'}” and replaces generated scores and evidence links. Larger groups
-        require the upcoming background job. Human review statuses are preserved.
+        This queues a background ranking run for “{data.selectedOpportunity?.title ||
+          'this opportunity'}”. Progress and safe failure codes will appear here. Human review
+        decisions are preserved.
       </AlertDialog.Description>
     </AlertDialog.Header>
     <AlertDialog.Footer>
-      <AlertDialog.Cancel disabled={recomputing}>Cancel</AlertDialog.Cancel>
-      <AlertDialog.Action disabled={recomputing} onclick={() => recomputeForm.requestSubmit()}>
-        Recompute
+      <AlertDialog.Cancel disabled={recomputeBusy}>Cancel</AlertDialog.Cancel>
+      <AlertDialog.Action disabled={recomputeBusy} onclick={() => recomputeForm.requestSubmit()}>
+        Queue recompute
       </AlertDialog.Action>
     </AlertDialog.Footer>
   </AlertDialog.Content>
@@ -746,15 +1002,71 @@
   class="hidden"
 >
   <input type="hidden" name="opportunity_id" value={data.selectedOpportunity?.id || ''} />
+  <input type="hidden" name="idempotency_key" value={recomputeIdempotencyKey} />
 </form>
 
-<form
-  method="POST"
-  action="?/setStatus"
-  bind:this={statusForm}
-  use:enhance={statusEnhance}
-  class="hidden"
->
-  <input type="hidden" name="match_id" value={selectedMatch?.id || ''} />
-  <input type="hidden" name="status" value={pendingDecision} />
-</form>
+<Dialog.Root bind:open={decisionDialogOpen}>
+  <Dialog.Content class="sm:max-w-md">
+    <Dialog.Header>
+      <Dialog.Title
+        >{label(pendingDecision)} {selectedMatch?.personName || 'candidate'}?</Dialog.Title
+      >
+      <Dialog.Description>
+        This records an auditable decision against decision revision {selectedMatch?.decisionRevision ||
+          0} and ranking version {selectedMatch?.rankingRevision || 0}. If either changed, you will
+        be asked to review the latest version.
+      </Dialog.Description>
+    </Dialog.Header>
+
+    <form method="POST" action="?/setStatus" use:enhance={statusEnhance} class="space-y-4">
+      <input type="hidden" name="match_id" value={selectedMatch?.id || ''} />
+      <input type="hidden" name="status" value={pendingDecision} />
+      <input type="hidden" name="reason_code" value={pendingReasonCode} />
+      <input type="hidden" name="expected_revision" value={selectedMatch?.decisionRevision || 0} />
+      <input
+        type="hidden"
+        name="expected_ranking_revision"
+        value={selectedMatch?.rankingRevision || 0}
+      />
+      <input type="hidden" name="idempotency_key" value={decisionIdempotencyKey} />
+
+      <div
+        class="rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
+      >
+        Reason category: <span class="font-semibold text-[color:var(--text)]"
+          >{label(pendingReasonCode)}</span
+        >
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="matching-decision-reason" class="text-xs font-medium text-[color:var(--text)]">
+          Decision note <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        </label>
+        <Textarea
+          id="matching-decision-reason"
+          name="reason"
+          bind:value={decisionReason}
+          maxlength={1000}
+          placeholder="Add concise context for the next reviewer…"
+        />
+        <p class="text-right text-[11px] text-[color:var(--text-subtle)] tabular-nums">
+          {decisionReason.length}/1000
+        </p>
+      </div>
+
+      <Dialog.Footer>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={decisionBusyId === selectedMatch?.id}
+          onclick={() => (decisionDialogOpen = false)}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={!pendingReasonCode || decisionBusyId === selectedMatch?.id}>
+          {decisionBusyId === selectedMatch?.id ? 'Saving…' : 'Confirm decision'}
+        </Button>
+      </Dialog.Footer>
+    </form>
+  </Dialog.Content>
+</Dialog.Root>

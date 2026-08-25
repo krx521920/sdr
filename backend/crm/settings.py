@@ -573,6 +573,7 @@ AUTOMATION_JOB_HANDLERS = {
     "sdr.process_outbound_prospect": "sdr.outbound.process_outbound_prospect_job",
     "sdr.sync_outbound_source": "sdr.sources.process_outbound_source_sync_job",
     "sdr.generate_outbound_copy": "sdr.outbound_copy.process_outbound_copy_job",
+    "matching.recompute_opportunity": "matching.jobs.process_recompute_opportunity_job",
 }
 INBOUND_EMAIL_ROUTE_HANDLERS = {
     "sdr": "sdr.email.enqueue_inbound_email",

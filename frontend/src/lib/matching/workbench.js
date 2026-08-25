@@ -19,6 +19,17 @@ export const MATCH_STATUSES = [
   'expired'
 ];
 export const DECISION_STATUSES = ['proposed', 'reviewing', 'shortlisted', 'accepted', 'rejected'];
+export const MATCH_RUN_ACTIVE_STATUSES = ['pending', 'queued', 'running', 'retry_scheduled'];
+export const MATCH_RUN_TERMINAL_STATUSES = ['succeeded', 'failed', 'dead_letter', 'cancelled'];
+
+const DECISION_TARGETS = {
+  proposed: ['reviewing', 'shortlisted', 'rejected'],
+  reviewing: ['shortlisted', 'rejected'],
+  shortlisted: ['reviewing', 'accepted', 'rejected'],
+  accepted: [],
+  rejected: [],
+  expired: []
+};
 
 /** @param {unknown} value */
 export function isUuid(value) {
@@ -35,6 +46,7 @@ export function parseWorkbenchFilters(searchParams) {
   const type = String(searchParams.get('type') || '').toLowerCase();
   const matchStatus = String(searchParams.get('match_status') || '').toLowerCase();
   const opportunity = String(searchParams.get('opportunity') || '');
+  const run = String(searchParams.get('run') || '');
 
   return {
     q: String(searchParams.get('q') || '')
@@ -43,7 +55,8 @@ export function parseWorkbenchFilters(searchParams) {
     status: OPPORTUNITY_STATUSES.includes(status) ? status : '',
     type: OPPORTUNITY_TYPES.includes(type) ? type : '',
     matchStatus: MATCH_STATUSES.includes(matchStatus) ? matchStatus : '',
-    opportunity: isUuid(opportunity) ? opportunity : ''
+    opportunity: isUuid(opportunity) ? opportunity : '',
+    run: isUuid(run) ? run : ''
   };
 }
 
@@ -158,13 +171,85 @@ export function normalizeMatch(raw) {
     gaps: safeExplanations(raw?.gaps, 'missing'),
     evaluatedAt: safeDateString(raw?.evaluated_at),
     engineVersion: String(raw?.engine_version || ''),
+    rankingRevision: safeInteger(raw?.ranking_revision),
+    decisionRevision: safeInteger(raw?.decision_revision),
+    decisionReason: String(raw?.decision_reason || '').slice(0, 1000),
+    decidedAt: safeDateString(raw?.decided_at),
     evidenceLinks: sanitizeEvidenceLinks(raw?.evidence_links)
   };
+}
+
+/**
+ * Keep the automation envelope out of the browser. Only the safe MatchRun
+ * contract is copied, so payloads, raw results and error messages are dropped.
+ *
+ * @param {any} raw
+ */
+export function normalizeMatchRun(raw) {
+  const totalCount = safeInteger(raw?.total_count);
+  const processedCount = Math.min(
+    totalCount || Number.MAX_SAFE_INTEGER,
+    safeInteger(raw?.processed_count)
+  );
+  const status = String(raw?.status || '').toLowerCase();
+  const outcome = String(raw?.outcome || '').toLowerCase();
+  return {
+    id: isUuid(String(raw?.id || '')) ? String(raw.id) : '',
+    opportunityId: isUuid(String(raw?.opportunity || '')) ? String(raw.opportunity) : '',
+    status: [...MATCH_RUN_ACTIVE_STATUSES, ...MATCH_RUN_TERMINAL_STATUSES].includes(status)
+      ? status
+      : '',
+    outcome: ['succeeded', 'skipped'].includes(outcome) ? outcome : '',
+    totalCount,
+    processedCount,
+    resultCount: safeInteger(raw?.result_count),
+    progress: totalCount > 0 ? Math.min(100, Math.round((processedCount / totalCount) * 100)) : 0,
+    rankingRevision: safeInteger(raw?.ranking_revision),
+    engineVersion: String(raw?.engine_version || '').slice(0, 64),
+    startedAt: safeDateString(raw?.started_at),
+    completedAt: safeDateString(raw?.completed_at),
+    errorCode: safeErrorCode(raw?.error_code),
+    createdAt: safeDateString(raw?.created_at),
+    updatedAt: safeDateString(raw?.updated_at)
+  };
+}
+
+/** @param {any} run */
+export function isMatchRunActive(run) {
+  return Boolean(run?.id) && MATCH_RUN_ACTIVE_STATUSES.includes(run.status);
+}
+
+/** @param {any} run */
+export function isMatchRunTerminal(run) {
+  return (
+    Boolean(run?.id) &&
+    (MATCH_RUN_TERMINAL_STATUSES.includes(run.status) ||
+      ['succeeded', 'skipped'].includes(run.outcome))
+  );
+}
+
+/** @param {any} run */
+export function isMatchRunSuccessful(run) {
+  return (
+    Boolean(run?.id) &&
+    run.outcome !== 'skipped' &&
+    (run.status === 'succeeded' || run.outcome === 'succeeded')
+  );
+}
+
+/** @param {any} run */
+export function isMatchRunSkipped(run) {
+  return Boolean(run?.id) && run.outcome === 'skipped';
 }
 
 /** @param {unknown} value */
 export function isDecisionStatus(value) {
   return typeof value === 'string' && DECISION_STATUSES.includes(value);
+}
+
+/** @param {unknown} currentStatus */
+export function decisionTargetsForStatus(currentStatus) {
+  return [...(DECISION_TARGETS[String(currentStatus)] || [])];
 }
 
 /** @param {unknown} value */
@@ -200,6 +285,13 @@ function safeRatio(value) {
 /** @param {unknown} value */
 function safeDateString(value) {
   return typeof value === 'string' ? value : '';
+}
+
+/** @param {unknown} value */
+function safeErrorCode(value) {
+  return String(value || '')
+    .replace(/[^a-z0-9_.:-]/gi, '')
+    .slice(0, 80);
 }
 
 /** @param {unknown} value */

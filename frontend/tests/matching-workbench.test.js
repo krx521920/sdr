@@ -4,15 +4,22 @@ import assert from 'node:assert/strict';
 import {
   buildOpportunityQuery,
   chooseOpportunity,
+  decisionTargetsForStatus,
   filterOpportunities,
   isDecisionStatus,
+  isMatchRunActive,
+  isMatchRunSkipped,
+  isMatchRunSuccessful,
+  isMatchRunTerminal,
   normalizeMatch,
+  normalizeMatchRun,
   parseWorkbenchFilters,
   scoreLabel
 } from '../src/lib/matching/workbench.js';
 
 const OPEN_ID = '10000000-0000-4000-8000-000000000001';
 const DRAFT_ID = '10000000-0000-4000-8000-000000000002';
+const RUN_ID = '10000000-0000-4000-8000-000000000003';
 
 test('parses only bounded URL filter values and valid UUID selections', () => {
   const parsed = parseWorkbenchFilters(
@@ -21,7 +28,8 @@ test('parses only bounded URL filter values and valid UUID selections', () => {
       status: 'OPEN',
       type: 'employment',
       match_status: 'shortlisted',
-      opportunity: OPEN_ID
+      opportunity: OPEN_ID,
+      run: RUN_ID
     })
   );
 
@@ -29,6 +37,7 @@ test('parses only bounded URL filter values and valid UUID selections', () => {
   assert.equal(parsed.type, 'employment');
   assert.equal(parsed.matchStatus, 'shortlisted');
   assert.equal(parsed.opportunity, OPEN_ID);
+  assert.equal(parsed.run, RUN_ID);
   assert.equal(parsed.q.length, 100);
 
   const rejected = parseWorkbenchFilters(
@@ -39,7 +48,8 @@ test('parses only bounded URL filter values and valid UUID selections', () => {
     status: '',
     type: '',
     matchStatus: '',
-    opportunity: ''
+    opportunity: '',
+    run: ''
   });
 });
 
@@ -91,6 +101,10 @@ test('normalizes matches without exposing raw evidence or identity fields', () =
     },
     status: 'shortlisted',
     overall_score: 91,
+    ranking_revision: 4,
+    decision_revision: 2,
+    decision_reason: 'Strong evidence and confirmed interest.',
+    decided_at: '2026-08-25T01:00:00Z',
     evidence_links: [
       {
         id: 'link',
@@ -123,6 +137,9 @@ test('normalizes matches without exposing raw evidence or identity fields', () =
     availability: 'open_to_offers'
   });
   assert.equal(normalized.personName, 'Alice Zhang');
+  assert.equal(normalized.rankingRevision, 4);
+  assert.equal(normalized.decisionRevision, 2);
+  assert.equal(normalized.decisionReason, 'Strong evidence and confirmed interest.');
   assert.equal(normalized.evidenceLinks[0].evidence.summary, 'Delivered a Python project.');
   const serialized = JSON.stringify(normalized);
   assert.equal(serialized.includes('source_uri'), false);
@@ -130,6 +147,79 @@ test('normalizes matches without exposing raw evidence or identity fields', () =
   assert.equal(serialized.includes('facts'), false);
   assert.equal(serialized.includes('private@example.com'), false);
   assert.equal(serialized.includes('source_record_id'), false);
+});
+
+test('normalizes safe match-run progress without exposing automation internals', () => {
+  const normalized = normalizeMatchRun({
+    id: RUN_ID,
+    opportunity: OPEN_ID,
+    status: 'running',
+    outcome: '',
+    total_count: 40,
+    processed_count: 55,
+    result_count: null,
+    ranking_revision: null,
+    engine_version: 'rules-v2',
+    started_at: '2026-08-25T00:00:00Z',
+    error_code: 'WORKER_TIMEOUT',
+    payload: { person_ids: ['private-person'] },
+    result: { raw_matches: ['private-match'] },
+    last_error_message: 'raw worker traceback',
+    created_at: '2026-08-25T00:00:00Z',
+    updated_at: '2026-08-25T00:01:00Z'
+  });
+
+  assert.equal(normalized.processedCount, 40);
+  assert.equal(normalized.progress, 100);
+  assert.equal(normalized.errorCode, 'WORKER_TIMEOUT');
+  assert.equal(isMatchRunActive(normalized), true);
+  assert.equal(isMatchRunTerminal(normalized), false);
+  const serialized = JSON.stringify(normalized);
+  assert.equal(serialized.includes('person_ids'), false);
+  assert.equal(serialized.includes('private-person'), false);
+  assert.equal(serialized.includes('private-match'), false);
+  assert.equal(serialized.includes('raw worker traceback'), false);
+  assert.equal(serialized.includes('payload'), false);
+});
+
+test('classifies terminal runs from status or outcome', () => {
+  const succeeded = normalizeMatchRun({
+    id: RUN_ID,
+    opportunity: OPEN_ID,
+    status: 'succeeded',
+    outcome: 'succeeded'
+  });
+  assert.equal(isMatchRunActive(succeeded), false);
+  assert.equal(isMatchRunTerminal(succeeded), true);
+  assert.equal(isMatchRunSuccessful(succeeded), true);
+
+  const failed = normalizeMatchRun({
+    id: RUN_ID,
+    opportunity: OPEN_ID,
+    status: 'dead_letter',
+    outcome: 'failed'
+  });
+  assert.equal(isMatchRunTerminal(failed), true);
+  assert.equal(isMatchRunSuccessful(failed), false);
+
+  const skipped = normalizeMatchRun({
+    id: RUN_ID,
+    opportunity: OPEN_ID,
+    status: 'succeeded',
+    outcome: 'skipped'
+  });
+  assert.equal(isMatchRunTerminal(skipped), true);
+  assert.equal(isMatchRunSkipped(skipped), true);
+  assert.equal(isMatchRunSuccessful(skipped), false);
+});
+
+test('limits human decision targets to the backend transition matrix', () => {
+  assert.deepEqual(decisionTargetsForStatus('proposed'), ['reviewing', 'shortlisted', 'rejected']);
+  assert.deepEqual(decisionTargetsForStatus('reviewing'), ['shortlisted', 'rejected']);
+  assert.deepEqual(decisionTargetsForStatus('shortlisted'), ['reviewing', 'accepted', 'rejected']);
+  assert.deepEqual(decisionTargetsForStatus('accepted'), []);
+  assert.deepEqual(decisionTargetsForStatus('rejected'), []);
+  assert.deepEqual(decisionTargetsForStatus('expired'), []);
 });
 
 test('limits human decisions and labels score boundaries', () => {

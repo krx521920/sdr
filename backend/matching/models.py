@@ -92,6 +92,16 @@ class MatchEvidenceDirection(models.TextChoices):
     NEUTRAL = "neutral", "Neutral"
 
 
+class MatchRunOutcome(models.TextChoices):
+    SUCCEEDED = "succeeded", "Succeeded"
+    SKIPPED = "skipped", "Skipped"
+
+
+class MatchRevisionKind(models.TextChoices):
+    EVALUATION = "evaluation", "Evaluation"
+    RERANK = "rerank", "Rerank"
+
+
 def default_scoring_weights():
     return {
         "skills": 45,
@@ -270,6 +280,7 @@ class MatchOpportunity(BaseOrgModel):
     preferred_criteria = models.JSONField(default=dict)
     exclusion_criteria = models.JSONField(default=dict)
     scoring_weights = models.JSONField(default=default_scoring_weights)
+    ranking_revision = models.PositiveBigIntegerField(default=0)
     owner = models.ForeignKey(
         "common.Profile",
         on_delete=models.SET_NULL,
@@ -355,6 +366,17 @@ class Match(BaseOrgModel):
     model_provider = models.CharField(max_length=40, blank=True)
     model_name = models.CharField(max_length=120, blank=True)
     evaluated_at = models.DateTimeField(default=timezone.now)
+    ranking_revision = models.PositiveBigIntegerField(default=0)
+    decision_revision = models.PositiveBigIntegerField(default=0)
+    decision_reason = models.TextField(blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.SET_NULL,
+        related_name="decided_matches",
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         db_table = "matching_match"
@@ -381,6 +403,227 @@ class Match(BaseOrgModel):
 
     def __str__(self):
         return f"{self.person_id}->{self.opportunity_id}:{self.overall_score}"
+
+
+class MatchRun(BaseOrgModel):
+    """One tenant-owned synchronous or asynchronous ranking execution."""
+
+    opportunity = models.ForeignKey(
+        MatchOpportunity,
+        on_delete=models.PROTECT,
+        related_name="match_runs",
+    )
+    automation_job = models.OneToOneField(
+        "automation.AutomationJob",
+        on_delete=models.PROTECT,
+        related_name="match_run",
+        null=True,
+        blank=True,
+    )
+    requested_by = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.SET_NULL,
+        related_name="requested_match_runs",
+        null=True,
+        blank=True,
+    )
+    request_hash = models.CharField(max_length=64)
+    requested_person_ids = models.JSONField(default=list)
+    total_count = models.PositiveIntegerField(default=0)
+    processed_count = models.PositiveIntegerField(default=0)
+    result_count = models.PositiveIntegerField(null=True, blank=True)
+    ranking_revision = models.PositiveBigIntegerField(null=True, blank=True)
+    engine_version = models.CharField(max_length=64, default="rules-v1")
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    outcome = models.CharField(
+        max_length=16,
+        choices=MatchRunOutcome.choices,
+        blank=True,
+        default="",
+    )
+
+    class Meta:
+        db_table = "matching_match_run"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["org", "opportunity", "-created_at"]),
+            models.Index(fields=["org", "outcome", "-created_at"]),
+            models.Index(fields=["org", "request_hash"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.opportunity_id and self.org_id:
+            if self.opportunity.org_id != self.org_id:
+                raise ValidationError("Match run opportunity must belong to the same org")
+        if self.automation_job_id and self.org_id:
+            if self.automation_job.org_id != self.org_id:
+                raise ValidationError("Match run job must belong to the same org")
+        if self.requested_by_id and self.org_id:
+            if self.requested_by.org_id != self.org_id:
+                raise ValidationError("Match run requester must belong to the same org")
+        if self.processed_count > self.total_count:
+            raise ValidationError("processed_count cannot exceed total_count")
+        if self.completed_at and self.started_at and self.completed_at < self.started_at:
+            raise ValidationError("completed_at cannot precede started_at")
+
+    def __str__(self):
+        return f"{self.opportunity_id}:{self.request_hash}"
+
+
+class AppendOnlyQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Append-only matching history cannot be updated")
+
+    def delete(self):
+        raise ValidationError("Append-only matching history cannot be deleted")
+
+
+class AppendOnlyManager(models.Manager.from_queryset(AppendOnlyQuerySet)):
+    pass
+
+
+class AppendOnlyHistoryMixin:
+    """Application-layer guard; PostgreSQL migrations add the database guard."""
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Append-only matching history cannot be updated")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Append-only matching history cannot be deleted")
+
+
+class MatchRevision(AppendOnlyHistoryMixin, BaseOrgModel):
+    """Immutable machine-generated snapshot for one match and ranking run."""
+
+    match = models.ForeignKey(
+        Match,
+        on_delete=models.PROTECT,
+        related_name="revisions",
+    )
+    run = models.ForeignKey(
+        MatchRun,
+        on_delete=models.PROTECT,
+        related_name="revisions",
+    )
+    revision = models.PositiveBigIntegerField()
+    revision_kind = models.CharField(
+        max_length=16,
+        choices=MatchRevisionKind.choices,
+        default=MatchRevisionKind.EVALUATION,
+    )
+    snapshot = models.JSONField(default=dict)
+    evidence_snapshot = models.JSONField(default=list)
+    engine_version = models.CharField(max_length=64, default="rules-v1")
+    evaluated_at = models.DateTimeField(default=timezone.now)
+
+    objects = AppendOnlyManager()
+
+    class Meta:
+        db_table = "matching_match_revision"
+        ordering = ("-revision",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["match", "run"],
+                name="unique_matching_revision_per_run",
+            ),
+            models.UniqueConstraint(
+                fields=["match", "revision"],
+                name="unique_matching_revision_number",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["org", "run", "revision"]),
+            models.Index(fields=["org", "match", "-revision"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if not (self.org_id and self.match_id and self.run_id):
+            return
+        if self.match.org_id != self.org_id or self.run.org_id != self.org_id:
+            raise ValidationError("Match revision must belong to the same org")
+        if self.match.opportunity_id != self.run.opportunity_id:
+            raise ValidationError("Match revision run must target the match opportunity")
+
+    def __str__(self):
+        return f"{self.match_id}:r{self.revision}"
+
+
+class MatchDecisionEvent(AppendOnlyHistoryMixin, BaseOrgModel):
+    """Immutable human decision transition for a current Match projection."""
+
+    match = models.ForeignKey(
+        Match,
+        on_delete=models.PROTECT,
+        related_name="decision_events",
+    )
+    from_status = models.CharField(max_length=24, choices=MatchStatus.choices)
+    to_status = models.CharField(max_length=24, choices=MatchStatus.choices)
+    reason_code = models.CharField(max_length=64)
+    reason = models.TextField(blank=True)
+    expected_decision_revision = models.PositiveBigIntegerField()
+    resulting_decision_revision = models.PositiveBigIntegerField()
+    based_on_ranking_revision = models.PositiveBigIntegerField(default=0)
+    actor = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.PROTECT,
+        related_name="match_decision_events",
+        null=True,
+        blank=True,
+    )
+    idempotency_key = models.CharField(max_length=128)
+
+    objects = AppendOnlyManager()
+
+    class Meta:
+        db_table = "matching_match_decision_event"
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "match", "resulting_decision_revision"],
+                name="unique_matching_decision_revision",
+            ),
+            models.UniqueConstraint(
+                fields=["org", "idempotency_key"],
+                name="unique_matching_decision_idempotency",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    resulting_decision_revision=models.F(
+                        "expected_decision_revision"
+                    )
+                    + 1
+                ),
+                name="matching_decision_revision_increments",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(from_status=models.F("to_status")),
+                name="matching_decision_changes_status",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(reason_code=""),
+                name="matching_decision_reason_code_present",
+            ),
+        ]
+        indexes = [models.Index(fields=["org", "match", "-created_at"])]
+
+    def clean(self):
+        super().clean()
+        if self.match_id and self.org_id and self.match.org_id != self.org_id:
+            raise ValidationError("Match decision must belong to the same org")
+        if self.actor_id and self.org_id and self.actor.org_id != self.org_id:
+            raise ValidationError("Match decision actor must belong to the same org")
+        if not self.reason_code.strip():
+            raise ValidationError("reason_code is required")
+        if self.resulting_decision_revision != self.expected_decision_revision + 1:
+            raise ValidationError("Decision revision must increment by one")
+
+    def __str__(self):
+        return f"{self.match_id}:{self.from_status}->{self.to_status}"
 
 
 class MatchEvidence(BaseOrgModel):

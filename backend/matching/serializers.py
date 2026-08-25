@@ -9,15 +9,22 @@ from common.models import Profile
 from matching.models import (
     Evidence,
     Match,
+    MatchDecisionEvent,
     MatchEvidence,
     MatchOpportunity,
     MatchOpportunityStatus,
+    MatchRevision,
+    MatchRun,
     MatchStatus,
     Person,
     PersonIdentity,
     PersonIdentityKind,
 )
-from matching.services import MAX_SYNC_RECOMPUTE_PEOPLE, SUPPORTED_DIMENSIONS
+from matching.services import (
+    MAX_ASYNC_RECOMPUTE_PEOPLE,
+    MAX_SYNC_RECOMPUTE_PEOPLE,
+    SUPPORTED_DIMENSIONS,
+)
 
 
 def _validate_string_list(value, field_name):
@@ -402,6 +409,10 @@ class MatchSerializer(serializers.ModelSerializer):
             "model_provider",
             "model_name",
             "evaluated_at",
+            "ranking_revision",
+            "decision_revision",
+            "decision_reason",
+            "decided_at",
             "evidence_links",
             "created_at",
             "updated_at",
@@ -411,6 +422,58 @@ class MatchSerializer(serializers.ModelSerializer):
 
 class MatchStatusSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=MatchStatus.choices)
+    expected_revision = serializers.IntegerField(min_value=0)
+    expected_ranking_revision = serializers.IntegerField(min_value=0)
+    reason_code = serializers.CharField(max_length=64, trim_whitespace=True)
+    reason = serializers.CharField(
+        max_length=1000,
+        trim_whitespace=True,
+        allow_blank=True,
+        required=False,
+        default="",
+    )
+    idempotency_key = serializers.CharField(
+        max_length=128,
+        trim_whitespace=True,
+        required=False,
+        allow_blank=True,
+    )
+
+
+class MatchRevisionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MatchRevision
+        fields = (
+            "id",
+            "match",
+            "run",
+            "revision",
+            "revision_kind",
+            "snapshot",
+            "evidence_snapshot",
+            "engine_version",
+            "evaluated_at",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
+class MatchDecisionEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MatchDecisionEvent
+        fields = (
+            "id",
+            "match",
+            "from_status",
+            "to_status",
+            "reason_code",
+            "reason",
+            "expected_decision_revision",
+            "resulting_decision_revision",
+            "based_on_ranking_revision",
+            "created_at",
+        )
+        read_only_fields = fields
 
 
 class RecomputeMatchesSerializer(OrgRelatedSerializerMixin, serializers.Serializer):
@@ -434,3 +497,66 @@ class RecomputeMatchesSerializer(OrgRelatedSerializerMixin, serializers.Serializ
                 f"Unknown people for this org: {', '.join(missing)}"
             )
         return values
+
+
+class AsyncRecomputeMatchesSerializer(
+    OrgRelatedSerializerMixin, serializers.Serializer
+):
+    person_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=False,
+        max_length=MAX_ASYNC_RECOMPUTE_PEOPLE,
+    )
+
+    def validate_person_ids(self, values):
+        values = list(dict.fromkeys(values))
+        found = set(
+            Person.objects.filter(
+                org=self.org(),
+                status="active",
+                id__in=values,
+            ).values_list("id", flat=True)
+        )
+        missing = [str(value) for value in values if value not in found]
+        if missing:
+            raise serializers.ValidationError(
+                "Every requested person must be active and belong to this org."
+            )
+        return values
+
+
+class MatchRunSerializer(serializers.ModelSerializer):
+    job_id = serializers.UUIDField(source="automation_job.id", read_only=True)
+    status = serializers.CharField(source="automation_job.status", read_only=True)
+    error_code = serializers.CharField(
+        source="automation_job.last_error_code",
+        read_only=True,
+    )
+    status_url = serializers.SerializerMethodField()
+
+    @staticmethod
+    def get_status_url(obj):
+        return f"/api/matching/match-runs/{obj.id}/"
+
+    class Meta:
+        model = MatchRun
+        fields = (
+            "id",
+            "opportunity",
+            "job_id",
+            "status",
+            "error_code",
+            "status_url",
+            "total_count",
+            "processed_count",
+            "result_count",
+            "ranking_revision",
+            "engine_version",
+            "started_at",
+            "completed_at",
+            "outcome",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
