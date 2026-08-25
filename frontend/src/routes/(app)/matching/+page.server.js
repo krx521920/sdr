@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { apiRequest } from '$lib/api-helpers.js';
 import {
+  buildCreateOpportunityPayload,
   buildOpportunityQuery,
   chooseOpportunity,
   filterOpportunities,
@@ -158,6 +159,72 @@ export async function load({ cookies, locals, url }) {
 
 /** @type {import('./$types').Actions} */
 export const actions = {
+  createOpportunity: async ({ request, cookies, locals }) => {
+    requireOrg(locals);
+    let permissions;
+    try {
+      permissions = await getMatchingPermissions(cookies, locals);
+    } catch (requestError) {
+      logSafeServerError('Matching opportunity permission check failed', requestError);
+      const status = requestStatus(requestError);
+      return fail(status === 401 || status === 403 ? status : 503, {
+        actionError: 'Opportunity permission could not be verified.'
+      });
+    }
+    if (!permissions.manage) {
+      return fail(403, { actionError: 'You do not have permission to create opportunities.' });
+    }
+
+    const form = await request.formData();
+    const parsed = buildCreateOpportunityPayload(form);
+    if (!parsed.payload) {
+      return fail(400, { actionError: parsed.error || 'The opportunity form is invalid.' });
+    }
+
+    try {
+      const created = normalizeOpportunity(
+        await apiRequest(
+          '/matching/opportunities/',
+          { method: 'POST', body: parsed.payload },
+          { cookies, org: locals.org }
+        )
+      );
+      if (!isUuid(created.id)) {
+        return fail(502, { actionError: 'The created opportunity could not be verified.' });
+      }
+      return {
+        opportunityCreated: true,
+        createdOpportunity: created
+      };
+    } catch (requestError) {
+      logSafeServerError('Matching opportunity creation failed', requestError);
+      const status = requestStatus(requestError);
+      if (status === 401 || status === 403) {
+        return fail(status, {
+          actionError: 'You do not have permission to create opportunities.'
+        });
+      }
+      if (status === 400 || status === 422) {
+        return fail(status, {
+          actionError: 'The opportunity could not be created. Review the form and try again.'
+        });
+      }
+      if (status === 409) {
+        return fail(409, {
+          actionError: 'This opportunity conflicts with a recent change. Refresh and try again.'
+        });
+      }
+      if (status === 429) {
+        return fail(429, {
+          actionError: 'Opportunity creation is temporarily rate limited. Try again shortly.'
+        });
+      }
+      return fail(503, {
+        actionError: 'Opportunity creation is temporarily unavailable. Try again shortly.'
+      });
+    }
+  },
+
   recompute: async ({ request, cookies, locals }) => {
     requireOrg(locals);
     let permissions;

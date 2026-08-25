@@ -2,6 +2,7 @@
   import { enhance } from '$app/forms';
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/stores';
+  import { tick } from 'svelte';
   import { toast } from 'svelte-sonner';
   import {
     Activity,
@@ -12,6 +13,7 @@
     Clock,
     Eye,
     MapPin,
+    Plus,
     RefreshCw,
     ShieldCheck,
     Sparkles,
@@ -26,6 +28,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import * as Dialog from '$lib/components/ui/dialog/index.js';
   import { SearchInput, SelectFilter } from '$lib/components/ui/filter';
+  import { Input } from '$lib/components/ui/input/index.js';
   import { Progress } from '$lib/components/ui/progress/index.js';
   import * as Sheet from '$lib/components/ui/sheet/index.js';
   import { Textarea } from '$lib/components/ui/textarea/index.js';
@@ -73,6 +76,7 @@
 
   let selectedMatchId = $state(/** @type {string | null} */ (null));
   let evidenceSheetOpen = $state(false);
+  let createOpportunityDialogOpen = $state(false);
   let recomputeDialogOpen = $state(false);
   let decisionDialogOpen = $state(false);
   let recomputing = $state(false);
@@ -88,6 +92,20 @@
   let pollFailures = $state(0);
   let handledTerminalRunId = $state('');
   let permissionRevoked = $state(false);
+  let creatingOpportunity = $state(false);
+  let createOpportunityError = $state('');
+  let createOpportunityErrorElement = $state(/** @type {HTMLElement | null} */ (null));
+  let opportunityTitle = $state('');
+  let opportunityType = $state('employment');
+  let opportunityStatus = $state('open');
+  let opportunityDescription = $state('');
+  let opportunityOrganization = $state('');
+  let opportunityLocation = $state('');
+  let opportunityRemoteMode = $state('');
+  let opportunityRequiredSkills = $state('');
+  let opportunityPreferredSkills = $state('');
+  let opportunityRequiredTitles = $state('');
+  let opportunityRequiredLocations = $state('');
   /** @type {ReturnType<typeof setInterval> | null} */
   let pollTimer = null;
   let pollInFlight = false;
@@ -193,6 +211,70 @@
     recomputeDialogOpen = true;
   }
 
+  function resetOpportunityForm() {
+    createOpportunityError = '';
+    opportunityTitle = '';
+    opportunityType = 'employment';
+    opportunityStatus = 'open';
+    opportunityDescription = '';
+    opportunityOrganization = '';
+    opportunityLocation = '';
+    opportunityRemoteMode = '';
+    opportunityRequiredSkills = '';
+    opportunityPreferredSkills = '';
+    opportunityRequiredTitles = '';
+    opportunityRequiredLocations = '';
+  }
+
+  function openCreateOpportunity() {
+    if (!canManage || creatingOpportunity) return;
+    resetOpportunityForm();
+    createOpportunityDialogOpen = true;
+  }
+
+  function createOpportunityEnhance() {
+    creatingOpportunity = true;
+    createOpportunityError = '';
+    liveMessage = 'Creating matching opportunity.';
+    return async ({ result, update }) => {
+      const actionData = /** @type {any} */ (result).data;
+      creatingOpportunity = false;
+      if (result.type === 'success' && actionData?.createdOpportunity?.id) {
+        const opportunity = actionData.createdOpportunity;
+        createOpportunityDialogOpen = false;
+        resetOpportunityForm();
+        liveMessage = `${opportunity.title} was created.`;
+        toast.success('Matching opportunity created');
+        await update({ reset: false, invalidateAll: false });
+        const url = new URL($page.url);
+        for (const key of ['q', 'status', 'type', 'match_status', 'run']) {
+          url.searchParams.delete(key);
+        }
+        url.searchParams.set('opportunity', opportunity.id);
+        // A newly created resource is a distinct navigation, so preserve the
+        // previous workbench state in browser history instead of replacing it.
+        // eslint-disable-next-line svelte/no-navigation-without-resolve
+        await goto(url, { noScroll: true });
+      } else {
+        const accessChanged = result.status === 401 || result.status === 403;
+        createOpportunityError =
+          actionData?.actionError || 'The opportunity could not be created.';
+        liveMessage = createOpportunityError;
+        toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
+        if (accessChanged) {
+          permissionRevoked = true;
+          createOpportunityDialogOpen = false;
+          recomputeDialogOpen = false;
+          decisionDialogOpen = false;
+        } else {
+          await tick();
+          createOpportunityErrorElement?.focus();
+        }
+      }
+    };
+  }
+
   function recomputeEnhance() {
     recomputing = true;
     liveMessage = 'Queueing candidate ranking. Please wait.';
@@ -271,6 +353,8 @@
         stopPolling();
         if (!permissionRevoked) {
           permissionRevoked = true;
+          creatingOpportunity = false;
+          createOpportunityDialogOpen = false;
           recomputeDialogOpen = false;
           decisionDialogOpen = false;
           liveMessage = 'Your matching access changed. Ranking updates have stopped.';
@@ -383,23 +467,41 @@
     subtitle="Place the right person into the right opportunity with evidence-backed ranking"
   >
     {#snippet actions()}
-      {#if canRecompute}
-        <Button
-          size="sm"
-          class="gap-1.5"
-          disabled={!data.selectedOpportunity || recomputeBusy}
-          aria-busy={recomputeBusy}
-          onclick={openRecompute}
-        >
-          <RefreshCw
-            class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
-          />
-          {runActive ? 'Ranking in progress…' : recomputing ? 'Queueing…' : 'Recompute candidates'}
-        </Button>
-      {:else if permissionRevoked}
+      {#if permissionRevoked}
         <Badge variant="outline">Access changed</Badge>
-      {:else if canManage}
-        <Badge variant="outline">Manage access</Badge>
+      {:else if canManage || canRecompute}
+        <div class="flex flex-wrap items-center gap-2">
+          {#if canManage}
+            <Button
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+              disabled={creatingOpportunity}
+              onclick={openCreateOpportunity}
+            >
+              <Plus class="size-3.5" />
+              New opportunity
+            </Button>
+          {/if}
+          {#if canRecompute}
+            <Button
+              size="sm"
+              class="gap-1.5"
+              disabled={!data.selectedOpportunity || recomputeBusy}
+              aria-busy={recomputeBusy}
+              onclick={openRecompute}
+            >
+              <RefreshCw
+                class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
+              />
+              {runActive
+                ? 'Ranking in progress…'
+                : recomputing
+                  ? 'Queueing…'
+                  : 'Recompute candidates'}
+            </Button>
+          {/if}
+        </div>
       {:else if isReadOnly}
         <Badge variant="outline">Read only</Badge>
       {/if}
@@ -454,8 +556,18 @@
           ? 'No opportunities meet the current filters.'
           : 'Create or import a matching opportunity before ranking people.'}
       </p>
-      {#if activeFilterCount > 0}
-        <Button variant="outline" class="mt-4" onclick={clearFilters}>Clear filters</Button>
+      {#if activeFilterCount > 0 || canManage}
+        <div class="mt-4 flex flex-wrap items-center justify-center gap-2">
+          {#if activeFilterCount > 0}
+            <Button variant="outline" onclick={clearFilters}>Clear filters</Button>
+          {/if}
+          {#if canManage}
+            <Button class="gap-1.5" onclick={openCreateOpportunity}>
+              <Plus class="size-3.5" />
+              Create opportunity
+            </Button>
+          {/if}
+        </div>
       {/if}
     </section>
   {:else}
@@ -992,6 +1104,219 @@
     </div>
   </div>
 {/snippet}
+
+<Dialog.Root bind:open={createOpportunityDialogOpen}>
+  <Dialog.Content class="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+    <Dialog.Header>
+      <Dialog.Title>Create matching opportunity</Dialog.Title>
+      <Dialog.Description>
+        Define the place and its criteria. Candidate ranking remains evidence-backed and starts only
+        when you explicitly queue a recompute.
+      </Dialog.Description>
+    </Dialog.Header>
+
+    <form
+      method="POST"
+      action="?/createOpportunity"
+      use:enhance={createOpportunityEnhance}
+      class="space-y-4"
+      aria-describedby={createOpportunityError ? 'matching-opportunity-error' : undefined}
+    >
+      {#if createOpportunityError}
+        <div
+          id="matching-opportunity-error"
+          bind:this={createOpportunityErrorElement}
+          class="rounded-lg border border-[color:var(--red)] bg-[color:var(--red-soft)] px-3 py-2 text-sm text-[color:var(--red)] outline-none"
+          role="alert"
+          tabindex="-1"
+        >
+          {createOpportunityError}
+        </div>
+      {/if}
+      <div class="space-y-1.5">
+        <label for="matching-opportunity-title" class="text-xs font-medium text-[color:var(--text)]">
+          Title
+        </label>
+        <Input
+          id="matching-opportunity-title"
+          name="title"
+          bind:value={opportunityTitle}
+          maxlength={255}
+          required
+          placeholder="AI growth engineer"
+        />
+      </div>
+
+      <div class="grid gap-4 sm:grid-cols-2">
+        <div class="space-y-1.5">
+          <label for="matching-opportunity-type" class="text-xs font-medium text-[color:var(--text)]">
+            Opportunity type
+          </label>
+          <select
+            id="matching-opportunity-type"
+            name="opportunity_type"
+            bind:value={opportunityType}
+            class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+          >
+            {#each opportunityTypeOptions as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="space-y-1.5">
+          <label for="matching-opportunity-status" class="text-xs font-medium text-[color:var(--text)]">
+            Initial status
+          </label>
+          <select
+            id="matching-opportunity-status"
+            name="status"
+            bind:value={opportunityStatus}
+            class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+          >
+            <option value="open">Open</option>
+            <option value="draft">Draft</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid gap-4 sm:grid-cols-2">
+        <div class="space-y-1.5">
+          <label for="matching-opportunity-organization" class="text-xs font-medium text-[color:var(--text)]">
+            Organization <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+          </label>
+          <Input
+            id="matching-opportunity-organization"
+            name="organization_name"
+            bind:value={opportunityOrganization}
+            maxlength={255}
+            placeholder="BottleCRM"
+          />
+        </div>
+        <div class="space-y-1.5">
+          <label for="matching-opportunity-location" class="text-xs font-medium text-[color:var(--text)]">
+            Location <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+          </label>
+          <Input
+            id="matching-opportunity-location"
+            name="location"
+            bind:value={opportunityLocation}
+            maxlength={255}
+            placeholder="Shanghai"
+          />
+        </div>
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="matching-opportunity-remote" class="text-xs font-medium text-[color:var(--text)]">
+          Work arrangement <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        </label>
+        <select
+          id="matching-opportunity-remote"
+          name="remote_mode"
+          bind:value={opportunityRemoteMode}
+          class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+        >
+          <option value="">Not specified</option>
+          <option value="on_site">On site</option>
+          <option value="hybrid">Hybrid</option>
+          <option value="remote">Remote</option>
+        </select>
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="matching-opportunity-description" class="text-xs font-medium text-[color:var(--text)]">
+          Description <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        </label>
+        <Textarea
+          id="matching-opportunity-description"
+          name="description"
+          bind:value={opportunityDescription}
+          maxlength={5000}
+          rows={4}
+          placeholder="Describe the outcome, responsibilities and context…"
+        />
+      </div>
+
+      <fieldset class="space-y-3 rounded-lg border border-[color:var(--border-faint)] p-4">
+        <legend class="px-1 text-xs font-semibold text-[color:var(--text)]">Matching criteria</legend>
+        <p class="text-xs text-[color:var(--text-muted)]">
+          Separate values with commas or new lines. Missing required criteria cap a candidate at 49.
+        </p>
+        <div class="grid gap-4 sm:grid-cols-2">
+          <div class="space-y-1.5">
+            <label for="matching-required-skills" class="text-xs font-medium text-[color:var(--text)]">
+              Required skills
+            </label>
+            <Textarea
+              id="matching-required-skills"
+              name="required_skills"
+              bind:value={opportunityRequiredSkills}
+              maxlength={4000}
+              rows={3}
+              placeholder="Python, Django, outbound automation"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label for="matching-preferred-skills" class="text-xs font-medium text-[color:var(--text)]">
+              Preferred skills
+            </label>
+            <Textarea
+              id="matching-preferred-skills"
+              name="preferred_skills"
+              bind:value={opportunityPreferredSkills}
+              maxlength={4000}
+              rows={3}
+              placeholder="PostgreSQL, CRM operations"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label for="matching-required-titles" class="text-xs font-medium text-[color:var(--text)]">
+              Required titles
+            </label>
+            <Textarea
+              id="matching-required-titles"
+              name="required_titles"
+              bind:value={opportunityRequiredTitles}
+              maxlength={4000}
+              rows={3}
+              placeholder="Growth engineer, SDR automation specialist"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label for="matching-required-locations" class="text-xs font-medium text-[color:var(--text)]">
+              Required locations
+            </label>
+            <Textarea
+              id="matching-required-locations"
+              name="required_locations"
+              bind:value={opportunityRequiredLocations}
+              maxlength={4000}
+              rows={3}
+              placeholder="Shanghai, Remote"
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <Dialog.Footer>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={creatingOpportunity}
+          onclick={() => (createOpportunityDialogOpen = false)}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          disabled={creatingOpportunity || !canManage || !opportunityTitle.trim()}
+        >
+          {creatingOpportunity ? 'Creating…' : 'Create opportunity'}
+        </Button>
+      </Dialog.Footer>
+    </form>
+  </Dialog.Content>
+</Dialog.Root>
 
 <Sheet.Root bind:open={evidenceSheetOpen}>
   <Sheet.Content

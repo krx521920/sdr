@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildCreateOpportunityPayload,
   buildOpportunityQuery,
   chooseOpportunity,
   decisionTargetsForStatus,
@@ -84,6 +85,51 @@ test('builds only supported server-side opportunity filters', () => {
     buildOpportunityQuery({ status: 'open', type: 'employment', q: 'not-sent' }, 999),
     'limit=500&status=open&type=employment'
   );
+});
+
+test('builds a bounded structured opportunity payload from human-readable criteria', () => {
+  const form = new FormData();
+  form.set('title', '  AI growth engineer  ');
+  form.set('opportunity_type', 'employment');
+  form.set('status', 'open');
+  form.set('description', 'Build evidence-backed outbound systems.');
+  form.set('organization_name', 'BottleCRM');
+  form.set('location', 'Shanghai');
+  form.set('remote_mode', 'hybrid');
+  form.set('required_skills', 'Python, Django\npython');
+  form.set('preferred_skills', 'PostgreSQL; CRM operations');
+  form.set('required_titles', 'Growth engineer');
+  form.set('required_locations', 'Shanghai, Remote');
+
+  assert.deepEqual(buildCreateOpportunityPayload(form), {
+    payload: {
+      opportunity_type: 'employment',
+      status: 'open',
+      title: 'AI growth engineer',
+      description: 'Build evidence-backed outbound systems.',
+      organization_name: 'BottleCRM',
+      location: 'Shanghai',
+      remote_mode: 'hybrid',
+      required_criteria: {
+        skills: ['Python', 'Django'],
+        titles: ['Growth engineer'],
+        locations: ['Shanghai', 'Remote']
+      },
+      preferred_criteria: { skills: ['PostgreSQL', 'CRM operations'] },
+      exclusion_criteria: {}
+    }
+  });
+
+  form.set('opportunity_type', 'administrator');
+  assert.deepEqual(buildCreateOpportunityPayload(form), {
+    error: 'Select a valid opportunity type.'
+  });
+
+  form.set('opportunity_type', 'employment');
+  form.set('required_skills', `${'x'.repeat(121)}, Python`);
+  assert.deepEqual(buildCreateOpportunityPayload(form), {
+    error: 'Each criterion must be at most 120 characters.'
+  });
 });
 
 test('filters opportunities locally and chooses requested, open, then first', () => {

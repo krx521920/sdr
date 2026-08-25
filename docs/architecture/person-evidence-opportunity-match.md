@@ -18,12 +18,15 @@ request, referral, contractor engagement, or partnership.
 - `Match` is the current assessment projection. It contains eligibility, fit,
   trust, relationship, availability, confidence, reasons, gaps, and rank.
 - `MatchEvidence` cites evidence records contributing to the current projection.
-  Immutable runs, revisions, and decision events are not implemented yet and
-  remain required before production decision auditing.
+- `MatchRun` records each durable recompute request and its fixed candidate
+  snapshot. `MatchRevision` stores immutable evaluation or rerank snapshots,
+  while `MatchDecisionEvent` stores immutable reviewer decisions.
 
 Every table owns an `org_id`, is filtered in the API, and has PostgreSQL RLS
 enabled and forced. This gives both application-layer and database-layer tenant
-isolation.
+isolation. Database triggers also reject updates and deletes of match revisions
+and decision events, so audit history is append-only below the application
+layer.
 
 ## Criteria contract
 
@@ -54,29 +57,44 @@ audited independently of the model response.
 
 ## API
 
-All endpoints require authentication, organization context, and sales access.
+All endpoints require authentication and organization context. Matching access
+is fail-closed and separated into `read`, `manage`, `recompute`, and `decide`
+capabilities; organization administrators receive the highest capability.
 
+- `GET /api/matching/capabilities/`
 - `GET/POST /api/matching/people/`
 - `GET/PATCH /api/matching/people/{person_id}/`
 - `GET/POST /api/matching/identities/`
 - `GET/POST /api/matching/evidence/`
 - `GET/POST /api/matching/opportunities/`
 - `GET/PATCH /api/matching/opportunities/{opportunity_id}/`
-- `GET/POST /api/matching/opportunities/{opportunity_id}/matches/`
+- `GET/POST /api/matching/opportunities/{opportunity_id}/matches/` (compatibility
+  recompute entry point)
+- `POST /api/matching/opportunities/{opportunity_id}/recompute/`
+- `GET /api/matching/opportunities/{opportunity_id}/match-runs/`
+- `GET /api/matching/match-runs/{run_id}/`
 - `GET/PATCH /api/matching/matches/{match_id}/`
+- `GET /api/matching/matches/{match_id}/revisions/`
+- `GET /api/matching/matches/{match_id}/decisions/`
 
 Evidence is append-only through the first API slice: there is no update or
-delete endpoint. Recompute accepts an optional `person_ids` list; without it,
-all active people in the tenant are evaluated only when there are at most 100.
-Synchronous recompute accepts at most 100 people; larger populations must be
-submitted as explicit subsets for controlled testing or handled by a future
-background job. A partial synchronous run is not an immutable ranking snapshot.
+all active people in the tenant are snapshotted. Recompute requires a UUID
+`Idempotency-Key`, persists an `AutomationJob` and `MatchRun`, and returns `202`
+before a Celery worker evaluates up to 500 people. Reusing a key with a different
+request is rejected. If a queued candidate snapshot changes before execution,
+the job fails closed instead of silently evaluating a different population.
+Evaluation and rank changes are preserved as immutable revisions tied to the
+run.
+
 Embedded match responses expose a minimal person summary and evidence citation
 metadata, never raw evidence facts, source URLs, or provider record identifiers.
 
 The first operator UI is available at `/matching`. It keeps opportunity and
-filter selection in the URL, requires confirmation before recompute, and lets a
-sales-enabled reviewer move the current match through review statuses.
+filter selection in the URL. A user with `manage` access can create a structured
+matching opportunity directly from the workbench; users with `recompute` access
+can confirm and queue a run; users with `decide` access can move the current
+match through review statuses. The form accepts bounded structured criteria and
+does not expose arbitrary JSON input.
 
 ## Channel integration path
 

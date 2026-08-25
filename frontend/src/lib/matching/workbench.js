@@ -22,6 +22,15 @@ export const DECISION_STATUSES = ['proposed', 'reviewing', 'shortlisted', 'accep
 export const MATCH_RUN_ACTIVE_STATUSES = ['pending', 'queued', 'running', 'retry_scheduled'];
 export const MATCH_RUN_TERMINAL_STATUSES = ['succeeded', 'failed', 'dead_letter', 'cancelled'];
 
+const CREATE_OPPORTUNITY_STATUSES = new Set(['draft', 'open']);
+const CREATE_OPPORTUNITY_REMOTE_MODES = new Set(['', 'on_site', 'hybrid', 'remote']);
+const CREATE_CRITERIA_FIELDS = [
+  ['required_skills', 'required_criteria', 'skills'],
+  ['required_titles', 'required_criteria', 'titles'],
+  ['required_locations', 'required_criteria', 'locations'],
+  ['preferred_skills', 'preferred_criteria', 'skills']
+];
+
 const DECISION_TARGETS = {
   proposed: ['reviewing', 'shortlisted', 'rejected'],
   reviewing: ['shortlisted', 'rejected'],
@@ -53,6 +62,97 @@ export function normalizeMatchingCapabilities(raw) {
 /** @param {unknown} value */
 export function isUuid(value) {
   return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+/**
+ * Convert the bounded, human-readable create form into the matching API
+ * contract. The workbench deliberately does not accept arbitrary JSON from a
+ * browser form.
+ *
+ * @param {{ get(name: string): unknown }} form
+ * @returns {{ payload?: Record<string, unknown>, error?: string }}
+ */
+export function buildCreateOpportunityPayload(form) {
+  if (!form || typeof form.get !== 'function') {
+    return { error: 'The opportunity form is invalid.' };
+  }
+
+  const text = (name) => String(form.get(name) || '').trim();
+  const title = text('title');
+  const opportunityType = text('opportunity_type').toLowerCase();
+  const status = text('status').toLowerCase();
+  const description = text('description');
+  const organizationName = text('organization_name');
+  const location = text('location');
+  const remoteMode = text('remote_mode').toLowerCase();
+
+  if (!title || title.length > 255) {
+    return { error: 'Enter an opportunity title of at most 255 characters.' };
+  }
+  if (!OPPORTUNITY_TYPES.includes(opportunityType)) {
+    return { error: 'Select a valid opportunity type.' };
+  }
+  if (!CREATE_OPPORTUNITY_STATUSES.has(status)) {
+    return { error: 'Select draft or open as the initial status.' };
+  }
+  if (description.length > 5000) {
+    return { error: 'Keep the opportunity description within 5,000 characters.' };
+  }
+  if (organizationName.length > 255 || location.length > 255) {
+    return { error: 'Organization and location must each be at most 255 characters.' };
+  }
+  if (!CREATE_OPPORTUNITY_REMOTE_MODES.has(remoteMode)) {
+    return { error: 'Select a valid work arrangement.' };
+  }
+
+  const criteria = {
+    required_criteria: {},
+    preferred_criteria: {},
+    exclusion_criteria: {}
+  };
+  for (const [field, group, dimension] of CREATE_CRITERIA_FIELDS) {
+    const parsed = parseCriteriaTerms(text(field));
+    if (parsed.error) return { error: parsed.error };
+    if (parsed.terms.length > 0) criteria[group][dimension] = parsed.terms;
+  }
+
+  return {
+    payload: {
+      opportunity_type: opportunityType,
+      status,
+      title,
+      description,
+      organization_name: organizationName,
+      location,
+      remote_mode: remoteMode,
+      ...criteria
+    }
+  };
+}
+
+/** @param {string} raw */
+function parseCriteriaTerms(raw) {
+  if (raw.length > 4000) {
+    return { terms: [], error: 'Keep each criteria field within 4,000 characters.' };
+  }
+  const terms = [];
+  const seen = new Set();
+  for (const value of raw.split(/[,;\n]/)) {
+    const term = value.trim();
+    if (!term) continue;
+    if (term.length > 120) {
+      return { terms: [], error: 'Each criterion must be at most 120 characters.' };
+    }
+    const key = term.toLocaleLowerCase('en');
+    if (!seen.has(key)) {
+      seen.add(key);
+      terms.push(term);
+    }
+    if (terms.length > 50) {
+      return { terms: [], error: 'Use at most 50 values in each criteria field.' };
+    }
+  }
+  return { terms };
 }
 
 /**
