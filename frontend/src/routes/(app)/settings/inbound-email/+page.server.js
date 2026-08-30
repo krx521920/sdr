@@ -38,7 +38,7 @@ export async function load({ cookies, locals, url }) {
 }
 
 function buildBody(formData) {
-  return {
+  const body = {
     address: String(formData.get('address') || '').trim(),
     provider: String(formData.get('provider') || 'ses'),
     route_target: String(formData.get('route_target') || 'case'),
@@ -47,6 +47,9 @@ function buildBody(formData) {
     default_assignee_id: String(formData.get('default_assignee_id') || '') || null,
     is_active: formData.get('is_active') !== 'false'
   };
+  const snsTopicArn = String(formData.get('sns_topic_arn') || '').trim();
+  if (snsTopicArn) body.sns_topic_arn = snsTopicArn;
+  return body;
 }
 
 /** @type {import('./$types').Actions} */

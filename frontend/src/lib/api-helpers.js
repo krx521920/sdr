@@ -131,6 +131,61 @@ export async function apiRequest(endpoint, options = {}, locals) {
 }
 
 /**
+ * Forward a multipart request from a SvelteKit server action to Django.
+ * Content-Type is intentionally omitted so fetch can supply the multipart
+ * boundary. Response bodies are never logged because imports may contain PII.
+ *
+ * @param {string} endpoint
+ * @param {FormData} body
+ * @param {{ method?: string, headers?: Record<string, string> }} options
+ * @param {{ cookies?: Cookies, org?: { id: string } } | Cookies} locals
+ * @returns {Promise<any>}
+ */
+export async function apiMultipartRequest(endpoint, body, options = {}, locals) {
+  const { method = 'POST', headers = {} } = options;
+  const cookies = /** @type {Cookies | undefined} */ (
+    /** @type {{ cookies?: Cookies }} */ (locals).cookies || locals
+  );
+  const accessToken = cookies?.get?.('jwt_access');
+  const requestHeaders = { ...headers };
+  if (accessToken) requestHeaders.Authorization = `Bearer ${accessToken}`;
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method,
+      headers: requestHeaders,
+      body
+    });
+    let responseBody = {};
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = {};
+    }
+    if (!response.ok) {
+      const safeData = /** @type {Record<string, unknown>} */ (
+        responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
+          ? responseBody
+          : {}
+      );
+      const safeMessage =
+        (typeof safeData.detail === 'string' && safeData.detail) ||
+        (typeof safeData.message === 'string' && safeData.message) ||
+        (typeof safeData.error_code === 'string' && safeData.error_code) ||
+        `HTTP ${response.status}: multipart request failed`;
+      const requestError = /** @type {Error & { status?: number }} */ (new Error(safeMessage));
+      requestError.status = response.status;
+      throw requestError;
+    }
+    return responseBody;
+  } catch (error) {
+    const status = Number(/** @type {{ status?: number }} */ (error)?.status);
+    if (!Number.isInteger(status)) console.error('Multipart API transport request failed');
+    throw error;
+  }
+}
+
+/**
  * Transform Django field names to camelCase for SvelteKit
  *
  * @param {any} obj - Django object with snake_case fields

@@ -2,6 +2,7 @@ import { error, fail } from '@sveltejs/kit';
 import { randomUUID } from 'node:crypto';
 
 import { apiRequest } from '$lib/api-helpers.js';
+import { REJECTION_REASON_CODES } from '$lib/matching/feedback.js';
 import {
   buildCreateOpportunityPayload,
   buildOpportunityQuery,
@@ -17,7 +18,12 @@ import {
 } from '$lib/matching/workbench.js';
 import { logSafeServerError } from '$lib/server/safe-error-log.js';
 
-const DECISION_REASON_CODES = new Set(['needs_review', 'strong_fit', 'approved', 'not_a_fit']);
+const DECISION_REASON_CODES = new Set([
+  'needs_review',
+  'strong_fit',
+  'approved',
+  ...REJECTION_REASON_CODES
+]);
 
 function requireOrg(locals) {
   if (!locals.user?.id || !locals.org?.id) {
@@ -64,11 +70,19 @@ export async function load({ cookies, locals, url }) {
   }
 
   try {
-    const opportunityResponse = await apiRequest(
-      `/matching/opportunities/?${buildOpportunityQuery(filters)}`,
-      {},
-      { cookies, org: locals.org }
-    );
+    const [opportunityResponse, peopleResponse] = await Promise.all([
+      apiRequest(
+        `/matching/opportunities/?${buildOpportunityQuery(filters)}`,
+        {},
+        { cookies, org: locals.org }
+      ),
+      apiRequest('/matching/people/?status=active&limit=1', {}, { cookies, org: locals.org }).catch(
+        (requestError) => {
+          logSafeServerError('Matching active person count load failed', requestError);
+          return { count: 0 };
+        }
+      )
+    ]);
     const allOpportunities = Array.isArray(opportunityResponse?.results)
       ? opportunityResponse.results.map(normalizeOpportunity)
       : [];
@@ -134,6 +148,7 @@ export async function load({ cookies, locals, url }) {
     return {
       opportunities,
       opportunityCount: Number(opportunityResponse?.count) || opportunities.length,
+      activePersonCount: Number(peopleResponse?.count) || 0,
       selectedOpportunity,
       matches,
       totalMatches,
@@ -159,6 +174,96 @@ export async function load({ cookies, locals, url }) {
 
 /** @type {import('./$types').Actions} */
 export const actions = {
+  onboardPerson: async ({ request, cookies, locals }) => {
+    requireOrg(locals);
+    let permissions;
+    try {
+      permissions = await getMatchingPermissions(cookies, locals);
+    } catch (requestError) {
+      logSafeServerError('Matching person onboarding permission check failed', requestError);
+      const status = requestStatus(requestError);
+      return fail(status === 401 || status === 403 ? status : 503, {
+        actionError: 'Person onboarding permission could not be verified.'
+      });
+    }
+    if (!permissions.manage) {
+      return fail(403, { actionError: 'You do not have permission to add people.' });
+    }
+
+    const form = await request.formData();
+    const rawPayload = String(form.get('payload') || '');
+    const idempotencyKey = String(form.get('idempotency_key') || '');
+    if (!rawPayload || Buffer.byteLength(rawPayload, 'utf8') > 256 * 1024) {
+      return fail(400, { actionError: 'The person onboarding form is invalid.' });
+    }
+    if (!isUuid(idempotencyKey)) {
+      return fail(400, { actionError: 'The onboarding request could not be identified safely.' });
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(rawPayload);
+    } catch {
+      return fail(400, { actionError: 'The person onboarding form is invalid.' });
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return fail(400, { actionError: 'The person onboarding form is invalid.' });
+    }
+
+    try {
+      const created = await apiRequest(
+        '/matching/people/onboard/',
+        {
+          method: 'POST',
+          headers: { 'Idempotency-Key': idempotencyKey },
+          body: payload
+        },
+        { cookies, org: locals.org }
+      );
+      const personId = String(created?.person_id || '');
+      const displayName =
+        typeof payload?.person?.display_name === 'string'
+          ? payload.person.display_name.trim().slice(0, 255)
+          : '';
+      if (!isUuid(personId) || !displayName) {
+        return fail(502, { actionError: 'The created person could not be verified.' });
+      }
+      return {
+        onboardingCreated: true,
+        onboardedPerson: {
+          id: personId,
+          displayName,
+          replayed: created?.replayed === true
+        }
+      };
+    } catch (requestError) {
+      logSafeServerError('Matching person onboarding failed', requestError);
+      const status = requestStatus(requestError);
+      if (status === 401 || status === 403) {
+        return fail(status, { actionError: 'You do not have permission to add people.' });
+      }
+      if (status === 400 || status === 422) {
+        return fail(status, {
+          actionError: 'The person could not be added. Review the form and try again.'
+        });
+      }
+      if (status === 409) {
+        return fail(409, {
+          actionError:
+            'This identity is already in use, or this request conflicts with an earlier attempt.'
+        });
+      }
+      if (status === 429) {
+        return fail(429, {
+          actionError: 'Person onboarding is temporarily rate limited. Try again shortly.'
+        });
+      }
+      return fail(503, {
+        actionError: 'Person onboarding is temporarily unavailable. Try again shortly.'
+      });
+    }
+  },
+
   createOpportunity: async ({ request, cookies, locals }) => {
     requireOrg(locals);
     let permissions;
@@ -242,19 +347,27 @@ export const actions = {
     }
     const form = await request.formData();
     const opportunityId = String(form.get('opportunity_id') || '');
+    const personId = String(form.get('person_id') || '');
     if (!isUuid(opportunityId)) {
       return fail(400, { actionError: 'Select a valid matching opportunity.' });
+    }
+    if (personId && !isUuid(personId)) {
+      return fail(400, { actionError: 'Select a valid person to rank.' });
     }
 
     try {
       const submittedKey = String(form.get('idempotency_key') || '');
       const idempotencyKey = isUuid(submittedKey) ? submittedKey : randomUUID();
+      const body = {
+        idempotency_key: idempotencyKey,
+        ...(personId ? { person_ids: [personId] } : {})
+      };
       const result = await apiRequest(
         `/matching/opportunities/${opportunityId}/recompute/`,
         {
           method: 'POST',
           headers: { 'Idempotency-Key': idempotencyKey },
-          body: { idempotency_key: idempotencyKey }
+          body
         },
         { cookies, org: locals.org }
       );
@@ -264,7 +377,8 @@ export const actions = {
       }
       return {
         recomputeQueued: true,
-        run
+        run,
+        focusPersonId: personId || null
       };
     } catch (requestError) {
       logSafeServerError('Matching recompute failed', requestError);

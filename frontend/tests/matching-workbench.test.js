@@ -30,21 +30,46 @@ test('normalizes matching capabilities with strict fail-closed booleans', () => 
       manage: false,
       recompute: 'true',
       decide: 1,
+      export: true,
+      delete: 'true',
+      retention: false,
+      feedback: true,
+      calibrate: 'true',
       payload: { admin: true }
     }),
-    { read: true, manage: false, recompute: false, decide: false }
+    {
+      read: true,
+      manage: false,
+      recompute: false,
+      decide: false,
+      export: true,
+      delete: false,
+      retention: false,
+      feedback: true,
+      calibrate: false
+    }
   );
   assert.deepEqual(normalizeMatchingCapabilities(null), {
     read: false,
     manage: false,
     recompute: false,
-    decide: false
+    decide: false,
+    export: false,
+    delete: false,
+    retention: false,
+    feedback: false,
+    calibrate: false
   });
   assert.deepEqual(normalizeMatchingCapabilities(['read', 'decide']), {
     read: false,
     manage: false,
     recompute: false,
-    decide: false
+    decide: false,
+    export: false,
+    delete: false,
+    retention: false,
+    feedback: false,
+    calibrate: false
   });
 });
 
@@ -193,7 +218,10 @@ test('normalizes matches without exposing raw evidence or identity fields', () =
           source_record_id: 'private-record',
           identities: [{ normalized_value: 'private@example.com' }],
           observed_at: '2026-08-24T00:00:00Z',
-          confidence: '0.9'
+          confidence: '0.9',
+          review_status: 'pending',
+          freshness: 'expiring',
+          ai_generated: true
         }
       }
     ]
@@ -213,6 +241,9 @@ test('normalizes matches without exposing raw evidence or identity fields', () =
   assert.equal(normalized.decisionRevision, 2);
   assert.equal(normalized.decisionReason, 'Strong evidence and confirmed interest.');
   assert.equal(normalized.evidenceLinks[0].evidence.summary, 'Delivered a Python project.');
+  assert.equal(normalized.evidenceLinks[0].evidence.reviewStatus, 'pending');
+  assert.equal(normalized.evidenceLinks[0].evidence.freshness, 'expiring');
+  assert.equal(normalized.evidenceLinks[0].evidence.aiGenerated, true);
   const serialized = JSON.stringify(normalized);
   assert.equal(serialized.includes('source_uri'), false);
   assert.equal(serialized.includes('private.example'), false);

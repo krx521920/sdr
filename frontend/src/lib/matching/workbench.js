@@ -55,7 +55,12 @@ export function normalizeMatchingCapabilities(raw) {
     read: value.read === true,
     manage: value.manage === true,
     recompute: value.recompute === true,
-    decide: value.decide === true
+    decide: value.decide === true,
+    export: value.export === true,
+    delete: value.delete === true,
+    retention: value.retention === true,
+    feedback: value.feedback === true,
+    calibrate: value.calibrate === true
   };
 }
 
@@ -257,7 +262,18 @@ export function sanitizeEvidenceLinks(links) {
       summary: String(link?.evidence?.summary || '').slice(0, 1000),
       observedAt: safeDateString(link?.evidence?.observed_at),
       validUntil: safeDateString(link?.evidence?.valid_until),
-      confidence: safeRatio(link?.evidence?.confidence)
+      confidence: safeRatio(link?.evidence?.confidence),
+      reviewStatus: ['pending', 'confirmed', 'rejected'].includes(
+        String(link?.evidence?.review_status || '').toLowerCase()
+      )
+        ? String(link.evidence.review_status).toLowerCase()
+        : '',
+      freshness: ['active', 'expiring', 'expired'].includes(
+        String(link?.evidence?.freshness || '').toLowerCase()
+      )
+        ? String(link.evidence.freshness).toLowerCase()
+        : '',
+      aiGenerated: link?.evidence?.ai_generated === true
     }
   }));
 }
@@ -292,6 +308,21 @@ export function normalizeMatch(raw) {
     engineVersion: String(raw?.engine_version || ''),
     rankingRevision: safeInteger(raw?.ranking_revision),
     decisionRevision: safeInteger(raw?.decision_revision),
+    feedbackRevision: safeInteger(raw?.feedback_revision),
+    recommendationVerdict: [
+      'unknown',
+      'accurate',
+      'partially_accurate',
+      'inaccurate',
+      'uncertain'
+    ].includes(String(raw?.recommendation_verdict || '').toLowerCase())
+      ? String(raw.recommendation_verdict).toLowerCase()
+      : 'unknown',
+    latestOutcomeCode: String(raw?.latest_outcome_code || '').slice(0, 40),
+    latestOutcomeAt: safeDateString(raw?.latest_outcome_at),
+    scoringPolicyVersionId: isUuid(String(raw?.scoring_policy_version || ''))
+      ? String(raw.scoring_policy_version)
+      : '',
     decisionReason: String(raw?.decision_reason || '').slice(0, 1000),
     decidedAt: safeDateString(raw?.decided_at),
     evidenceLinks: sanitizeEvidenceLinks(raw?.evidence_links)

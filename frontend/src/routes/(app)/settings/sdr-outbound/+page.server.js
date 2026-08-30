@@ -1,4 +1,19 @@
 import { apiRequest } from '$lib/api-helpers.js';
+import {
+  buildApolloApprovedExecution,
+  normalizeApolloApprovalRequired,
+  normalizeApolloCandidateResponse,
+  validApolloUuid
+} from '$lib/apollo-execution.js';
+import { logSafeServerError } from '$lib/server/safe-error-log.js';
+import {
+  buildWhatsAppApprovedExecution,
+  normalizeWhatsAppApprovalRequired,
+  normalizeWhatsAppConnection,
+  normalizeWhatsAppExecutionResult,
+  normalizeWhatsAppMessageResponse,
+  validWhatsAppUuid
+} from '$lib/whatsapp-execution.js';
 import { env } from '$env/dynamic/public';
 import { error, fail } from '@sveltejs/kit';
 
@@ -14,6 +29,75 @@ const LOCAL_CONNECTION_TEST_CODES = new Set([
   'partner_access_not_confirmed',
   'permission_denied'
 ]);
+const APOLLO_CANDIDATE_SOURCE_LIMIT = 12;
+const APOLLO_CANDIDATE_PER_SOURCE_LIMIT = 100;
+
+function fixedOutboundFailure(err, fallback) {
+  logSafeServerError('SDR outbound operation failed', err);
+  const status = Number(err?.status);
+  return fail([400, 403, 409].includes(status) ? status : 400, { actionError: fallback });
+}
+
+async function loadApolloCandidates(sources, cookies, org) {
+  const safeSources = (Array.isArray(sources) ? sources : [])
+    .filter((source) => source?.provider === 'apollo' && validApolloUuid(source?.id))
+    .slice(0, APOLLO_CANDIDATE_SOURCE_LIMIT);
+  const entries = await Promise.all(
+    safeSources.map(async (source) => {
+      try {
+        const response = await apiRequest(
+          `/sdr/outbound/sources/${source.id}/apollo-candidates/`,
+          {},
+          { cookies, org }
+        );
+        return [
+          source.id,
+          {
+            ...normalizeApolloCandidateResponse(
+              response,
+              source.id,
+              APOLLO_CANDIDATE_PER_SOURCE_LIMIT
+            ),
+            error: ''
+          }
+        ];
+      } catch (err) {
+        logSafeServerError('Could not load Apollo candidates', err);
+        return [
+          source.id,
+          {
+            count: 0,
+            results: [],
+            error: 'Apollo candidates could not be loaded for this source.'
+          }
+        ];
+      }
+    })
+  );
+  return Object.fromEntries(entries);
+}
+
+async function loadWhatsAppMessages(campaignId, cookies, org) {
+  if (!validWhatsAppUuid(campaignId)) return { count: 0, results: [], error: '' };
+  try {
+    const response = await apiRequest(
+      `/integrations/whatsapp/messages/?campaign_id=${encodeURIComponent(campaignId)}&limit=100`,
+      {},
+      { cookies, org }
+    );
+    return {
+      ...normalizeWhatsAppMessageResponse(response, campaignId, 100),
+      error: ''
+    };
+  } catch (err) {
+    logSafeServerError('Could not load the WhatsApp execution queue', err);
+    return {
+      count: 0,
+      results: [],
+      error: 'The WhatsApp execution queue could not be loaded.'
+    };
+  }
+}
 
 /**
  * Check only the locally stored connection state. The backend endpoint is
@@ -66,7 +150,8 @@ async function checkLocalConnection(provider, cookies) {
 async function localConnectionTestAction(provider, cookies) {
   try {
     return await checkLocalConnection(provider, cookies);
-  } catch {
+  } catch (err) {
+    logSafeServerError('Local provider configuration check failed', err);
     return null;
   }
 }
@@ -96,14 +181,13 @@ export async function load({ cookies, locals, url }) {
   let linkedinConnection = null;
   let linkedinError = '';
   try {
-    whatsappConnection = await apiRequest(
-      '/integrations/whatsapp/connection/',
-      {},
-      { cookies, org: locals?.org }
+    whatsappConnection = normalizeWhatsAppConnection(
+      await apiRequest('/integrations/whatsapp/connection/', {}, { cookies, org: locals?.org })
     );
   } catch (err) {
-    if (!err?.message?.startsWith('HTTP 404')) {
-      whatsappError = err?.message || 'Could not load WhatsApp settings.';
+    if (Number(err?.status) !== 404) {
+      logSafeServerError('Could not load WhatsApp settings', err);
+      whatsappError = 'Could not load WhatsApp settings.';
     }
   }
 
@@ -114,8 +198,9 @@ export async function load({ cookies, locals, url }) {
       { cookies, org: locals?.org }
     );
   } catch (err) {
-    if (!err?.message?.startsWith('HTTP 404')) {
-      apolloError = err?.message || 'Could not load Apollo settings.';
+    if (Number(err?.status) !== 404) {
+      logSafeServerError('Could not load Apollo settings', err);
+      apolloError = 'Could not load Apollo settings.';
     }
   }
 
@@ -126,8 +211,9 @@ export async function load({ cookies, locals, url }) {
       { cookies, org: locals?.org }
     );
   } catch (err) {
-    if (!err?.message?.startsWith('HTTP 404')) {
-      linkedinError = err?.message || 'Could not load LinkedIn settings.';
+    if (Number(err?.status) !== 404) {
+      logSafeServerError('Could not load LinkedIn settings', err);
+      linkedinError = 'Could not load LinkedIn settings.';
     }
   }
 
@@ -140,30 +226,39 @@ export async function load({ cookies, locals, url }) {
     const requestedId = url.searchParams.get('campaign') || '';
     const selectedCampaign =
       campaigns.results?.find((item) => item.id === requestedId) || campaigns.results?.[0] || null;
-    const [prospects, outboundSources, copyDrafts, campaignAnalytics] = selectedCampaign
-      ? await Promise.all([
-          apiRequest(
-            `/sdr/outbound/campaigns/${selectedCampaign.id}/prospects/?limit=250`,
-            {},
-            { cookies, org: locals?.org }
-          ),
-          apiRequest(
-            `/sdr/outbound/campaigns/${selectedCampaign.id}/sources/`,
-            {},
-            { cookies, org: locals?.org }
-          ),
-          apiRequest(
-            `/sdr/outbound/campaigns/${selectedCampaign.id}/copy-drafts/`,
-            {},
-            { cookies, org: locals?.org }
-          ),
-          apiRequest(
-            `/sdr/outbound/campaigns/${selectedCampaign.id}/analytics/`,
-            {},
-            { cookies, org: locals?.org }
-          )
-        ])
-      : [{ count: 0, summary: {}, results: [] }, [], [], null];
+    const [prospects, outboundSources, copyDrafts, campaignAnalytics, whatsappMessages] =
+      selectedCampaign
+        ? await Promise.all([
+            apiRequest(
+              `/sdr/outbound/campaigns/${selectedCampaign.id}/prospects/?limit=250`,
+              {},
+              { cookies, org: locals?.org }
+            ),
+            apiRequest(
+              `/sdr/outbound/campaigns/${selectedCampaign.id}/sources/`,
+              {},
+              { cookies, org: locals?.org }
+            ),
+            apiRequest(
+              `/sdr/outbound/campaigns/${selectedCampaign.id}/copy-drafts/`,
+              {},
+              { cookies, org: locals?.org }
+            ),
+            apiRequest(
+              `/sdr/outbound/campaigns/${selectedCampaign.id}/analytics/`,
+              {},
+              { cookies, org: locals?.org }
+            ),
+            loadWhatsAppMessages(selectedCampaign.id, cookies, locals?.org)
+          ])
+        : [
+            { count: 0, summary: {}, results: [] },
+            [],
+            [],
+            null,
+            { count: 0, results: [], error: '' }
+          ];
+    const apolloCandidates = await loadApolloCandidates(outboundSources, cookies, locals?.org);
     return {
       campaigns,
       prospects,
@@ -175,12 +270,14 @@ export async function load({ cookies, locals, url }) {
       linkedinConnection,
       linkedinError,
       outboundSources,
+      apolloCandidates,
       copyDrafts,
       campaignAnalytics,
+      whatsappMessages,
       loadError: ''
     };
   } catch (err) {
-    console.error('Failed to load SDR outbound:', err);
+    logSafeServerError('Could not load SDR outbound', err);
     return {
       campaigns: { summary: {}, channels: [], statuses: [], results: [] },
       prospects: { count: 0, summary: {}, results: [] },
@@ -192,15 +289,80 @@ export async function load({ cookies, locals, url }) {
       linkedinConnection,
       linkedinError,
       outboundSources: [],
+      apolloCandidates: {},
       copyDrafts: [],
       campaignAnalytics: null,
-      loadError: err?.message || 'Could not load outbound prospecting.'
+      whatsappMessages: { count: 0, results: [], error: '' },
+      loadError: 'Could not load outbound prospecting.'
     };
   }
 }
 
 /** @type {import('./$types').Actions} */
 export const actions = {
+  executeWhatsAppMessage: async ({ request, cookies, locals }) => {
+    if (locals.profile?.role !== 'ADMIN' && !locals.profile?.is_organization_admin) {
+      return fail(403, { actionError: 'Administrator access is required.' });
+    }
+    const formData = await request.formData();
+    const messageId = String(formData.get('message_id') || '').trim();
+    const approvalValue = String(formData.get('approval_id') || '').trim();
+    if (!validWhatsAppUuid(messageId)) {
+      return fail(400, { actionError: 'The WhatsApp message is invalid.' });
+    }
+    const body = approvalValue ? buildWhatsAppApprovedExecution(approvalValue) : {};
+    if (!body) {
+      return fail(400, { actionError: 'Enter a valid one-time approval UUID.' });
+    }
+
+    try {
+      const response = await apiRequest(
+        `/integrations/whatsapp/messages/${messageId}/execution/`,
+        { method: 'POST', body },
+        { cookies, org: locals?.org }
+      );
+      if (!approvalValue) {
+        const intent = normalizeWhatsAppApprovalRequired(response, messageId);
+        if (!intent) {
+          return fail(502, {
+            actionError: 'WhatsApp returned an unexpected approval-intent response.'
+          });
+        }
+        return {
+          whatsappApprovalRequired: true,
+          whatsappMessageId: messageId,
+          whatsappIntent: intent
+        };
+      }
+
+      const execution = normalizeWhatsAppExecutionResult(response);
+      if (!execution) {
+        return fail(502, {
+          actionError: 'WhatsApp returned an unexpected execution acknowledgement.'
+        });
+      }
+      return {
+        whatsappExecutionQueued: execution.executionStatus === 'reserved',
+        whatsappExecutionConverged: ['accepted', 'delivered'].includes(execution.executionStatus),
+        whatsappMessageId: messageId,
+        whatsappExecution: execution
+      };
+    } catch (err) {
+      logSafeServerError('WhatsApp execution request failed', err);
+      if (Number(err?.status) === 403) {
+        return fail(403, { actionError: 'Your administrator permission changed.' });
+      }
+      if (Number(err?.status) === 409) {
+        return fail(409, {
+          actionError:
+            'This WhatsApp execution cannot be replayed. Review its current durable state.'
+        });
+      }
+      return fail(400, {
+        actionError: 'The WhatsApp execution request was rejected before it could be queued.'
+      });
+    }
+  },
   testWhatsAppConnection: async ({ cookies }) => {
     const result = await localConnectionTestAction('whatsapp', cookies);
     if (!result) {
@@ -251,9 +413,7 @@ export const actions = {
       );
       return { campaignSaved: true, campaignId: saved.id };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the outbound campaign.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the outbound campaign.');
     }
   },
   saveWhatsAppConnection: async ({ request, cookies, locals }) => {
@@ -270,16 +430,16 @@ export const actions = {
       return fail(400, { actionError: 'Enter the numeric WhatsApp Phone Number ID.' });
     }
     try {
-      const connection = await apiRequest(
-        '/integrations/whatsapp/connection/',
-        { method: 'PUT', body },
-        { cookies, org: locals?.org }
+      const connection = normalizeWhatsAppConnection(
+        await apiRequest(
+          '/integrations/whatsapp/connection/',
+          { method: 'PUT', body },
+          { cookies, org: locals?.org }
+        )
       );
       return { whatsappSaved: true, whatsappConnection: connection };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the WhatsApp connection.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the WhatsApp connection.');
     }
   },
   saveLinkedInConnection: async ({ request, cookies, locals }) => {
@@ -298,9 +458,7 @@ export const actions = {
       );
       return { linkedinSaved: true, linkedinConnection: connection };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the LinkedIn connection.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the LinkedIn connection.');
     }
   },
   saveApolloConnection: async ({ request, cookies, locals }) => {
@@ -316,9 +474,7 @@ export const actions = {
       );
       return { apolloSaved: true, apolloConnection: connection };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the Apollo connection.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the Apollo connection.');
     }
   },
   saveApolloSource: async ({ request, cookies, locals }) => {
@@ -358,28 +514,113 @@ export const actions = {
       );
       return { apolloSourceSaved: true, apolloSource: source };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the Apollo source.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the Apollo source.');
     }
   },
   syncApolloSource: async ({ request, cookies, locals }) => {
     const formData = await request.formData();
     const sourceId = String(formData.get('source_id') || '');
-    if (!UUID_PATTERN.test(sourceId)) {
+    if (!validApolloUuid(sourceId)) {
       return fail(400, { actionError: 'The Apollo source is invalid.' });
+    }
+    const approvalValue = String(formData.get('approval_id') || '').trim();
+    const executionBody = approvalValue
+      ? buildApolloApprovedExecution(approvalValue, () => crypto.randomUUID())
+      : {};
+    if (approvalValue && !executionBody) {
+      return fail(400, { actionError: 'Enter a valid one-time approval UUID.' });
     }
     try {
       const result = await apiRequest(
         `/sdr/outbound/sources/${sourceId}/sync/`,
+        { method: 'POST', body: executionBody },
+        { cookies, org: locals?.org }
+      );
+      if (!approvalValue) {
+        const intent = normalizeApolloApprovalRequired(
+          result,
+          'search_people',
+          `outbound-source:${sourceId}`
+        );
+        if (!intent) {
+          return fail(502, {
+            actionError: 'Apollo returned an unexpected approval-intent response.'
+          });
+        }
+        return {
+          apolloSearchApprovalRequired: true,
+          apolloSourceId: sourceId,
+          apolloSearchIntent: intent
+        };
+      }
+      if (!validApolloUuid(result?.job_id)) {
+        return fail(502, { actionError: 'Apollo did not return a valid queued job.' });
+      }
+      return { apolloSourceQueued: true, apolloSourceId: sourceId };
+    } catch (err) {
+      return fixedOutboundFailure(err, 'Could not queue the Apollo source sync.');
+    }
+  },
+  prepareApolloCandidateEnrichment: async ({ request, cookies, locals }) => {
+    const formData = await request.formData();
+    const sourceId = String(formData.get('source_id') || '');
+    const candidateId = String(formData.get('candidate_id') || '');
+    if (!validApolloUuid(sourceId) || !validApolloUuid(candidateId)) {
+      return fail(400, { actionError: 'The Apollo candidate is invalid.' });
+    }
+    try {
+      const result = await apiRequest(
+        `/sdr/outbound/apollo-candidates/${candidateId}/enrich/`,
         { method: 'POST', body: {} },
         { cookies, org: locals?.org }
       );
-      return { apolloSourceQueued: true, apolloSourceJob: result };
+      const intent = normalizeApolloApprovalRequired(
+        result,
+        'enrich_person',
+        `apollo-candidate:${candidateId}`
+      );
+      if (!intent) {
+        return fail(502, {
+          actionError: 'Apollo returned an unexpected enrichment-intent response.'
+        });
+      }
+      return {
+        apolloEnrichmentApprovalRequired: true,
+        apolloSourceId: sourceId,
+        apolloCandidateId: candidateId,
+        apolloEnrichmentIntent: intent
+      };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not queue the Apollo source sync.'
-      });
+      return fixedOutboundFailure(err, 'Could not prepare the Apollo enrichment approval.');
+    }
+  },
+  enrichApolloCandidate: async ({ request, cookies, locals }) => {
+    const formData = await request.formData();
+    const sourceId = String(formData.get('source_id') || '');
+    const candidateId = String(formData.get('candidate_id') || '');
+    const executionBody = buildApolloApprovedExecution(
+      String(formData.get('approval_id') || '').trim(),
+      () => crypto.randomUUID()
+    );
+    if (!validApolloUuid(sourceId) || !validApolloUuid(candidateId) || !executionBody) {
+      return fail(400, { actionError: 'Candidate and one-time approval UUID are required.' });
+    }
+    try {
+      const result = await apiRequest(
+        `/sdr/outbound/apollo-candidates/${candidateId}/enrich/`,
+        { method: 'POST', body: executionBody },
+        { cookies, org: locals?.org }
+      );
+      if (!validApolloUuid(result?.job_id) || String(result?.candidate_id || '') !== candidateId) {
+        return fail(502, { actionError: 'Apollo did not return a valid enrichment job.' });
+      }
+      return {
+        apolloCandidateEnrichmentQueued: true,
+        apolloSourceId: sourceId,
+        apolloCandidateId: candidateId
+      };
+    } catch (err) {
+      return fixedOutboundFailure(err, 'Could not queue the Apollo candidate enrichment.');
     }
   },
   generateOutboundCopy: async ({ request, cookies, locals }) => {
@@ -408,9 +649,7 @@ export const actions = {
       );
       return { outboundCopyQueued: true, outboundCopyDraft: draft };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not queue outbound copy generation.'
-      });
+      return fixedOutboundFailure(err, 'Could not queue outbound copy generation.');
     }
   },
   saveOutboundCopy: async ({ request, cookies, locals }) => {
@@ -444,9 +683,7 @@ export const actions = {
       );
       return { outboundCopySaved: true, outboundCopyDraft: draft };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not save the reviewed outbound copy.'
-      });
+      return fixedOutboundFailure(err, 'Could not save the reviewed outbound copy.');
     }
   },
   applyOutboundCopy: async ({ request, cookies, locals }) => {
@@ -463,9 +700,7 @@ export const actions = {
       );
       return { outboundCopyApplied: true, outboundCopyApplyResult: result };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not apply the outbound copy.'
-      });
+      return fixedOutboundFailure(err, 'Could not apply the outbound copy.');
     }
   },
   campaignAction: async ({ request, cookies, locals }) => {
@@ -484,9 +719,7 @@ export const actions = {
       );
       return { campaignUpdated: true, campaignAction: action, campaignExecution: result.execution };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not update campaign execution.'
-      });
+      return fixedOutboundFailure(err, 'Could not update campaign execution.');
     }
   },
   importProspects: async ({ request, cookies, locals }) => {
@@ -508,9 +741,7 @@ export const actions = {
       );
       return { prospectsImported: true, importResult };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not import the prospect list.'
-      });
+      return fixedOutboundFailure(err, 'Could not import the prospect list.');
     }
   },
   prospectAction: async ({ request, cookies, locals }) => {
@@ -528,9 +759,7 @@ export const actions = {
       );
       return { prospectUpdated: true, prospectAction: action };
     } catch (err) {
-      return fail(400, {
-        actionError: err?.message || 'Could not update the prospect.'
-      });
+      return fixedOutboundFailure(err, 'Could not update the prospect.');
     }
   }
 };

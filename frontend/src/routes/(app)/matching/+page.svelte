@@ -1,5 +1,5 @@
 <script>
-  import { enhance } from '$app/forms';
+  import { deserialize, enhance } from '$app/forms';
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/stores';
   import { tick } from 'svelte';
@@ -12,17 +12,20 @@
     CircleAlert,
     Clock,
     Eye,
+    FileSpreadsheet,
     MapPin,
     Plus,
     RefreshCw,
     ShieldCheck,
     Sparkles,
     Target,
+    UserPlus,
     Users,
     X
   } from '@lucide/svelte';
 
   import { PageHeader, FilterStrip, FilterPill } from '$lib/components/layout';
+  import PersonOnboardingDialog from '$lib/components/matching/PersonOnboardingDialog.svelte';
   import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -32,6 +35,7 @@
   import { Progress } from '$lib/components/ui/progress/index.js';
   import * as Sheet from '$lib/components/ui/sheet/index.js';
   import { Textarea } from '$lib/components/ui/textarea/index.js';
+  import { REJECTION_REASON_CODES } from '$lib/matching/feedback.js';
   import {
     decisionTargetsForStatus,
     isMatchRunActive,
@@ -71,12 +75,14 @@
     reviewing: 'needs_review',
     shortlisted: 'strong_fit',
     accepted: 'approved',
-    rejected: 'not_a_fit'
+    rejected: ''
   };
 
   let selectedMatchId = $state(/** @type {string | null} */ (null));
   let evidenceSheetOpen = $state(false);
   let createOpportunityDialogOpen = $state(false);
+  let onboardingDialogOpen = $state(false);
+  let discardOnboardingDialogOpen = $state(false);
   let recomputeDialogOpen = $state(false);
   let decisionDialogOpen = $state(false);
   let recomputing = $state(false);
@@ -85,6 +91,8 @@
   let pendingReasonCode = $state('');
   let decisionReason = $state('');
   let recomputeIdempotencyKey = $state('');
+  let recomputePersonId = $state('');
+  let focusPersonId = $state('');
   let decisionIdempotencyKey = $state('');
   let liveMessage = $state('');
   let polledRun = $state(/** @type {any} */ (null));
@@ -93,6 +101,13 @@
   let handledTerminalRunId = $state('');
   let permissionRevoked = $state(false);
   let creatingOpportunity = $state(false);
+  let onboardingBusy = $state(false);
+  let onboardingError = $state('');
+  let onboardingIdempotencyKey = $state('');
+  let onboardedPerson = $state(
+    /** @type {{ id: string, displayName: string, replayed: boolean } | null} */ (null)
+  );
+  let pendingOnboardingClose = $state(/** @type {(() => void) | null} */ (null));
   let createOpportunityError = $state('');
   let createOpportunityErrorElement = $state(/** @type {HTMLElement | null} */ (null));
   let opportunityTitle = $state('');
@@ -125,7 +140,8 @@
   const canManage = $derived(data.permissions?.manage === true && !permissionRevoked);
   const canRecompute = $derived(data.permissions?.recompute === true && !permissionRevoked);
   const canDecide = $derived(data.permissions?.decide === true && !permissionRevoked);
-  const isReadOnly = $derived(!canManage && !canRecompute && !canDecide);
+  const canFeedback = $derived(data.permissions?.feedback === true && !permissionRevoked);
+  const isReadOnly = $derived(!canManage && !canRecompute && !canDecide && !canFeedback);
   const recomputeBusy = $derived(recomputing || runActive);
   const activeRunKey = $derived(
     !permissionRevoked &&
@@ -148,6 +164,15 @@
       selectedMatchId = null;
     } else if (!selectedMatchId || !matches.some((match) => match.id === selectedMatchId)) {
       selectedMatchId = matches[0].id;
+    }
+  });
+
+  $effect(() => {
+    if (!focusPersonId) return;
+    const focusedMatch = data.matches.find((match) => match.personId === focusPersonId);
+    if (focusedMatch) {
+      selectedMatchId = focusedMatch.id;
+      focusPersonId = '';
     }
   });
 
@@ -205,10 +230,83 @@
     decisionDialogOpen = true;
   }
 
-  function openRecompute() {
+  /** @param {string} [personId] */
+  function openRecompute(personId = '') {
     if (!canRecompute || recomputeBusy) return;
+    recomputePersonId = personId;
     recomputeIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
     recomputeDialogOpen = true;
+  }
+
+  function openPersonOnboarding() {
+    if (!canManage || onboardingBusy) return;
+    onboardingError = '';
+    onboardingIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    onboardingDialogOpen = true;
+  }
+
+  /** @param {{ close: () => void }} context */
+  function requestPersonOnboardingClose(context) {
+    pendingOnboardingClose = context.close;
+    discardOnboardingDialogOpen = true;
+  }
+
+  function discardPersonOnboarding() {
+    const close = pendingOnboardingClose;
+    pendingOnboardingClose = null;
+    discardOnboardingDialogOpen = false;
+    close?.();
+  }
+
+  /** @param {Record<string, unknown>} payload */
+  async function submitPersonOnboarding(payload) {
+    if (onboardingBusy) return;
+    onboardingBusy = true;
+    onboardingError = '';
+    liveMessage = 'Saving person and evidence.';
+
+    try {
+      const form = new FormData();
+      form.set('payload', JSON.stringify(payload));
+      form.set('idempotency_key', onboardingIdempotencyKey);
+      const response = await fetch('?/onboardPerson', {
+        method: 'POST',
+        headers: { accept: 'application/json', 'x-sveltekit-action': 'true' },
+        cache: 'no-store',
+        body: form
+      });
+      const result = deserialize(await response.text());
+      const actionData = /** @type {any} */ (result).data;
+      if (result.type === 'success' && actionData?.onboardedPerson?.id) {
+        onboardedPerson = actionData.onboardedPerson;
+        onboardingDialogOpen = false;
+        onboardingIdempotencyKey = '';
+        pendingOnboardingClose = null;
+        liveMessage = `${onboardedPerson.displayName} was added with evidence.`;
+        toast.success(
+          actionData.onboardedPerson.replayed ? 'Person already saved' : 'Person added'
+        );
+        await invalidateAll();
+        return;
+      }
+
+      onboardingError = actionData?.actionError || 'The person could not be added.';
+      liveMessage = onboardingError;
+      toast.error(onboardingError);
+      if (result.status === 401 || result.status === 403) {
+        permissionRevoked = true;
+        onboardingDialogOpen = false;
+        createOpportunityDialogOpen = false;
+        recomputeDialogOpen = false;
+        decisionDialogOpen = false;
+      }
+    } catch {
+      onboardingError = 'Person onboarding is temporarily unavailable. Your form is still open.';
+      liveMessage = onboardingError;
+      toast.error(onboardingError);
+    } finally {
+      onboardingBusy = false;
+    }
   }
 
   function resetOpportunityForm() {
@@ -257,8 +355,7 @@
         await goto(url, { noScroll: true });
       } else {
         const accessChanged = result.status === 401 || result.status === 403;
-        createOpportunityError =
-          actionData?.actionError || 'The opportunity could not be created.';
+        createOpportunityError = actionData?.actionError || 'The opportunity could not be created.';
         liveMessage = createOpportunityError;
         toast.error(liveMessage);
         await update({ reset: false, invalidateAll: false });
@@ -284,6 +381,9 @@
       if (result.type === 'success' && actionData?.run?.id) {
         recomputeDialogOpen = false;
         recomputeIdempotencyKey = '';
+        focusPersonId = actionData?.focusPersonId || recomputePersonId || '';
+        const focusedRun = Boolean(focusPersonId);
+        recomputePersonId = '';
         polledRun = actionData.run;
         polledRunHistory = [
           actionData.run,
@@ -293,7 +393,10 @@
         liveMessage = 'Candidate ranking was queued and will update in the background.';
         toast.success('Candidate ranking queued');
         await update({ reset: false, invalidateAll: false });
-        await updateQuery({ run: actionData.run.id });
+        await updateQuery({
+          run: actionData.run.id,
+          ...(focusedRun ? { match_status: null } : {})
+        });
       } else {
         liveMessage = actionData?.actionError || 'Candidates could not be recomputed.';
         toast.error(liveMessage);
@@ -353,6 +456,10 @@
         stopPolling();
         if (!permissionRevoked) {
           permissionRevoked = true;
+          onboardingBusy = false;
+          onboardingDialogOpen = false;
+          discardOnboardingDialogOpen = false;
+          pendingOnboardingClose = null;
           creatingOpportunity = false;
           createOpportunityDialogOpen = false;
           recomputeDialogOpen = false;
@@ -374,6 +481,7 @@
         if (handledTerminalRunId !== result.run.id) {
           handledTerminalRunId = result.run.id;
           if (isMatchRunSkipped(result.run)) {
+            focusPersonId = '';
             liveMessage =
               'Candidate ranking was skipped because the opportunity is no longer active.';
             toast.info('Ranking skipped');
@@ -384,6 +492,7 @@
             toast.success(`Ranking completed: ${count} candidates`);
             await invalidateAll();
           } else {
+            focusPersonId = '';
             const errorCode = result.run.errorCode || 'MATCH_RECOMPUTE_FAILED';
             liveMessage = `Candidate ranking stopped. Error code: ${errorCode}.`;
             toast.error(`Ranking failed: ${errorCode}`);
@@ -467,11 +576,38 @@
     subtitle="Place the right person into the right opportunity with evidence-backed ranking"
   >
     {#snippet actions()}
+      <Button href="/matching/feedback" size="sm" variant="outline" class="gap-1.5">
+        <Activity class="size-3.5" />Feedback loop
+      </Button>
+      <Button href="/matching/governance" size="sm" variant="outline" class="gap-1.5">
+        <ShieldCheck class="size-3.5" />Evidence governance
+      </Button>
       {#if permissionRevoked}
         <Badge variant="outline">Access changed</Badge>
       {:else if canManage || canRecompute}
         <div class="flex flex-wrap items-center gap-2">
           {#if canManage}
+            <Button
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+              disabled={onboardingBusy}
+              onclick={openPersonOnboarding}
+            >
+              <UserPlus class="size-3.5" />
+              Add person
+            </Button>
+            <Button
+              href={data.selectedOpportunity
+                ? `/matching/imports/new?opportunity=${encodeURIComponent(data.selectedOpportunity.id)}`
+                : '/matching/imports/new'}
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+            >
+              <FileSpreadsheet class="size-3.5" />
+              Import CSV
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -489,7 +625,7 @@
               class="gap-1.5"
               disabled={!data.selectedOpportunity || recomputeBusy}
               aria-busy={recomputeBusy}
-              onclick={openRecompute}
+              onclick={() => openRecompute()}
             >
               <RefreshCw
                 class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
@@ -538,10 +674,41 @@
     {/if}
     {#snippet meta()}
       <span>{data.opportunities.length} opportunities</span>
+      <span>{data.activePersonCount} active people</span>
     {/snippet}
   </FilterStrip>
 
   <p class="sr-only" role="status" aria-live="polite">{liveMessage}</p>
+
+  {#if onboardedPerson}
+    <div
+      class="mx-5 mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-[color:var(--green)] bg-[color:var(--green-soft)] px-4 py-3 text-sm text-[color:var(--green-soft-text)]"
+      role="status"
+    >
+      <Check class="size-4 shrink-0" aria-hidden="true" />
+      <span class="font-medium">{onboardedPerson.displayName} was added with evidence.</span>
+      <div class="ml-auto flex items-center gap-2">
+        {#if canRecompute && data.selectedOpportunity}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={recomputeBusy}
+            onclick={() => openRecompute(onboardedPerson.id)}
+          >
+            Rank for {data.selectedOpportunity.title}
+          </Button>
+        {/if}
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Dismiss person onboarding confirmation"
+          onclick={() => (onboardedPerson = null)}
+        >
+          <X class="size-4" />
+        </Button>
+      </div>
+    </div>
+  {/if}
 
   {#if data.opportunities.length === 0}
     <section class="flex flex-1 flex-col items-center justify-center px-6 py-20 text-center">
@@ -1061,6 +1228,24 @@
                   <span class="text-[11px] text-[color:var(--text-subtle)]"
                     >{label(link.evidence.kind)}</span
                   >
+                  {#if link.evidence.aiGenerated && link.evidence.reviewStatus === 'pending'}
+                    <Badge
+                      variant="outline"
+                      class="border-[color:var(--amber)] text-[color:var(--amber-soft-text)]"
+                      >AI · Pending review</Badge
+                    >
+                  {:else if link.evidence.reviewStatus}
+                    <Badge variant="outline">{label(link.evidence.reviewStatus)}</Badge>
+                  {/if}
+                  {#if ['expiring', 'expired'].includes(link.evidence.freshness)}
+                    <Badge
+                      variant="outline"
+                      class={link.evidence.freshness === 'expired'
+                        ? 'border-[color:var(--red)] text-[color:var(--red-soft-text)]'
+                        : 'border-[color:var(--amber)] text-[color:var(--amber-soft-text)]'}
+                      >{label(link.evidence.freshness)}</Badge
+                    >
+                  {/if}
                   <span class="ml-auto text-[11px] text-[color:var(--text-subtle)] tabular-nums"
                     >{Math.round(link.evidence.confidence * 100)}% confidence</span
                   >
@@ -1134,7 +1319,10 @@
         </div>
       {/if}
       <div class="space-y-1.5">
-        <label for="matching-opportunity-title" class="text-xs font-medium text-[color:var(--text)]">
+        <label
+          for="matching-opportunity-title"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
           Title
         </label>
         <Input
@@ -1149,7 +1337,10 @@
 
       <div class="grid gap-4 sm:grid-cols-2">
         <div class="space-y-1.5">
-          <label for="matching-opportunity-type" class="text-xs font-medium text-[color:var(--text)]">
+          <label
+            for="matching-opportunity-type"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
             Opportunity type
           </label>
           <select
@@ -1164,7 +1355,10 @@
           </select>
         </div>
         <div class="space-y-1.5">
-          <label for="matching-opportunity-status" class="text-xs font-medium text-[color:var(--text)]">
+          <label
+            for="matching-opportunity-status"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
             Initial status
           </label>
           <select
@@ -1181,7 +1375,10 @@
 
       <div class="grid gap-4 sm:grid-cols-2">
         <div class="space-y-1.5">
-          <label for="matching-opportunity-organization" class="text-xs font-medium text-[color:var(--text)]">
+          <label
+            for="matching-opportunity-organization"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
             Organization <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
           </label>
           <Input
@@ -1193,7 +1390,10 @@
           />
         </div>
         <div class="space-y-1.5">
-          <label for="matching-opportunity-location" class="text-xs font-medium text-[color:var(--text)]">
+          <label
+            for="matching-opportunity-location"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
             Location <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
           </label>
           <Input
@@ -1207,8 +1407,13 @@
       </div>
 
       <div class="space-y-1.5">
-        <label for="matching-opportunity-remote" class="text-xs font-medium text-[color:var(--text)]">
-          Work arrangement <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        <label
+          for="matching-opportunity-remote"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
+          Work arrangement <span class="font-normal text-[color:var(--text-subtle)]"
+            >(optional)</span
+          >
         </label>
         <select
           id="matching-opportunity-remote"
@@ -1224,7 +1429,10 @@
       </div>
 
       <div class="space-y-1.5">
-        <label for="matching-opportunity-description" class="text-xs font-medium text-[color:var(--text)]">
+        <label
+          for="matching-opportunity-description"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
           Description <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
         </label>
         <Textarea
@@ -1238,13 +1446,18 @@
       </div>
 
       <fieldset class="space-y-3 rounded-lg border border-[color:var(--border-faint)] p-4">
-        <legend class="px-1 text-xs font-semibold text-[color:var(--text)]">Matching criteria</legend>
+        <legend class="px-1 text-xs font-semibold text-[color:var(--text)]"
+          >Matching criteria</legend
+        >
         <p class="text-xs text-[color:var(--text-muted)]">
           Separate values with commas or new lines. Missing required criteria cap a candidate at 49.
         </p>
         <div class="grid gap-4 sm:grid-cols-2">
           <div class="space-y-1.5">
-            <label for="matching-required-skills" class="text-xs font-medium text-[color:var(--text)]">
+            <label
+              for="matching-required-skills"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
               Required skills
             </label>
             <Textarea
@@ -1257,7 +1470,10 @@
             />
           </div>
           <div class="space-y-1.5">
-            <label for="matching-preferred-skills" class="text-xs font-medium text-[color:var(--text)]">
+            <label
+              for="matching-preferred-skills"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
               Preferred skills
             </label>
             <Textarea
@@ -1270,7 +1486,10 @@
             />
           </div>
           <div class="space-y-1.5">
-            <label for="matching-required-titles" class="text-xs font-medium text-[color:var(--text)]">
+            <label
+              for="matching-required-titles"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
               Required titles
             </label>
             <Textarea
@@ -1283,7 +1502,10 @@
             />
           </div>
           <div class="space-y-1.5">
-            <label for="matching-required-locations" class="text-xs font-medium text-[color:var(--text)]">
+            <label
+              for="matching-required-locations"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
               Required locations
             </label>
             <Textarea
@@ -1318,6 +1540,32 @@
   </Dialog.Content>
 </Dialog.Root>
 
+<PersonOnboardingDialog
+  bind:open={onboardingDialogOpen}
+  busy={onboardingBusy}
+  error={onboardingError}
+  onSubmit={submitPersonOnboarding}
+  onRequestClose={requestPersonOnboardingClose}
+  onClearError={() => (onboardingError = '')}
+/>
+
+<AlertDialog.Root bind:open={discardOnboardingDialogOpen}>
+  <AlertDialog.Content class="max-w-md">
+    <AlertDialog.Header>
+      <AlertDialog.Title>Discard this person draft?</AlertDialog.Title>
+      <AlertDialog.Description>
+        The profile, identity and evidence entered in this dialog have not been saved.
+      </AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel onclick={() => (pendingOnboardingClose = null)}>
+        Keep editing
+      </AlertDialog.Cancel>
+      <AlertDialog.Action onclick={discardPersonOnboarding}>Discard draft</AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>
+
 <Sheet.Root bind:open={evidenceSheetOpen}>
   <Sheet.Content
     side="right"
@@ -1336,11 +1584,16 @@
 <AlertDialog.Root bind:open={recomputeDialogOpen}>
   <AlertDialog.Content class="max-w-md">
     <AlertDialog.Header>
-      <AlertDialog.Title>Recompute candidate ranking?</AlertDialog.Title>
+      <AlertDialog.Title
+        >{recomputePersonId
+          ? 'Rank the newly added person?'
+          : 'Recompute candidate ranking?'}</AlertDialog.Title
+      >
       <AlertDialog.Description>
-        This queues a background ranking run for “{data.selectedOpportunity?.title ||
-          'this opportunity'}”. Progress and safe failure codes will appear here. Human review
-        decisions are preserved.
+        {recomputePersonId
+          ? `This queues a focused ranking run for the new person against “${data.selectedOpportunity?.title || 'this opportunity'}”.`
+          : `This queues a background ranking run for “${data.selectedOpportunity?.title || 'this opportunity'}”.`}
+        Progress and safe failure codes will appear here. Human review decisions are preserved.
       </AlertDialog.Description>
     </AlertDialog.Header>
     <AlertDialog.Footer>
@@ -1360,6 +1613,7 @@
   class="hidden"
 >
   <input type="hidden" name="opportunity_id" value={data.selectedOpportunity?.id || ''} />
+  <input type="hidden" name="person_id" value={recomputePersonId} />
   <input type="hidden" name="idempotency_key" value={recomputeIdempotencyKey} />
 </form>
 
@@ -1379,7 +1633,6 @@
     <form method="POST" action="?/setStatus" use:enhance={statusEnhance} class="space-y-4">
       <input type="hidden" name="match_id" value={selectedMatch?.id || ''} />
       <input type="hidden" name="status" value={pendingDecision} />
-      <input type="hidden" name="reason_code" value={pendingReasonCode} />
       <input type="hidden" name="expected_revision" value={selectedMatch?.decisionRevision || 0} />
       <input
         type="hidden"
@@ -1388,13 +1641,36 @@
       />
       <input type="hidden" name="idempotency_key" value={decisionIdempotencyKey} />
 
-      <div
-        class="rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
-      >
-        Reason category: <span class="font-semibold text-[color:var(--text)]"
-          >{label(pendingReasonCode)}</span
+      {#if pendingDecision === 'rejected'}
+        <label
+          for="matching-rejection-reason"
+          class="block text-xs font-medium text-[color:var(--text)]"
         >
-      </div>
+          Structured rejection reason
+          <select
+            id="matching-rejection-reason"
+            name="reason_code"
+            bind:value={pendingReasonCode}
+            required
+            disabled={decisionBusyId === selectedMatch?.id}
+            class="mt-1.5 w-full rounded-md border bg-transparent px-3 py-2 text-sm"
+          >
+            <option value="" disabled>Select a reason</option>
+            {#each REJECTION_REASON_CODES as code (code)}
+              <option value={code}>{label(code)}</option>
+            {/each}
+          </select>
+        </label>
+      {:else}
+        <input type="hidden" name="reason_code" value={pendingReasonCode} />
+        <div
+          class="rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
+        >
+          Reason category: <span class="font-semibold text-[color:var(--text)]"
+            >{label(pendingReasonCode)}</span
+          >
+        </div>
+      {/if}
 
       <div class="space-y-1.5">
         <label for="matching-decision-reason" class="text-xs font-medium text-[color:var(--text)]">
@@ -1409,6 +1685,10 @@
         />
         <p class="text-right text-[11px] text-[color:var(--text-subtle)] tabular-nums">
           {decisionReason.length}/1000
+        </p>
+        <p class="text-[11px] text-[color:var(--text-subtle)]">
+          Do not paste identity values, private messages, source links or provider output. Aggregate
+          feedback uses the structured reason above, not this note.
         </p>
       </div>
 
