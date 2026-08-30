@@ -3,7 +3,7 @@ from datetime import timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
-from django.db import transaction
+from django.db import models, transaction
 from django.http import HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
@@ -17,6 +17,11 @@ from common.permissions import HasOrgContext, IsOrgAdmin
 from integrations.api.serializers import (
     ApolloConnectionSerializer,
     ApolloConnectionWriteSerializer,
+    ChannelSafetyApprovalWriteSerializer,
+    ChannelSafetyChannelWriteSerializer,
+    ChannelSafetyOrganizationWriteSerializer,
+    ChannelSafetyTargetWriteSerializer,
+    ChannelSafetyUnknownResolveSerializer,
     FacebookConversionSettingsSerializer,
     FacebookMessengerManualReplySerializer,
     FacebookMessengerSettingsSerializer,
@@ -27,21 +32,46 @@ from integrations.api.serializers import (
     FacebookPageConnectionSerializer,
     FeishuBaseConnectionSerializer,
     FeishuBaseConnectionWriteSerializer,
+    FeishuBaseExecutionWriteSerializer,
+    FeishuBasePersonImportWriteSerializer,
     LinkedInConnectionSerializer,
     LinkedInConnectionWriteSerializer,
     WhatsAppBusinessConnectionSerializer,
     WhatsAppBusinessConnectionWriteSerializer,
+    WhatsAppMessageExecutionSerializer,
+    WhatsAppMessageListQuerySerializer,
+)
+from integrations.execution_safety import (
+    ExecutionSafetyError,
+    add_test_target,
+    configure_channel,
+    configure_organization_execution,
+    disable_test_target,
+    issue_execution_approval,
+    resolve_unknown_execution,
 )
 from integrations.models import (
     ApolloConnection,
+    ChannelExecutionApproval,
+    ChannelExecutionControl,
+    ChannelTestTarget,
+    ExecutionChannel,
+    ExternalExecutionRequest,
+    ExternalRequestStatus,
     FacebookConversionSettings,
     FacebookMessengerMessage,
     FacebookMessengerReply,
     FacebookOAuthSession,
     FacebookPageConnection,
     FeishuBaseConnection,
+    FeishuBasePersonImport,
+    FeishuBaseSync,
+    FeishuBaseSyncStatus,
     LinkedInConnection,
+    OrganizationExecutionControl,
     WhatsAppBusinessConnection,
+    WhatsAppMessage,
+    WhatsAppMessageStatus,
     WhatsAppPhoneRoute,
 )
 from integrations.providers.facebook.adapter import (
@@ -74,11 +104,24 @@ from integrations.providers.facebook.service import (
     connect_facebook_page,
     set_facebook_messenger_enabled,
 )
-from integrations.providers.feishu_base.client import (
-    FeishuBaseAPIError,
-    FeishuBaseClient,
-    FeishuBaseConfigurationError,
-    validate_field_mapping,
+from integrations.providers.feishu_base.person_import import (
+    enqueue_feishu_person_import,
+    feishu_person_import_execution_intent,
+)
+from integrations.providers.feishu_base.sync import (
+    FeishuBaseSyncUnavailable,
+    enqueue_feishu_base_sync,
+    enqueue_feishu_remote_delete,
+    enqueue_feishu_schema_validation,
+    feishu_delete_execution_intent,
+    feishu_research_sync_execution_intent,
+    feishu_schema_execution_intent,
+)
+from integrations.providers.whatsapp.outbound import (
+    WHATSAPP_SEND_ACTION,
+    WhatsAppCampaignUnavailable,
+    reserve_and_enqueue_whatsapp_message,
+    whatsapp_message_execution_intent,
 )
 from integrations.providers.whatsapp.webhooks import (
     process_whatsapp_status_webhook,
@@ -86,9 +129,205 @@ from integrations.providers.whatsapp.webhooks import (
 )
 from integrations.secrets import SecretDecryptionError
 from leads.models import Lead
+from sdr.compliance import intake_data_restriction
 from sdr.models import LeadIntake
 
 logger = logging.getLogger(__name__)
+
+
+def _channel_safety_error(exc):
+    return Response(exc.as_dict(), status=exc.status_code)
+
+
+def _uuid_header(request):
+    from uuid import UUID
+
+    try:
+        return UUID(request.headers.get("Idempotency-Key", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+class ChannelSafetySummaryView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def get(self, request):
+        org_control = OrganizationExecutionControl.objects.filter(org=request.org).first()
+        controls = {
+            item.channel: item
+            for item in ChannelExecutionControl.objects.filter(org=request.org)
+        }
+        targets = list(ChannelTestTarget.objects.filter(org=request.org).order_by("channel", "safe_label"))
+        target_labels = {(item.channel, item.identifier_hash): item.safe_label for item in targets}
+        now = timezone.now()
+        approvals = ChannelExecutionApproval.objects.filter(
+            org=request.org, consumed_at__isnull=True, expires_at__gt=now
+        ).order_by("expires_at")
+        unknown = ExternalExecutionRequest.objects.filter(
+            org=request.org, status=ExternalRequestStatus.UNKNOWN
+        ).order_by("unknown_at")
+        return Response(
+            {
+                "environment_enabled": bool(
+                    getattr(settings, "REAL_CHANNEL_EXECUTION_ENABLED", False)
+                ),
+                "organization": {
+                    "enabled": org_control.enabled if org_control else False,
+                    "daily_limit": org_control.daily_limit if org_control else 0,
+                    "reserved_units": org_control.reserved_units if org_control else 0,
+                    "consumed_units": org_control.consumed_units if org_control else 0,
+                    "revision": org_control.revision if org_control else 0,
+                },
+                "channels": [
+                    {
+                        "channel": channel,
+                        "implemented": channel not in {ExecutionChannel.WECHAT, ExecutionChannel.WECOM},
+                        "enabled": bool(controls.get(channel) and controls[channel].enabled)
+                        if channel not in {ExecutionChannel.WECHAT, ExecutionChannel.WECOM}
+                        else False,
+                        "test_mode": controls[channel].test_mode if channel in controls else True,
+                        "daily_limit": controls[channel].daily_limit if channel in controls else 0,
+                        "per_execution_limit": controls[channel].per_execution_limit if channel in controls else 0,
+                        "reserved_units": controls[channel].reserved_units if channel in controls else 0,
+                        "consumed_units": controls[channel].consumed_units if channel in controls else 0,
+                        "revision": controls[channel].revision if channel in controls else 0,
+                    }
+                    for channel in ExecutionChannel.values
+                ],
+                "test_targets": [
+                    {"id": item.id, "channel": item.channel, "safe_label": item.safe_label, "active": item.is_active}
+                    for item in targets
+                ],
+                "approvals": [
+                    {
+                        "id": item.id,
+                        "channel": item.channel,
+                        "action": item.action,
+                        "safe_label": target_labels.get((item.channel, item.target_hash), "Approved test target"),
+                        "units": item.units,
+                        "expires_at": item.expires_at,
+                    }
+                    for item in approvals
+                ],
+                "unknown_requests": [
+                    {
+                        "id": item.id,
+                        "channel": item.channel,
+                        "action": item.action,
+                        "units": item.units,
+                        "status": item.status,
+                        "sending_at": item.sending_at,
+                        "unknown_at": item.unknown_at,
+                    }
+                    for item in unknown
+                ],
+            }
+        )
+
+
+class ChannelSafetyOrganizationView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def put(self, request):
+        serializer = ChannelSafetyOrganizationWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            control = configure_organization_execution(
+                org=request.org, actor=request.profile, **serializer.validated_data
+            )
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        return Response({"enabled": control.enabled, "daily_limit": control.daily_limit, "revision": control.revision})
+
+
+class ChannelSafetyChannelView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def put(self, request, channel):
+        serializer = ChannelSafetyChannelWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            control = configure_channel(
+                org=request.org, actor=request.profile, channel=channel, **serializer.validated_data
+            )
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        return Response({"channel": control.channel, "enabled": control.enabled, "test_mode": control.test_mode, "daily_limit": control.daily_limit, "per_execution_limit": control.per_execution_limit, "revision": control.revision})
+
+
+class ChannelSafetyTargetListCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def post(self, request):
+        serializer = ChannelSafetyTargetWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            target = add_test_target(org=request.org, actor=request.profile, **serializer.validated_data)
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        return Response({"id": target.id, "channel": target.channel, "safe_label": target.safe_label, "active": target.is_active}, status=201)
+
+
+class ChannelSafetyTargetDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def delete(self, request, target_id):
+        try:
+            disable_test_target(org=request.org, actor=request.profile, target_id=target_id)
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        return Response(status=204)
+
+
+class ChannelSafetyApprovalCreateView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def post(self, request):
+        key = _uuid_header(request)
+        if key is None:
+            return Response({"idempotency_key": ["A valid UUID Idempotency-Key is required."]}, status=400)
+        serializer = ChannelSafetyApprovalWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        target = ChannelTestTarget.objects.filter(
+            org=request.org, id=data["target_id"], is_active=True
+        ).first()
+        if target is None:
+            return Response(status=404)
+        try:
+            result = issue_execution_approval(
+                org=request.org,
+                approved_by=request.profile,
+                channel=target.channel,
+                action=data["action"],
+                target_hash=target.identifier_hash,
+                payload_hash=data["payload_sha256"],
+                units=data["units"],
+                expires_in=timedelta(seconds=data["expires_in_seconds"]),
+                idempotency_key=key,
+            )
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        approval = result.approval
+        return Response(
+            {"id": approval.id, "channel": approval.channel, "action": approval.action, "safe_label": target.safe_label, "units": approval.units, "expires_at": approval.expires_at, "replayed": result.replayed},
+            status=200 if result.replayed else 201,
+        )
+
+
+class ChannelSafetyUnknownResolveView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    def post(self, request, request_id):
+        serializer = ChannelSafetyUnknownResolveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = resolve_unknown_execution(
+                org=request.org, actor=request.profile, request_id=request_id, **serializer.validated_data
+            )
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        return Response({"id": item.id, "status": item.status, "error_code": item.error_code})
 
 
 def _local_connection_test_payload(code: str, *, ok: bool = False) -> dict:
@@ -286,6 +525,16 @@ class LinkedInConnectionView(APIView):
         return Response(LinkedInConnectionSerializer(connection).data)
 
 
+def _feishu_protected_destination_change(connection, values) -> bool:
+    if "app_id" in values and values["app_id"] != connection.app_id:
+        return True
+    return any(
+        values.get(field_name)
+        and values[field_name] != getattr(connection, field_name)
+        for field_name in ("app_token", "table_id")
+    )
+
+
 class FeishuBaseConnectionView(APIView):
     permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
 
@@ -300,10 +549,10 @@ class FeishuBaseConnectionView(APIView):
                 {
                     "id": None,
                     "app_id": "",
+                    "app_id_configured": False,
                     "app_secret_configured": False,
-                    "app_secret_hint": "",
-                    "app_token": "",
-                    "table_id": "",
+                    "app_token_configured": False,
+                    "table_id_configured": False,
                     "field_mapping": {},
                     "is_active": False,
                     "last_validated_at": None,
@@ -316,6 +565,9 @@ class FeishuBaseConnectionView(APIView):
                         "succeeded": 0,
                         "failed": 0,
                         "skipped": 0,
+                        "unknown": 0,
+                        "external_erasure_pending": 0,
+                        "external_erasure_completed": 0,
                     },
                     "created_at": None,
                     "updated_at": None,
@@ -329,93 +581,477 @@ class FeishuBaseConnectionView(APIView):
         responses={200: FeishuBaseConnectionSerializer},
     )
     def put(self, request):
-        connection = FeishuBaseConnection.objects.filter(org=request.org).first()
-        serializer = FeishuBaseConnectionWriteSerializer(
-            data=request.data,
-            context={"connection": connection},
-        )
-        serializer.is_valid(raise_exception=True)
-        values = serializer.validated_data
-        if connection is None:
-            connection = FeishuBaseConnection(org=request.org)
-        if values.get("app_secret"):
-            connection.set_app_secret(values["app_secret"])
-        for field_name in (
-            "app_id",
-            "app_token",
-            "table_id",
-            "field_mapping",
-            "is_active",
-        ):
-            if field_name in values:
-                setattr(connection, field_name, values[field_name])
-        connection.full_clean()
-        connection.save()
+        with transaction.atomic():
+            connection = FeishuBaseConnection.objects.select_for_update().filter(
+                org=request.org
+            ).first()
+            serializer = FeishuBaseConnectionWriteSerializer(
+                data=request.data,
+                context={"connection": connection},
+            )
+            serializer.is_valid(raise_exception=True)
+            values = serializer.validated_data
+            if connection is None:
+                connection = FeishuBaseConnection(org=request.org)
+            elif _feishu_protected_destination_change(connection, values):
+                protected_sync_exists = FeishuBaseSync.objects.filter(
+                    org=request.org
+                ).filter(
+                    models.Q(record_id_ciphertext__gt="")
+                    | models.Q(status=FeishuBaseSyncStatus.UNKNOWN)
+                ).exists()
+                if protected_sync_exists:
+                    return Response(
+                        {
+                            "code": "feishu_destination_locked",
+                            "detail": (
+                                "Delete or reconcile existing Feishu Base records "
+                                "before changing connection identifiers."
+                            ),
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+            if values.get("app_secret"):
+                connection.set_app_secret(values["app_secret"])
+            for field_name in ("app_id", "field_mapping", "is_active"):
+                if field_name in values:
+                    setattr(connection, field_name, values[field_name])
+            # Empty identifier values mean "keep the stored value". This lets
+            # the UI replace a destination without reading current tokens.
+            for field_name in ("app_token", "table_id"):
+                if values.get(field_name):
+                    setattr(connection, field_name, values[field_name])
+            connection.full_clean()
+            connection.save()
         return Response(FeishuBaseConnectionSerializer(connection).data)
 
 
 class FeishuBaseConnectionTestView(APIView):
     permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
 
-    @extend_schema(tags=["Integrations - Feishu Base"], responses={200: dict})
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        request=FeishuBaseExecutionWriteSerializer,
+        responses={200: dict, 202: dict},
+    )
     def post(self, request):
         connection = FeishuBaseConnection.objects.filter(org=request.org).first()
-        if connection is None or not all(
-            (
-                connection.app_id,
-                connection.app_secret_ciphertext,
-                connection.app_token,
-                connection.table_id,
-                connection.field_mapping.get("intake_id"),
-            )
-        ):
-            return Response(
-                {
-                    "detail": "Save the app credentials, target table, and field mapping first."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        client = FeishuBaseClient(
-            base_url=settings.FEISHU_OPEN_API_BASE_URL,
-            timeout=settings.FEISHU_OPEN_API_TIMEOUT,
-        )
+        if connection is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = FeishuBaseExecutionWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            access_token = client.tenant_access_token(
-                app_id=connection.app_id,
-                app_secret=connection.get_app_secret(),
+            if not serializer.validated_data:
+                intent = feishu_schema_execution_intent(connection)
+                return Response(
+                    {"approval_required": True, "intent": intent.as_dict()}
+                )
+            job = enqueue_feishu_schema_validation(
+                connection=connection,
+                **serializer.validated_data,
             )
-            fields = client.list_fields(
-                access_token=access_token,
-                app_token=connection.app_token,
-                table_id=connection.table_id,
+        except FeishuBaseSyncUnavailable as exc:
+            return _feishu_base_error(exc)
+        return _feishu_job_response(job)
+
+
+class FeishuBaseResearchSyncView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        request=FeishuBaseExecutionWriteSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request, intake_id):
+        intake = LeadIntake.objects.filter(org=request.org, id=intake_id).first()
+        if intake is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = FeishuBaseExecutionWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            if not serializer.validated_data:
+                intent = feishu_research_sync_execution_intent(intake=intake)
+                return Response(
+                    {"approval_required": True, "intent": intent.as_dict()}
+                )
+            job = enqueue_feishu_base_sync(
+                intake=intake,
+                **serializer.validated_data,
             )
-            validate_field_mapping(connection.field_mapping, fields)
-        except FeishuBaseConfigurationError as exc:
-            return Response(
-                {
-                    "detail": str(exc),
-                    "missing_fields": exc.missing_fields,
-                    "type_mismatches": exc.type_mismatches,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except FeishuBaseAPIError as exc:
-            return Response(
-                {"detail": str(exc), "code": exc.error_code},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-        validated_at = timezone.now()
-        FeishuBaseConnection.objects.filter(
-            id=connection.id,
-            org=request.org,
-        ).update(last_validated_at=validated_at)
+        except FeishuBaseSyncUnavailable as exc:
+            return _feishu_base_error(exc)
+        return _feishu_job_response(job)
+
+
+class FeishuBaseSyncListView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["Integrations - Feishu Base"], responses={200: dict})
+    def get(self, request):
+        rows = (
+            FeishuBaseSync.objects.filter(org=request.org)
+            .select_related("execution_request")
+            .order_by("-updated_at", "-id")[:100]
+        )
         return Response(
             {
-                "valid": True,
-                "field_count": len(fields),
-                "mapped_fields": sorted(connection.field_mapping.values()),
-                "validated_at": validated_at,
+                "results": [
+                    {
+                        "id": row.id,
+                        "intake_id": row.intake_id,
+                        "safe_label": row.record_safe_label
+                        or f"Research sync {str(row.id)[:8]}",
+                        "status": row.status,
+                        "external_erasure_status": _feishu_erasure_status(row),
+                        "can_delete": row.has_remote_record
+                        and row.status
+                        in {
+                            FeishuBaseSyncStatus.SUCCEEDED,
+                            FeishuBaseSyncStatus.EXTERNAL_ERASURE_PENDING,
+                        },
+                        "updated_at": row.updated_at,
+                    }
+                    for row in rows
+                ]
             }
+        )
+
+
+class FeishuBaseRemoteDeleteView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        request=FeishuBaseExecutionWriteSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request, sync_id):
+        sync = (
+            FeishuBaseSync.objects.filter(org=request.org, id=sync_id)
+            .select_related("connection", "intake")
+            .first()
+        )
+        if sync is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = FeishuBaseExecutionWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            if not serializer.validated_data:
+                intent = feishu_delete_execution_intent(sync)
+                return Response(
+                    {"approval_required": True, "intent": intent.as_dict()}
+                )
+            job = enqueue_feishu_remote_delete(
+                sync=sync,
+                **serializer.validated_data,
+            )
+        except FeishuBaseSyncUnavailable as exc:
+            return _feishu_base_error(exc)
+        return _feishu_job_response(job)
+
+
+class FeishuBasePersonImportPreviewView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - Feishu Base"],
+        request=FeishuBasePersonImportWriteSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request):
+        connection = FeishuBaseConnection.objects.filter(org=request.org).first()
+        if connection is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = FeishuBasePersonImportWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        mapping = data.pop("mapping")
+        row_limit = data.pop("limit")
+        try:
+            if not data:
+                intent = feishu_person_import_execution_intent(
+                    connection=connection,
+                    mapping=mapping,
+                    row_limit=row_limit,
+                )
+                return Response(
+                    {"approval_required": True, "intent": intent.as_dict()}
+                )
+            result = enqueue_feishu_person_import(
+                connection=connection,
+                requested_by=request.profile,
+                mapping=mapping,
+                row_limit=row_limit,
+                **data,
+            )
+        except FeishuBaseSyncUnavailable as exc:
+            return _feishu_base_error(exc)
+        return Response(
+            _safe_feishu_person_import(result.person_import, replayed=result.replayed),
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class FeishuBasePersonImportDetailView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["Integrations - Feishu Base"], responses={200: dict})
+    def get(self, request, import_id):
+        person_import = (
+            FeishuBasePersonImport.objects.filter(org=request.org, id=import_id)
+            .select_related("automation_job", "import_batch")
+            .first()
+        )
+        if person_import is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(_safe_feishu_person_import(person_import))
+
+
+def _feishu_base_error(exc):
+    forbidden = {
+        "environment_execution_disabled",
+        "organization_execution_disabled",
+        "channel_disabled",
+        "target_not_allowlisted",
+    }
+    response_status = (
+        status.HTTP_403_FORBIDDEN
+        if exc.code in forbidden
+        else status.HTTP_409_CONFLICT
+    )
+    return Response(
+        {"code": exc.code, "detail": str(exc)},
+        status=response_status,
+    )
+
+
+def _safe_feishu_person_import(person_import, *, replayed=False):
+    job = person_import.automation_job
+    return {
+        "id": person_import.id,
+        "status": person_import.status,
+        "job_id": job.id if job else None,
+        "job_status": job.status if job else None,
+        "status_url": (
+            f"/api/integrations/feishu-base/person-imports/{person_import.id}/"
+        ),
+        "batch_id": person_import.import_batch_id,
+        "error_code": person_import.error_code,
+        "total_count": person_import.total_count,
+        "ready_count": person_import.ready_count,
+        "invalid_count": person_import.invalid_count,
+        "created_at": person_import.created_at,
+        "completed_at": person_import.completed_at,
+        "replayed": replayed,
+    }
+
+
+def _feishu_job_response(job):
+    return Response(
+        {
+            "job_id": job.id,
+            "execution_request_id": job.payload["execution_request_id"],
+            "status": job.status,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+def _feishu_erasure_status(sync):
+    if sync.status == FeishuBaseSyncStatus.EXTERNAL_ERASURE_COMPLETED:
+        return "completed"
+    if sync.status == FeishuBaseSyncStatus.EXTERNAL_ERASURE_PENDING:
+        return "pending"
+    if (
+        sync.status == FeishuBaseSyncStatus.UNKNOWN
+        and sync.execution_request_id
+        and sync.execution_request.action == "delete_research_record"
+    ):
+        return "unknown"
+    return "available" if sync.has_remote_record else "none"
+
+
+WHATSAPP_APPROVABLE_MESSAGE_STATUSES = frozenset(
+    {
+        WhatsAppMessageStatus.PENDING,
+        WhatsAppMessageStatus.QUEUED,
+    }
+)
+
+
+def _safe_whatsapp_message(message):
+    execution_request = message.execution_request
+    return {
+        "id": message.id,
+        "campaign_id": message.campaign_id,
+        "prospect_id": message.prospect_id,
+        "status": message.status,
+        "execution_request_id": message.execution_request_id,
+        "execution_status": (
+            execution_request.status if execution_request is not None else None
+        ),
+        "created_at": message.created_at,
+    }
+
+
+def _whatsapp_execution_intent_payload(*, message, intent):
+    return {
+        "channel": ExecutionChannel.WHATSAPP,
+        "action": WHATSAPP_SEND_ACTION,
+        "message_id": str(message.id),
+        "target_sha256": intent.target_hash,
+        "payload_sha256": intent.payload_hash,
+        "units": intent.units,
+    }
+
+
+def _whatsapp_execution_unavailable():
+    return Response(
+        {
+            "code": "whatsapp_execution_unavailable",
+            "detail": "The WhatsApp message cannot be approved in its current state.",
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _whatsapp_non_reserved_replay_response(execution_request):
+    response_status = (
+        status.HTTP_200_OK
+        if execution_request.status
+        in {
+            ExternalRequestStatus.ACCEPTED,
+            ExternalRequestStatus.DELIVERED,
+        }
+        else status.HTTP_409_CONFLICT
+    )
+    return Response(
+        {
+            "code": "whatsapp_execution_not_replayable",
+            "detail": (
+                "This WhatsApp execution has already left RESERVED state; "
+                "no provider job was queued."
+            ),
+            "execution_request_id": str(execution_request.id),
+            "execution_status": execution_request.status,
+            "replayed": True,
+        },
+        status=response_status,
+    )
+
+
+class WhatsAppMessageListView(APIView):
+    """Reviewable, strictly non-PII WhatsApp execution queue."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["Integrations - WhatsApp"], responses={200: dict})
+    def get(self, request):
+        serializer = WhatsAppMessageListQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        filters = serializer.validated_data
+        messages = WhatsAppMessage.objects.filter(
+            org=request.org,
+            campaign__org=request.org,
+            prospect__org=request.org,
+            connection__org=request.org,
+        ).select_related("execution_request")
+        if filters.get("campaign_id"):
+            messages = messages.filter(campaign_id=filters["campaign_id"])
+        if filters.get("status"):
+            messages = messages.filter(status=filters["status"])
+        count = messages.count()
+        messages = messages.order_by("-created_at", "-id")[: filters["limit"]]
+        return Response(
+            {
+                "count": count,
+                "results": [_safe_whatsapp_message(message) for message in messages],
+            }
+        )
+
+
+class WhatsAppMessageExecutionView(APIView):
+    """Preview or reserve one exact WhatsApp provider attempt."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["Integrations - WhatsApp"],
+        request=WhatsAppMessageExecutionSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request, message_id):
+        message = (
+            WhatsAppMessage.objects.filter(
+                id=message_id,
+                org=request.org,
+                campaign__org=request.org,
+                prospect__org=request.org,
+                connection__org=request.org,
+            )
+            .select_related(
+                "org",
+                "connection__route",
+                "campaign",
+                "prospect",
+                "execution_request",
+            )
+            .first()
+        )
+        if message is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        serializer = WhatsAppMessageExecutionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if (
+            message.execution_request_id
+            and message.execution_request.status != ExternalRequestStatus.RESERVED
+        ):
+            return _whatsapp_non_reserved_replay_response(message.execution_request)
+        if message.status not in WHATSAPP_APPROVABLE_MESSAGE_STATUSES:
+            return _whatsapp_execution_unavailable()
+
+        try:
+            intent = whatsapp_message_execution_intent(message)
+        except WhatsAppCampaignUnavailable:
+            return _whatsapp_execution_unavailable()
+
+        approval_id = serializer.validated_data.get("approval_id")
+        if approval_id is None:
+            return Response(
+                {
+                    "approval_required": True,
+                    "intent": _whatsapp_execution_intent_payload(
+                        message=message,
+                        intent=intent,
+                    ),
+                }
+            )
+
+        try:
+            submission = reserve_and_enqueue_whatsapp_message(
+                message,
+                approval_id=approval_id,
+            )
+        except ExecutionSafetyError as exc:
+            return _channel_safety_error(exc)
+        except WhatsAppCampaignUnavailable:
+            return _whatsapp_execution_unavailable()
+        if (
+            submission.request.status != ExternalRequestStatus.RESERVED
+            or submission.job is None
+        ):
+            return _whatsapp_non_reserved_replay_response(submission.request)
+        return Response(
+            {
+                "job_id": str(submission.job.id),
+                "status": submission.job.status,
+                "execution_request_id": str(submission.request.id),
+                "execution_status": submission.request.status,
+                "replayed": submission.replayed,
+            },
+            status=status.HTTP_202_ACCEPTED,
         )
 
 
@@ -916,15 +1552,19 @@ class FacebookMessengerConversationView(APIView):
         window_expires_at = (
             latest.occurred_at + timedelta(hours=24) if latest is not None else None
         )
+        restriction = intake_data_restriction(intake)
         can_reply = bool(
             latest
             and connection
             and connection.is_active
             and connection.messenger_enabled
+            and not restriction
             and window_expires_at
             and window_expires_at > timezone.now()
         )
-        if latest is None:
+        if restriction:
+            unavailable_reason = restriction.code
+        elif latest is None:
             unavailable_reason = "no_inbound_message"
         elif connection is None or not connection.is_active:
             unavailable_reason = "page_disconnected"

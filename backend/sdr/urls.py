@@ -7,7 +7,9 @@ from sdr.api.views import (
     LeadIntakeListView,
     LeadNurtureEnrollmentActionView,
     LeadNurtureEnrollmentListView,
+    SDRAcknowledgementEmailExecutionView,
     SDRAnalyticsView,
+    SDRApolloCandidateEnrichView,
     SDRComplianceDeletionActionView,
     SDRComplianceOverviewView,
     SDRComplianceRetentionScanView,
@@ -21,6 +23,7 @@ from sdr.api.views import (
     SDREmailSuppressionDetailView,
     SDREmailSuppressionListCreateView,
     SDRIntelligenceSettingsView,
+    SDRNurtureEmailExecutionView,
     SDRNurtureSequenceDetailView,
     SDRNurtureSequenceListCreateView,
     SDROutboundCampaignActionView,
@@ -33,6 +36,7 @@ from sdr.api.views import (
     SDROutboundProspectActionView,
     SDROutboundProspectImportView,
     SDROutboundProspectListView,
+    SDROutboundSourceApolloCandidateListView,
     SDROutboundSourceDetailView,
     SDROutboundSourceListCreateView,
     SDROutboundSourceSyncView,
@@ -49,6 +53,16 @@ from sdr.unsubscribe_views import NurtureUnsubscribeView
 app_name = "api_sdr"
 
 urlpatterns = [
+    path(
+        "email/acknowledgements/<uuid:delivery_id>/execution/",
+        SDRAcknowledgementEmailExecutionView.as_view(),
+        name="acknowledgement_email_execution",
+    ),
+    path(
+        "email/nurture/<uuid:delivery_id>/execution/",
+        SDRNurtureEmailExecutionView.as_view(),
+        name="nurture_email_execution",
+    ),
     path("analytics/funnel/", SDRAnalyticsView.as_view(), name="analytics_funnel"),
     path(
         "compliance/",
@@ -164,6 +178,16 @@ urlpatterns = [
         "outbound/sources/<uuid:source_id>/sync/",
         SDROutboundSourceSyncView.as_view(),
         name="outbound_source_sync",
+    ),
+    path(
+        "outbound/sources/<uuid:source_id>/apollo-candidates/",
+        SDROutboundSourceApolloCandidateListView.as_view(),
+        name="outbound_source_apollo_candidates",
+    ),
+    path(
+        "outbound/apollo-candidates/<uuid:candidate_id>/enrich/",
+        SDRApolloCandidateEnrichView.as_view(),
+        name="outbound_apollo_candidate_enrich",
     ),
     path(
         "outbound/prospects/<uuid:prospect_id>/action/",

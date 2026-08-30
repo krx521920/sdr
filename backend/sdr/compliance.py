@@ -48,6 +48,7 @@ from sdr.provider_ports import provider_data_governance_adapters
 from sdr.routing import normalize_country
 
 PHONE_NON_DIGITS = re.compile(r"\D")
+WECHAT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{5,19}$")
 SOURCE_COLLECTION_METHOD = {
     LeadSource.FACEBOOK_AD: SDRCollectionMethod.INBOUND_FORM,
     LeadSource.WEBSITE_FORM: SDRCollectionMethod.INBOUND_FORM,
@@ -81,7 +82,23 @@ class DataProcessingRestriction:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class ContactGovernanceContext:
+    """Portable contact-governance facts for callers without an SDR intake."""
+
+    lawful_basis: str = SDRLawfulBasis.UNASSESSED
+    notes: str = ""
+    consent: Mapping[str, Any] | None = None
+    country: str = ""
+    allowed_channels: tuple[str, ...] = ()
+    processing_status: str = SDRProvenanceStatus.ACTIVE
+
+
 PROVENANCE_PROCESSING_RESTRICTIONS = {
+    SDRProvenanceStatus.RETENTION_DUE: DataProcessingRestriction(
+        code="data_retention_due",
+        reason="The intake's retention period has elapsed.",
+    ),
     SDRProvenanceStatus.DELETION_REQUESTED: DataProcessingRestriction(
         code="data_deletion_requested",
         reason="The intake has an active data deletion request.",
@@ -89,6 +106,13 @@ PROVENANCE_PROCESSING_RESTRICTIONS = {
     SDRProvenanceStatus.ANONYMIZED: DataProcessingRestriction(
         code="data_anonymized",
         reason="The intake's SDR-owned data has been anonymized.",
+    ),
+}
+GOVERNANCE_PROCESSING_RESTRICTIONS = {
+    **PROVENANCE_PROCESSING_RESTRICTIONS,
+    "restricted": DataProcessingRestriction(
+        code="data_processing_restricted",
+        reason="Processing is restricted for this person.",
     ),
 }
 
@@ -106,6 +130,8 @@ def normalize_contact_identifier(channel: str, value: str) -> str:
         host = (parsed.hostname or "").lower().removeprefix("www.")
         path = parsed.path.rstrip("/").lower()
         return urlunsplit(("https", host, path, "", "")) if host else cleaned.lower()
+    if channel == SDRComplianceChannel.WECHAT:
+        return cleaned.lower()
     raise ValueError("Unsupported compliance channel.")
 
 
@@ -130,6 +156,8 @@ def _valid_contact_identifier(channel: str, identifier: str) -> bool:
                 return False
             return True
         return bool(urlsplit(identifier).hostname)
+    if channel == SDRComplianceChannel.WECHAT:
+        return bool(WECHAT_ID_PATTERN.fullmatch(identifier))
     return False
 
 
@@ -208,15 +236,13 @@ def ensure_intake_provenance(
         "source_url": source_url,
         "lawful_basis": lawful_basis,
         "lawful_basis_notes": str(
-            raw.get("lawful_basis_notes")
-            or getattr(prospect, "lawful_basis_notes", "")
+            raw.get("lawful_basis_notes") or getattr(prospect, "lawful_basis_notes", "")
         ).strip(),
         "consent_at": _consent_datetime(
             raw.get("consent_at") or getattr(prospect, "consent_at", None)
         ),
         "consent_evidence": str(
-            raw.get("consent_evidence")
-            or getattr(prospect, "consent_evidence", "")
+            raw.get("consent_evidence") or getattr(prospect, "consent_evidence", "")
         ).strip(),
         "country_code": country,
         "allowed_channels": allowed_channels,
@@ -252,33 +278,29 @@ def evaluate_contact(
     country_code: str = "",
     intake: LeadIntake | None = None,
     prospect: SDROutboundProspect | None = None,
+    governance: ContactGovernanceContext | Mapping[str, Any] | None = None,
     event_key: str = "",
 ) -> ComplianceDecision:
     if channel not in SDRComplianceChannel.values:
-        return _decision(False, "unsupported_channel", "Unsupported channel.", channel, "")
-    normalized = normalize_contact_identifier(channel, identifier)
-    country = normalize_country(
-        country_code or (prospect.country if prospect else "")
-    )[:3]
-    if not normalized:
-        return _decision(False, "missing_identifier", "A contact identifier is required.", channel, country)
-
-    identifier_hash = _identifier_hash(channel, normalized)
-    if not _valid_contact_identifier(channel, normalized):
-        decision = _decision(
-            False,
-            "invalid_identifier",
-            "The contact identifier is invalid for this channel.",
-            channel,
-            country,
+        return _decision(
+            False, "unsupported_channel", "Unsupported channel.", channel, ""
         )
-        _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
-        return decision
-
+    governance_context = _coerce_governance_context(governance)
     provenance = _provenance_for(intake=intake, prospect=prospect)
+    country = normalize_country(
+        country_code
+        or (governance_context.country if governance_context else "")
+        or (prospect.country if prospect else "")
+    )[:3]
+    normalized = normalize_contact_identifier(channel, identifier)
+    identifier_hash = _identifier_hash(channel, normalized)
     restriction = (
         PROVENANCE_PROCESSING_RESTRICTIONS.get(provenance.status)
         if provenance
+        else None
+    ) or (
+        GOVERNANCE_PROCESSING_RESTRICTIONS.get(governance_context.processing_status)
+        if governance_context
         else None
     )
     if restriction:
@@ -286,6 +308,25 @@ def evaluate_contact(
             False,
             restriction.code,
             restriction.reason,
+            channel,
+            country,
+        )
+        _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+        return decision
+    if not normalized:
+        return _decision(
+            False,
+            "missing_identifier",
+            "A contact identifier is required.",
+            channel,
+            country,
+        )
+
+    if not _valid_contact_identifier(channel, normalized):
+        decision = _decision(
+            False,
+            "invalid_identifier",
+            "The contact identifier is invalid for this channel.",
             channel,
             country,
         )
@@ -308,11 +349,14 @@ def evaluate_contact(
         )
         _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
         return decision
-    if channel == SDRComplianceChannel.EMAIL and SDREmailSuppression.objects.filter(
-        org_id=org_id,
-        email__iexact=normalized,
-        is_active=True,
-    ).exists():
+    if (
+        channel == SDRComplianceChannel.EMAIL
+        and SDREmailSuppression.objects.filter(
+            org_id=org_id,
+            email__iexact=normalized,
+            is_active=True,
+        ).exists()
+    ):
         decision = _decision(
             False,
             "email_suppressed",
@@ -334,9 +378,12 @@ def evaluate_contact(
     )
     # Alphabetic ordering puts '*' before a country. Prefer the exact match.
     if country:
-        rule = SDRChannelComplianceRule.objects.filter(
-            org_id=org_id, channel=channel, country_code=country
-        ).first() or rule
+        rule = (
+            SDRChannelComplianceRule.objects.filter(
+                org_id=org_id, channel=channel, country_code=country
+            ).first()
+            or rule
+        )
     if rule and not rule.is_allowed:
         decision = _decision(
             False,
@@ -348,36 +395,48 @@ def evaluate_contact(
         _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
         return decision
 
-    lawful_basis = (
-        provenance.lawful_basis
-        if provenance
-        else getattr(prospect, "lawful_basis", SDRLawfulBasis.UNASSESSED)
-    )
-    allowed_channels = (
-        provenance.allowed_channels
-        if provenance
-        else getattr(prospect, "allowed_channels", list(SDRComplianceChannel.values))
-    )
-    consent_at = (
-        provenance.consent_at
-        if provenance
-        else getattr(prospect, "consent_at", None)
-    )
-    consent_evidence = (
-        provenance.consent_evidence
-        if provenance
-        else getattr(prospect, "consent_evidence", "")
-    )
-    lawful_basis_notes = (
-        provenance.lawful_basis_notes
-        if provenance
-        else getattr(prospect, "lawful_basis_notes", "")
-    )
-    if rule and rule.requires_consent and (
-        lawful_basis != SDRLawfulBasis.CONSENT
-        or channel not in allowed_channels
-        or not consent_at
-        or not consent_evidence.strip()
+    if governance_context:
+        lawful_basis = governance_context.lawful_basis
+        allowed_channels = clean_channels(governance_context.allowed_channels)
+        consent_at, consent_evidence = _governance_consent(governance_context)
+        lawful_basis_notes = governance_context.notes
+    else:
+        lawful_basis = (
+            provenance.lawful_basis
+            if provenance
+            else getattr(prospect, "lawful_basis", SDRLawfulBasis.UNASSESSED)
+        )
+        allowed_channels = (
+            provenance.allowed_channels
+            if provenance
+            else getattr(
+                prospect, "allowed_channels", list(SDRComplianceChannel.values)
+            )
+        )
+        consent_at = (
+            provenance.consent_at
+            if provenance
+            else getattr(prospect, "consent_at", None)
+        )
+        consent_evidence = (
+            provenance.consent_evidence
+            if provenance
+            else getattr(prospect, "consent_evidence", "")
+        )
+        lawful_basis_notes = (
+            provenance.lawful_basis_notes
+            if provenance
+            else getattr(prospect, "lawful_basis_notes", "")
+        )
+    if (
+        rule
+        and rule.requires_consent
+        and (
+            lawful_basis != SDRLawfulBasis.CONSENT
+            or channel not in allowed_channels
+            or not consent_at
+            or not consent_evidence.strip()
+        )
     ):
         decision = _decision(
             False,
@@ -399,7 +458,9 @@ def evaluate_contact(
                 channel,
                 country,
             )
-            _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+            _audit_decision(
+                decision, org_id, intake, prospect, event_key, identifier_hash
+            )
             return decision
         if lawful_basis == SDRLawfulBasis.CONSENT and (
             not consent_at or not consent_evidence.strip()
@@ -411,7 +472,9 @@ def evaluate_contact(
                 channel,
                 country,
             )
-            _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+            _audit_decision(
+                decision, org_id, intake, prospect, event_key, identifier_hash
+            )
             return decision
         if (
             lawful_basis == SDRLawfulBasis.LEGITIMATE_INTEREST
@@ -424,7 +487,9 @@ def evaluate_contact(
                 channel,
                 country,
             )
-            _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+            _audit_decision(
+                decision, org_id, intake, prospect, event_key, identifier_hash
+            )
             return decision
         if channel not in allowed_channels:
             decision = _decision(
@@ -434,10 +499,14 @@ def evaluate_contact(
                 channel,
                 country,
             )
-            _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
+            _audit_decision(
+                decision, org_id, intake, prospect, event_key, identifier_hash
+            )
             return decision
 
-    decision = _decision(True, "allowed", "Contact is permitted by current controls.", channel, country)
+    decision = _decision(
+        True, "allowed", "Contact is permitted by current controls.", channel, country
+    )
     _audit_decision(decision, org_id, intake, prospect, event_key, identifier_hash)
     return decision
 
@@ -472,11 +541,15 @@ def block_contact(
         raise ValueError("A contact identifier is required.")
     digest = _identifier_hash(channel, normalized)
     now = timezone.now()
-    entry = SDRDoNotContactEntry.objects.select_for_update().filter(
-        org_id=org_id,
-        channel=channel,
-        identifier_hash=digest,
-    ).first()
+    entry = (
+        SDRDoNotContactEntry.objects.select_for_update()
+        .filter(
+            org_id=org_id,
+            channel=channel,
+            identifier_hash=digest,
+        )
+        .first()
+    )
     created = entry is None
     values = {
         "identifier": normalized,
@@ -540,6 +613,10 @@ def release_contact_block(entry: SDRDoNotContactEntry, *, updated_by=None):
 
 @transaction.atomic
 def request_intake_deletion(intake: LeadIntake, *, requested_by=None):
+    intake = LeadIntake.objects.select_for_update().get(
+        id=intake.id,
+        org_id=intake.org_id,
+    )
     provenance = ensure_intake_provenance(intake=intake)
     provenance.status = SDRProvenanceStatus.DELETION_REQUESTED
     provenance.deletion_requested_at = timezone.now()
@@ -560,6 +637,10 @@ def request_intake_deletion(intake: LeadIntake, *, requested_by=None):
 
 @transaction.atomic
 def cancel_intake_deletion(intake: LeadIntake, *, updated_by=None):
+    intake = LeadIntake.objects.select_for_update().get(
+        id=intake.id,
+        org_id=intake.org_id,
+    )
     provenance = ensure_intake_provenance(intake=intake)
     if provenance.status != SDRProvenanceStatus.DELETION_REQUESTED:
         return provenance
@@ -580,7 +661,9 @@ def cancel_intake_deletion(intake: LeadIntake, *, updated_by=None):
     return provenance
 
 
-def scan_retention(*, org_id: UUID, execute: bool = False, limit: int = 200) -> dict[str, Any]:
+def scan_retention(
+    *, org_id: UUID, execute: bool = False, limit: int = 200
+) -> dict[str, Any]:
     settings = get_compliance_settings(org_id=org_id)
     now = timezone.now()
     cutoff = now - timedelta(days=settings.retention_days)
@@ -595,8 +678,7 @@ def scan_retention(*, org_id: UUID, execute: bool = False, limit: int = 200) -> 
 
     deletion_filter = Q(
         status=SDRProvenanceStatus.DELETION_REQUESTED,
-        deletion_requested_at__lte=now
-        - timedelta(days=settings.deletion_grace_days),
+        deletion_requested_at__lte=now - timedelta(days=settings.deletion_grace_days),
     )
     due_filter = deletion_filter
     if settings.retention_mode != SDRRetentionMode.DISABLED:
@@ -618,7 +700,9 @@ def scan_retention(*, org_id: UUID, execute: bool = False, limit: int = 200) -> 
         if should_anonymize:
             anonymize_intake(provenance.intake, performed_by=None)
             anonymized += 1
-        elif not deletion_due and provenance.status != SDRProvenanceStatus.RETENTION_DUE:
+        elif (
+            not deletion_due and provenance.status != SDRProvenanceStatus.RETENTION_DUE
+        ):
             provenance.status = SDRProvenanceStatus.RETENTION_DUE
             provenance.save(update_fields=["status", "updated_at"])
             _record_event(
@@ -644,7 +728,9 @@ def scan_retention(*, org_id: UUID, execute: bool = False, limit: int = 200) -> 
 
 @transaction.atomic
 def anonymize_intake(intake: LeadIntake, *, performed_by=None) -> SDRDataProvenance:
-    intake = LeadIntake.objects.select_for_update().get(id=intake.id, org_id=intake.org_id)
+    intake = LeadIntake.objects.select_for_update().get(
+        id=intake.id, org_id=intake.org_id
+    )
     provenance = ensure_intake_provenance(intake=intake)
     if provenance.status == SDRProvenanceStatus.ANONYMIZED:
         return provenance
@@ -709,12 +795,17 @@ def anonymize_intake(intake: LeadIntake, *, performed_by=None) -> SDRDataProvena
         consent_evidence="",
         allowed_channels=[],
     )
+    provider_governance: dict[str, int] = {}
     for adapter in provider_data_governance_adapters():
-        adapter.anonymize_intake_data(
+        result = adapter.anonymize_intake_data(
             org_id=intake.org_id,
             intake_id=intake.id,
             marker=marker,
         )
+        for key, value in result.items():
+            provider_governance[str(key)] = provider_governance.get(str(key), 0) + int(
+                value
+            )
     LeadIntake.objects.filter(id=intake.id, org_id=intake.org_id).update(
         source_record_id=f"anon:{marker}",
         raw_payload={},
@@ -749,7 +840,10 @@ def anonymize_intake(intake: LeadIntake, *, performed_by=None) -> SDRDataProvena
         event_type=SDRComplianceEventType.ANONYMIZED,
         event_key=f"anonymized:{intake.id}",
         reason="SDR-owned personal data was anonymized; linked CRM data was not changed.",
-        snapshot={"crm_lead_review_required": bool(intake.crm_lead_id)},
+        snapshot={
+            "crm_lead_review_required": bool(intake.crm_lead_id),
+            "provider_governance": provider_governance,
+        },
         created_by=performed_by,
     )
     return provenance
@@ -777,6 +871,67 @@ def _consent_datetime(value):
     if parsed is None:
         return None
     return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
+
+
+def _coerce_governance_context(
+    value: ContactGovernanceContext | Mapping[str, Any] | None,
+) -> ContactGovernanceContext | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        if not isinstance(value, ContactGovernanceContext):
+            raise TypeError("governance must be a mapping or ContactGovernanceContext")
+        values = {
+            "lawful_basis": value.lawful_basis,
+            "notes": value.notes,
+            "consent": value.consent,
+            "country": value.country,
+            "allowed_channels": value.allowed_channels,
+            "processing_status": value.processing_status,
+        }
+    else:
+        values = value
+    lawful_basis = str(values.get("lawful_basis") or SDRLawfulBasis.UNASSESSED).strip()
+    if lawful_basis not in SDRLawfulBasis.values:
+        lawful_basis = SDRLawfulBasis.UNASSESSED
+    processing_status = str(
+        values.get("processing_status") or SDRProvenanceStatus.ACTIVE
+    ).strip()
+    if processing_status not in {
+        *SDRProvenanceStatus.values,
+        "restricted",
+    }:
+        processing_status = "restricted"
+    return ContactGovernanceContext(
+        lawful_basis=lawful_basis,
+        notes=str(values.get("notes") or "").strip(),
+        consent=(
+            values.get("consent")
+            if isinstance(values.get("consent"), Mapping)
+            else None
+        ),
+        country=str(values.get("country") or "").strip(),
+        allowed_channels=tuple(clean_channels(values.get("allowed_channels") or [])),
+        processing_status=processing_status,
+    )
+
+
+def _governance_consent(
+    context: ContactGovernanceContext,
+) -> tuple[Any | None, str]:
+    consent = context.consent
+    if not isinstance(consent, Mapping) or consent.get("granted") is False:
+        return None, ""
+    recorded_at = _consent_datetime(
+        consent.get("recorded_at") or consent.get("consent_at") or consent.get("at")
+    )
+    evidence = str(
+        consent.get("evidence")
+        or consent.get("evidence_reference")
+        or consent.get("reference")
+        or ""
+    ).strip()
+    return recorded_at, evidence
 
 
 def _decision(allowed, code, reason, channel, country_code):

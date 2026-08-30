@@ -242,9 +242,7 @@ class Case(AssignableMixin, BaseModel):
                         ) % {"max": self.PARENT_MAX_DEPTH}
                 # Block linking to/from a Duplicate (merged) case.
                 if parent_obj is not None and parent_obj.status == "Duplicate":
-                    errors["parent"] = _(
-                        "Cannot link to a case that has been merged."
-                    )
+                    errors["parent"] = _("Cannot link to a case that has been merged.")
                 if self.status == "Duplicate":
                     errors["parent"] = _(
                         "A merged case cannot be linked under a parent."
@@ -303,11 +301,9 @@ class Case(AssignableMixin, BaseModel):
         # forward verbatim — we don't try to walk this through business hours
         # again because it represents real elapsed time the agent had to wait,
         # not a target that respects the calendar.
-        paused = (self.sla_paused_seconds or 0)
+        paused = self.sla_paused_seconds or 0
         if self.sla_paused_at is not None:
-            paused += max(
-                int((timezone.now() - self.sla_paused_at).total_seconds()), 0
-            )
+            paused += max(int((timezone.now() - self.sla_paused_at).total_seconds()), 0)
         if paused:
             deadline = deadline + timedelta(seconds=paused)
         return deadline
@@ -367,9 +363,7 @@ class CaseWatcher(BaseModel):
     subscribed_via = models.CharField(
         max_length=16, choices=SUBSCRIBED_VIA_CHOICES, default="manual"
     )
-    org = models.ForeignKey(
-        Org, on_delete=models.CASCADE, related_name="case_watchers"
-    )
+    org = models.ForeignKey(Org, on_delete=models.CASCADE, related_name="case_watchers")
 
     class Meta:
         verbose_name = "Case Watcher"
@@ -422,9 +416,7 @@ class CsatSurvey(BaseModel):
     comment = models.TextField(blank=True, default="")
     responded_at = models.DateTimeField(null=True, blank=True)
     expires_at = models.DateTimeField()
-    org = models.ForeignKey(
-        Org, on_delete=models.CASCADE, related_name="csat_surveys"
-    )
+    org = models.ForeignKey(Org, on_delete=models.CASCADE, related_name="csat_surveys")
 
     class Meta:
         verbose_name = "CSAT Survey"
@@ -713,9 +705,7 @@ class InboundMailbox(BaseModel):
         Org, on_delete=models.CASCADE, related_name="inbound_mailboxes"
     )
     address = models.EmailField(_("Inbound Address"))
-    provider = models.CharField(
-        max_length=16, choices=PROVIDER_CHOICES, default="ses"
-    )
+    provider = models.CharField(max_length=16, choices=PROVIDER_CHOICES, default="ses")
     route_target = models.CharField(
         max_length=16,
         choices=ROUTE_TARGET_CHOICES,
@@ -729,6 +719,15 @@ class InboundMailbox(BaseModel):
         help_text="Shared secret / SNS Topic ARN suffix used to verify webhook "
         "calls. Auto-generated on create if left blank.",
     )
+    sns_topic_arn = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "Exact AWS SNS Topic ARN authorized for this mailbox. The ARN binds "
+            "the topic name, AWS account, partition, and region."
+        ),
+    )
 
     # Reserved for future IMAP support (Tier 1+ follow-up).
     imap_host = models.CharField(max_length=255, blank=True, default="")
@@ -741,7 +740,11 @@ class InboundMailbox(BaseModel):
     )
     default_case_type = models.CharField(
         max_length=255,
-        choices=[("Question", "Question"), ("Incident", "Incident"), ("Problem", "Problem")],
+        choices=[
+            ("Question", "Question"),
+            ("Incident", "Incident"),
+            ("Problem", "Problem"),
+        ],
         blank=True,
         null=True,
     )
@@ -764,6 +767,11 @@ class InboundMailbox(BaseModel):
                 fields=["org", "address"],
                 name="uniq_inbound_mailbox_per_org_address",
             ),
+            models.UniqueConstraint(
+                fields=["sns_topic_arn"],
+                condition=~models.Q(sns_topic_arn=""),
+                name="uniq_inbound_mailbox_sns_topic",
+            ),
         ]
         indexes = [
             models.Index(fields=["org", "is_active"]),
@@ -771,6 +779,37 @@ class InboundMailbox(BaseModel):
 
     def __str__(self):
         return f"InboundMailbox({self.address}, org={self.org_id})"
+
+
+class InboundMailboxWebhookRoute(models.Model):
+    """Minimal non-RLS bootstrap from an opaque webhook UUID to one tenant.
+
+    The public webhook cannot query :class:`InboundMailbox` before selecting an
+    organization because that table is protected by forced PostgreSQL RLS.  This
+    table intentionally contains only the mailbox UUID and organization UUID --
+    no address, SNS ARN, secret, or message PII.  The scoped mailbox row is
+    reloaded and validated after entering the resolved organization context.
+    """
+
+    mailbox = models.OneToOneField(
+        InboundMailbox,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="webhook_route",
+    )
+    org = models.ForeignKey(
+        Org,
+        on_delete=models.CASCADE,
+        related_name="inbound_mailbox_webhook_routes",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "inbound_mailbox_webhook_route"
+        ordering = ("mailbox_id",)
+
+    def __str__(self):
+        return str(self.mailbox_id)
 
 
 class EmailMessage(BaseModel):
@@ -872,9 +911,7 @@ class RoutingRule(BaseModel):
         ("by_team", "Assign to target_team"),
     ]
 
-    org = models.ForeignKey(
-        Org, on_delete=models.CASCADE, related_name="routing_rules"
-    )
+    org = models.ForeignKey(Org, on_delete=models.CASCADE, related_name="routing_rules")
     name = models.CharField(max_length=255)
     priority_order = models.PositiveIntegerField(
         default=100,
@@ -957,9 +994,7 @@ class TimeEntry(BaseModel):
     check.
     """
 
-    org = models.ForeignKey(
-        Org, on_delete=models.CASCADE, related_name="time_entries"
-    )
+    org = models.ForeignKey(Org, on_delete=models.CASCADE, related_name="time_entries")
     case = models.ForeignKey(
         Case, on_delete=models.CASCADE, related_name="time_entries"
     )
@@ -985,9 +1020,7 @@ class TimeEntry(BaseModel):
         blank=True,
         help_text="Snapshot at log time so future rate changes do not alter history.",
     )
-    currency = models.CharField(
-        max_length=3, choices=CURRENCY_CODES, default="USD"
-    )
+    currency = models.CharField(max_length=3, choices=CURRENCY_CODES, default="USD")
 
     invoice = models.ForeignKey(
         "invoices.Invoice",
@@ -1057,4 +1090,3 @@ class TimeEntry(BaseModel):
 # but must be importable through ``cases.models`` so Django's app registry,
 # `makemigrations`, and existing reverse-related lookups all resolve them.
 from cases.approvals import Approval, ApprovalRule  # noqa: E402,F401
-

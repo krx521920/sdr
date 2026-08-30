@@ -1,0 +1,1710 @@
+<script>
+  import { deserialize, enhance } from '$app/forms';
+  import { goto, invalidateAll } from '$app/navigation';
+  import { page } from '$app/stores';
+  import { tick } from 'svelte';
+  import { toast } from 'svelte-sonner';
+  import {
+    Activity,
+    Building2,
+    Check,
+    ChevronRight,
+    CircleAlert,
+    Clock,
+    Eye,
+    FileSpreadsheet,
+    MapPin,
+    Plus,
+    RefreshCw,
+    ShieldCheck,
+    Sparkles,
+    Target,
+    UserPlus,
+    Users,
+    X
+  } from '@lucide/svelte';
+
+  import { PageHeader, FilterStrip, FilterPill } from '$lib/components/layout';
+  import PersonOnboardingDialog from '$lib/components/matching/PersonOnboardingDialog.svelte';
+  import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
+  import { Badge } from '$lib/components/ui/badge/index.js';
+  import { Button } from '$lib/components/ui/button/index.js';
+  import * as Dialog from '$lib/components/ui/dialog/index.js';
+  import { SearchInput, SelectFilter } from '$lib/components/ui/filter';
+  import { Input } from '$lib/components/ui/input/index.js';
+  import { Progress } from '$lib/components/ui/progress/index.js';
+  import * as Sheet from '$lib/components/ui/sheet/index.js';
+  import { Textarea } from '$lib/components/ui/textarea/index.js';
+  import { REJECTION_REASON_CODES } from '$lib/matching/feedback.js';
+  import {
+    decisionTargetsForStatus,
+    isMatchRunActive,
+    isMatchRunSkipped,
+    isMatchRunSuccessful,
+    isMatchRunTerminal,
+    scoreLabel
+  } from '$lib/matching/workbench.js';
+
+  let { data } = $props();
+
+  const opportunityStatusOptions = [
+    { value: 'draft', label: 'Draft' },
+    { value: 'open', label: 'Open' },
+    { value: 'paused', label: 'Paused' },
+    { value: 'filled', label: 'Filled' },
+    { value: 'closed', label: 'Closed' }
+  ];
+  const opportunityTypeOptions = [
+    { value: 'customer', label: 'Customer' },
+    { value: 'employment', label: 'Employment' },
+    { value: 'contractor', label: 'Contractor' },
+    { value: 'project', label: 'Project' },
+    { value: 'expert', label: 'Expert' },
+    { value: 'referral', label: 'Referral' },
+    { value: 'partnership', label: 'Partnership' }
+  ];
+  const matchStatusOptions = [
+    { value: 'proposed', label: 'Proposed' },
+    { value: 'reviewing', label: 'Reviewing' },
+    { value: 'shortlisted', label: 'Shortlisted' },
+    { value: 'accepted', label: 'Accepted' },
+    { value: 'rejected', label: 'Rejected' },
+    { value: 'expired', label: 'Expired' }
+  ];
+  const decisionReasonCodes = {
+    reviewing: 'needs_review',
+    shortlisted: 'strong_fit',
+    accepted: 'approved',
+    rejected: ''
+  };
+
+  let selectedMatchId = $state(/** @type {string | null} */ (null));
+  let evidenceSheetOpen = $state(false);
+  let createOpportunityDialogOpen = $state(false);
+  let onboardingDialogOpen = $state(false);
+  let discardOnboardingDialogOpen = $state(false);
+  let recomputeDialogOpen = $state(false);
+  let decisionDialogOpen = $state(false);
+  let recomputing = $state(false);
+  let decisionBusyId = $state(/** @type {string | null} */ (null));
+  let pendingDecision = $state('');
+  let pendingReasonCode = $state('');
+  let decisionReason = $state('');
+  let recomputeIdempotencyKey = $state('');
+  let recomputePersonId = $state('');
+  let focusPersonId = $state('');
+  let decisionIdempotencyKey = $state('');
+  let liveMessage = $state('');
+  let polledRun = $state(/** @type {any} */ (null));
+  let polledRunHistory = $state(/** @type {any[]} */ ([]));
+  let pollFailures = $state(0);
+  let handledTerminalRunId = $state('');
+  let permissionRevoked = $state(false);
+  let creatingOpportunity = $state(false);
+  let onboardingBusy = $state(false);
+  let onboardingError = $state('');
+  let onboardingIdempotencyKey = $state('');
+  let onboardedPerson = $state(
+    /** @type {{ id: string, displayName: string, replayed: boolean } | null} */ (null)
+  );
+  let pendingOnboardingClose = $state(/** @type {(() => void) | null} */ (null));
+  let createOpportunityError = $state('');
+  let createOpportunityErrorElement = $state(/** @type {HTMLElement | null} */ (null));
+  let opportunityTitle = $state('');
+  let opportunityType = $state('employment');
+  let opportunityStatus = $state('open');
+  let opportunityDescription = $state('');
+  let opportunityOrganization = $state('');
+  let opportunityLocation = $state('');
+  let opportunityRemoteMode = $state('');
+  let opportunityRequiredSkills = $state('');
+  let opportunityPreferredSkills = $state('');
+  let opportunityRequiredTitles = $state('');
+  let opportunityRequiredLocations = $state('');
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let pollTimer = null;
+  let pollInFlight = false;
+  /** @type {HTMLFormElement} */
+  let recomputeForm;
+
+  const selectedMatch = $derived(
+    data.matches.find((match) => match.id === selectedMatchId) || data.matches[0] || null
+  );
+  const currentRun = $derived(
+    polledRun?.opportunityId === data.selectedOpportunity?.id ? polledRun : data.currentRun
+  );
+  const runHistory = $derived(
+    polledRunHistory.length > 0 ? polledRunHistory : data.runHistory || []
+  );
+  const runActive = $derived(isMatchRunActive(currentRun));
+  const canManage = $derived(data.permissions?.manage === true && !permissionRevoked);
+  const canRecompute = $derived(data.permissions?.recompute === true && !permissionRevoked);
+  const canDecide = $derived(data.permissions?.decide === true && !permissionRevoked);
+  const canFeedback = $derived(data.permissions?.feedback === true && !permissionRevoked);
+  const isReadOnly = $derived(!canManage && !canRecompute && !canDecide && !canFeedback);
+  const recomputeBusy = $derived(recomputing || runActive);
+  const activeRunKey = $derived(
+    !permissionRevoked &&
+      data.permissions?.read === true &&
+      runActive &&
+      data.selectedOpportunity?.id &&
+      currentRun?.id
+      ? `${data.selectedOpportunity.id}:${currentRun.id}`
+      : ''
+  );
+  const activeFilterCount = $derived(
+    [data.filters.q, data.filters.status, data.filters.type, data.filters.matchStatus].filter(
+      Boolean
+    ).length
+  );
+
+  $effect(() => {
+    const matches = data.matches;
+    if (matches.length === 0) {
+      selectedMatchId = null;
+    } else if (!selectedMatchId || !matches.some((match) => match.id === selectedMatchId)) {
+      selectedMatchId = matches[0].id;
+    }
+  });
+
+  $effect(() => {
+    if (!focusPersonId) return;
+    const focusedMatch = data.matches.find((match) => match.personId === focusPersonId);
+    if (focusedMatch) {
+      selectedMatchId = focusedMatch.id;
+      focusPersonId = '';
+    }
+  });
+
+  /** @param {Record<string, string | null>} changes */
+  function updateQuery(changes) {
+    const url = new URL($page.url);
+    for (const [key, value] of Object.entries(changes)) {
+      if (!value || value === 'ALL') url.searchParams.delete(key);
+      else url.searchParams.set(key, value);
+    }
+    // The destination is the current URL object, so it already includes any configured base path.
+    // eslint-disable-next-line svelte/no-navigation-without-resolve
+    return goto(url, { keepFocus: true, noScroll: true, replaceState: true });
+  }
+
+  /** @param {string} id */
+  function selectOpportunity(id) {
+    selectedMatchId = null;
+    evidenceSheetOpen = false;
+    polledRun = null;
+    polledRunHistory = [];
+    updateQuery({ opportunity: id, run: null });
+  }
+
+  function clearFilters() {
+    updateQuery({
+      q: null,
+      status: null,
+      type: null,
+      match_status: null,
+      opportunity: null,
+      run: null
+    });
+  }
+
+  /** @param {any} match */
+  function selectMatch(match) {
+    selectedMatchId = match.id;
+  }
+
+  /** @param {any} match */
+  function openEvidence(match) {
+    selectedMatchId = match.id;
+    evidenceSheetOpen = true;
+  }
+
+  /** @param {string} status */
+  function openDecision(status) {
+    if (!canDecide || !selectedMatch || decisionBusyId) return;
+    if (!decisionTargetsForStatus(selectedMatch.status).includes(status)) return;
+    pendingDecision = status;
+    pendingReasonCode = decisionReasonCodes[status] || '';
+    decisionReason = '';
+    decisionIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    decisionDialogOpen = true;
+  }
+
+  /** @param {string} [personId] */
+  function openRecompute(personId = '') {
+    if (!canRecompute || recomputeBusy) return;
+    recomputePersonId = personId;
+    recomputeIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    recomputeDialogOpen = true;
+  }
+
+  function openPersonOnboarding() {
+    if (!canManage || onboardingBusy) return;
+    onboardingError = '';
+    onboardingIdempotencyKey = globalThis.crypto?.randomUUID?.() || '';
+    onboardingDialogOpen = true;
+  }
+
+  /** @param {{ close: () => void }} context */
+  function requestPersonOnboardingClose(context) {
+    pendingOnboardingClose = context.close;
+    discardOnboardingDialogOpen = true;
+  }
+
+  function discardPersonOnboarding() {
+    const close = pendingOnboardingClose;
+    pendingOnboardingClose = null;
+    discardOnboardingDialogOpen = false;
+    close?.();
+  }
+
+  /** @param {Record<string, unknown>} payload */
+  async function submitPersonOnboarding(payload) {
+    if (onboardingBusy) return;
+    onboardingBusy = true;
+    onboardingError = '';
+    liveMessage = 'Saving person and evidence.';
+
+    try {
+      const form = new FormData();
+      form.set('payload', JSON.stringify(payload));
+      form.set('idempotency_key', onboardingIdempotencyKey);
+      const response = await fetch('?/onboardPerson', {
+        method: 'POST',
+        headers: { accept: 'application/json', 'x-sveltekit-action': 'true' },
+        cache: 'no-store',
+        body: form
+      });
+      const result = deserialize(await response.text());
+      const actionData = /** @type {any} */ (result).data;
+      if (result.type === 'success' && actionData?.onboardedPerson?.id) {
+        onboardedPerson = actionData.onboardedPerson;
+        onboardingDialogOpen = false;
+        onboardingIdempotencyKey = '';
+        pendingOnboardingClose = null;
+        liveMessage = `${onboardedPerson.displayName} was added with evidence.`;
+        toast.success(
+          actionData.onboardedPerson.replayed ? 'Person already saved' : 'Person added'
+        );
+        await invalidateAll();
+        return;
+      }
+
+      onboardingError = actionData?.actionError || 'The person could not be added.';
+      liveMessage = onboardingError;
+      toast.error(onboardingError);
+      if (result.status === 401 || result.status === 403) {
+        permissionRevoked = true;
+        onboardingDialogOpen = false;
+        createOpportunityDialogOpen = false;
+        recomputeDialogOpen = false;
+        decisionDialogOpen = false;
+      }
+    } catch {
+      onboardingError = 'Person onboarding is temporarily unavailable. Your form is still open.';
+      liveMessage = onboardingError;
+      toast.error(onboardingError);
+    } finally {
+      onboardingBusy = false;
+    }
+  }
+
+  function resetOpportunityForm() {
+    createOpportunityError = '';
+    opportunityTitle = '';
+    opportunityType = 'employment';
+    opportunityStatus = 'open';
+    opportunityDescription = '';
+    opportunityOrganization = '';
+    opportunityLocation = '';
+    opportunityRemoteMode = '';
+    opportunityRequiredSkills = '';
+    opportunityPreferredSkills = '';
+    opportunityRequiredTitles = '';
+    opportunityRequiredLocations = '';
+  }
+
+  function openCreateOpportunity() {
+    if (!canManage || creatingOpportunity) return;
+    resetOpportunityForm();
+    createOpportunityDialogOpen = true;
+  }
+
+  function createOpportunityEnhance() {
+    creatingOpportunity = true;
+    createOpportunityError = '';
+    liveMessage = 'Creating matching opportunity.';
+    return async ({ result, update }) => {
+      const actionData = /** @type {any} */ (result).data;
+      creatingOpportunity = false;
+      if (result.type === 'success' && actionData?.createdOpportunity?.id) {
+        const opportunity = actionData.createdOpportunity;
+        createOpportunityDialogOpen = false;
+        resetOpportunityForm();
+        liveMessage = `${opportunity.title} was created.`;
+        toast.success('Matching opportunity created');
+        await update({ reset: false, invalidateAll: false });
+        const url = new URL($page.url);
+        for (const key of ['q', 'status', 'type', 'match_status', 'run']) {
+          url.searchParams.delete(key);
+        }
+        url.searchParams.set('opportunity', opportunity.id);
+        // A newly created resource is a distinct navigation, so preserve the
+        // previous workbench state in browser history instead of replacing it.
+        // eslint-disable-next-line svelte/no-navigation-without-resolve
+        await goto(url, { noScroll: true });
+      } else {
+        const accessChanged = result.status === 401 || result.status === 403;
+        createOpportunityError = actionData?.actionError || 'The opportunity could not be created.';
+        liveMessage = createOpportunityError;
+        toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
+        if (accessChanged) {
+          permissionRevoked = true;
+          createOpportunityDialogOpen = false;
+          recomputeDialogOpen = false;
+          decisionDialogOpen = false;
+        } else {
+          await tick();
+          createOpportunityErrorElement?.focus();
+        }
+      }
+    };
+  }
+
+  function recomputeEnhance() {
+    recomputing = true;
+    liveMessage = 'Queueing candidate ranking. Please wait.';
+    return async ({ result, update }) => {
+      recomputing = false;
+      const actionData = /** @type {any} */ (result).data;
+      if (result.type === 'success' && actionData?.run?.id) {
+        recomputeDialogOpen = false;
+        recomputeIdempotencyKey = '';
+        focusPersonId = actionData?.focusPersonId || recomputePersonId || '';
+        const focusedRun = Boolean(focusPersonId);
+        recomputePersonId = '';
+        polledRun = actionData.run;
+        polledRunHistory = [
+          actionData.run,
+          ...runHistory.filter((run) => run.id !== actionData.run.id)
+        ].slice(0, 10);
+        handledTerminalRunId = '';
+        liveMessage = 'Candidate ranking was queued and will update in the background.';
+        toast.success('Candidate ranking queued');
+        await update({ reset: false, invalidateAll: false });
+        await updateQuery({
+          run: actionData.run.id,
+          ...(focusedRun ? { match_status: null } : {})
+        });
+      } else {
+        liveMessage = actionData?.actionError || 'Candidates could not be recomputed.';
+        toast.error(liveMessage);
+      }
+    };
+  }
+
+  function statusEnhance() {
+    if (!selectedMatch) return;
+    decisionBusyId = selectedMatch.id;
+    liveMessage = `Saving ${pendingDecision} decision for ${selectedMatch.personName}.`;
+    return async ({ result, update }) => {
+      const actionData = /** @type {any} */ (result).data;
+      const personName = selectedMatch?.personName || 'candidate';
+      decisionBusyId = null;
+      if (result.type === 'success') {
+        decisionDialogOpen = false;
+        liveMessage = `${personName} is now ${pendingDecision}.`;
+        toast.success(`Decision saved: ${pendingDecision}`);
+        await update({ reset: false });
+        pendingDecision = '';
+        pendingReasonCode = '';
+        decisionReason = '';
+        decisionIdempotencyKey = '';
+      } else if (actionData?.conflict) {
+        liveMessage = actionData.actionError;
+        toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
+        await invalidateAll();
+        decisionDialogOpen = true;
+      } else {
+        liveMessage = actionData?.actionError || 'The decision could not be saved.';
+        toast.error(liveMessage);
+        await update({ reset: false, invalidateAll: false });
+      }
+    };
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollRunStatus() {
+    if (pollInFlight || !currentRun?.id || !data.selectedOpportunity?.id) return;
+    pollInFlight = true;
+    try {
+      const params = new URLSearchParams({
+        run: currentRun.id,
+        opportunity: data.selectedOpportunity.id,
+        _: String(Date.now())
+      });
+      const response = await fetch(`/api/matching-run-poll?${params}`);
+      if (response.status === 403) {
+        stopPolling();
+        if (!permissionRevoked) {
+          permissionRevoked = true;
+          onboardingBusy = false;
+          onboardingDialogOpen = false;
+          discardOnboardingDialogOpen = false;
+          pendingOnboardingClose = null;
+          creatingOpportunity = false;
+          createOpportunityDialogOpen = false;
+          recomputeDialogOpen = false;
+          decisionDialogOpen = false;
+          liveMessage = 'Your matching access changed. Ranking updates have stopped.';
+          toast.error('Matching access changed');
+        }
+        return;
+      }
+      if (!response.ok) throw new Error('poll unavailable');
+      const result = await response.json();
+      if (!result.run?.id) throw new Error('run unavailable');
+      polledRun = result.run;
+      if (Array.isArray(result.runs)) polledRunHistory = result.runs;
+      pollFailures = 0;
+
+      if (isMatchRunTerminal(result.run)) {
+        stopPolling();
+        if (handledTerminalRunId !== result.run.id) {
+          handledTerminalRunId = result.run.id;
+          if (isMatchRunSkipped(result.run)) {
+            focusPersonId = '';
+            liveMessage =
+              'Candidate ranking was skipped because the opportunity is no longer active.';
+            toast.info('Ranking skipped');
+            await invalidateAll();
+          } else if (isMatchRunSuccessful(result.run)) {
+            const count = Number(result.run.resultCount) || 0;
+            liveMessage = `Candidate ranking completed. ${count} candidates ranked.`;
+            toast.success(`Ranking completed: ${count} candidates`);
+            await invalidateAll();
+          } else {
+            focusPersonId = '';
+            const errorCode = result.run.errorCode || 'MATCH_RECOMPUTE_FAILED';
+            liveMessage = `Candidate ranking stopped. Error code: ${errorCode}.`;
+            toast.error(`Ranking failed: ${errorCode}`);
+          }
+        }
+      }
+    } catch {
+      pollFailures += 1;
+      if (pollFailures === 3) {
+        liveMessage = 'Ranking status is temporarily unavailable. Retrying.';
+      }
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    pollRunStatus();
+    pollTimer = setInterval(pollRunStatus, 3000);
+  }
+
+  $effect(() => {
+    const key = activeRunKey;
+    if (key) startPolling();
+    else stopPolling();
+    return () => stopPolling();
+  });
+
+  /** @param {string} value */
+  function label(value) {
+    return value
+      ? value
+          .split('_')
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(' ')
+      : 'Unknown';
+  }
+
+  /** @param {string} value */
+  function formatDate(value) {
+    if (!value) return 'Not recorded';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'Not recorded';
+    return new Intl.DateTimeFormat('en', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    }).format(date);
+  }
+
+  /** @param {string} value */
+  function statusClass(value) {
+    if (value === 'accepted' || value === 'open') {
+      return 'border-transparent bg-[color:var(--green-soft)] text-[color:var(--green-soft-text)]';
+    }
+    if (value === 'rejected' || value === 'closed') {
+      return 'border-transparent bg-[color:var(--red-soft)] text-[color:var(--red)]';
+    }
+    if (value === 'shortlisted' || value === 'paused') {
+      return 'border-transparent bg-[color:var(--amber-soft)] text-[color:var(--amber-soft-text)]';
+    }
+    return 'border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] text-[color:var(--text-muted)]';
+  }
+
+  /** @param {Record<string, string[]>} criteria */
+  function criteriaEntries(criteria) {
+    return Object.entries(criteria || {}).filter(
+      ([, values]) => Array.isArray(values) && values.length
+    );
+  }
+</script>
+
+<svelte:head>
+  <title>Matching workbench - BottleCRM</title>
+</svelte:head>
+
+<div class="flex min-h-0 flex-col">
+  <PageHeader
+    title="Matching workbench"
+    subtitle="Place the right person into the right opportunity with evidence-backed ranking"
+  >
+    {#snippet actions()}
+      <Button href="/matching/feedback" size="sm" variant="outline" class="gap-1.5">
+        <Activity class="size-3.5" />Feedback loop
+      </Button>
+      <Button href="/matching/governance" size="sm" variant="outline" class="gap-1.5">
+        <ShieldCheck class="size-3.5" />Evidence governance
+      </Button>
+      {#if permissionRevoked}
+        <Badge variant="outline">Access changed</Badge>
+      {:else if canManage || canRecompute}
+        <div class="flex flex-wrap items-center gap-2">
+          {#if canManage}
+            <Button
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+              disabled={onboardingBusy}
+              onclick={openPersonOnboarding}
+            >
+              <UserPlus class="size-3.5" />
+              Add person
+            </Button>
+            <Button
+              href={data.selectedOpportunity
+                ? `/matching/imports/new?opportunity=${encodeURIComponent(data.selectedOpportunity.id)}`
+                : '/matching/imports/new'}
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+            >
+              <FileSpreadsheet class="size-3.5" />
+              Import CSV
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              class="gap-1.5"
+              disabled={creatingOpportunity}
+              onclick={openCreateOpportunity}
+            >
+              <Plus class="size-3.5" />
+              New opportunity
+            </Button>
+          {/if}
+          {#if canRecompute}
+            <Button
+              size="sm"
+              class="gap-1.5"
+              disabled={!data.selectedOpportunity || recomputeBusy}
+              aria-busy={recomputeBusy}
+              onclick={() => openRecompute()}
+            >
+              <RefreshCw
+                class="size-3.5 {recomputeBusy ? 'animate-spin motion-reduce:animate-none' : ''}"
+              />
+              {runActive
+                ? 'Ranking in progress…'
+                : recomputing
+                  ? 'Queueing…'
+                  : 'Recompute candidates'}
+            </Button>
+          {/if}
+        </div>
+      {:else if isReadOnly}
+        <Badge variant="outline">Read only</Badge>
+      {/if}
+    {/snippet}
+  </PageHeader>
+
+  <FilterStrip>
+    <SearchInput
+      value={data.filters.q}
+      placeholder="Search opportunities…"
+      onchange={(value) => updateQuery({ q: value, opportunity: null, run: null })}
+      class="w-full sm:w-56"
+    />
+    <SelectFilter
+      options={opportunityStatusOptions}
+      value={data.filters.status || 'ALL'}
+      allLabel="All opportunity statuses"
+      onchange={(value) => updateQuery({ status: String(value), opportunity: null, run: null })}
+    />
+    <SelectFilter
+      options={opportunityTypeOptions}
+      value={data.filters.type || 'ALL'}
+      allLabel="All opportunity types"
+      onchange={(value) => updateQuery({ type: String(value), opportunity: null, run: null })}
+    />
+    <SelectFilter
+      options={matchStatusOptions}
+      value={data.filters.matchStatus || 'ALL'}
+      allLabel="All candidate statuses"
+      onchange={(value) => updateQuery({ match_status: String(value) })}
+    />
+    {#if activeFilterCount > 0}
+      <FilterPill label="Clear all" dashed onclick={clearFilters} />
+    {/if}
+    {#snippet meta()}
+      <span>{data.opportunities.length} opportunities</span>
+      <span>{data.activePersonCount} active people</span>
+    {/snippet}
+  </FilterStrip>
+
+  <p class="sr-only" role="status" aria-live="polite">{liveMessage}</p>
+
+  {#if onboardedPerson}
+    <div
+      class="mx-5 mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-[color:var(--green)] bg-[color:var(--green-soft)] px-4 py-3 text-sm text-[color:var(--green-soft-text)]"
+      role="status"
+    >
+      <Check class="size-4 shrink-0" aria-hidden="true" />
+      <span class="font-medium">{onboardedPerson.displayName} was added with evidence.</span>
+      <div class="ml-auto flex items-center gap-2">
+        {#if canRecompute && data.selectedOpportunity}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={recomputeBusy}
+            onclick={() => openRecompute(onboardedPerson.id)}
+          >
+            Rank for {data.selectedOpportunity.title}
+          </Button>
+        {/if}
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Dismiss person onboarding confirmation"
+          onclick={() => (onboardedPerson = null)}
+        >
+          <X class="size-4" />
+        </Button>
+      </div>
+    </div>
+  {/if}
+
+  {#if data.opportunities.length === 0}
+    <section class="flex flex-1 flex-col items-center justify-center px-6 py-20 text-center">
+      <div
+        class="mb-4 flex size-14 items-center justify-center rounded-full bg-[color:var(--violet-soft)]"
+      >
+        <Target class="size-7 text-[color:var(--violet-soft-text)]" />
+      </div>
+      <h2 class="text-lg font-semibold text-[color:var(--text)]">No matching opportunities</h2>
+      <p class="mt-1 max-w-md text-sm text-[color:var(--text-muted)]">
+        {activeFilterCount > 0
+          ? 'No opportunities meet the current filters.'
+          : 'Create or import a matching opportunity before ranking people.'}
+      </p>
+      {#if activeFilterCount > 0 || canManage}
+        <div class="mt-4 flex flex-wrap items-center justify-center gap-2">
+          {#if activeFilterCount > 0}
+            <Button variant="outline" onclick={clearFilters}>Clear filters</Button>
+          {/if}
+          {#if canManage}
+            <Button class="gap-1.5" onclick={openCreateOpportunity}>
+              <Plus class="size-3.5" />
+              Create opportunity
+            </Button>
+          {/if}
+        </div>
+      {/if}
+    </section>
+  {:else}
+    <div
+      class="grid min-h-[calc(100vh-170px)] grid-cols-1 border-t border-[color:var(--border-faint)] lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[280px_minmax(0,1fr)_380px]"
+    >
+      <aside
+        class="max-h-[320px] overflow-y-auto border-b border-[color:var(--border-faint)] bg-[color:var(--bg-card)] lg:max-h-none lg:border-r lg:border-b-0"
+        aria-labelledby="matching-opportunities-title"
+      >
+        <div
+          class="sticky top-0 z-[1] border-b border-[color:var(--border-faint)] bg-[color:var(--bg-card)] px-4 py-3"
+        >
+          <h2
+            id="matching-opportunities-title"
+            class="text-xs font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+          >
+            Opportunities
+          </h2>
+        </div>
+        <ol class="divide-y divide-[color:var(--border-faint)]">
+          {#each data.opportunities as opportunity (opportunity.id)}
+            <li>
+              <button
+                type="button"
+                aria-current={data.selectedOpportunity?.id === opportunity.id ? 'true' : undefined}
+                class="group w-full px-4 py-3 text-left transition-colors focus-visible:shadow-[inset_3px_0_0_var(--violet),0_0_0_2px_var(--focus-ring)] focus-visible:outline-none {data
+                  .selectedOpportunity?.id === opportunity.id
+                  ? 'bg-[color:var(--violet-soft)]'
+                  : 'hover:bg-[color:var(--bg-hover)]'}"
+                onclick={() => selectOpportunity(opportunity.id)}
+              >
+                <span class="flex items-start justify-between gap-3">
+                  <span class="min-w-0">
+                    <span class="block truncate text-sm font-semibold text-[color:var(--text)]"
+                      >{opportunity.title}</span
+                    >
+                    <span
+                      class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[color:var(--text-subtle)]"
+                    >
+                      <span>{label(opportunity.type)}</span>
+                      {#if opportunity.location}<span>· {opportunity.location}</span>{/if}
+                    </span>
+                  </span>
+                  <ChevronRight
+                    class="mt-0.5 size-4 shrink-0 text-[color:var(--text-subtle)]"
+                    aria-hidden="true"
+                  />
+                </span>
+                <span class="mt-2 flex items-center justify-between gap-2">
+                  <Badge variant="outline" class={statusClass(opportunity.status)}
+                    >{label(opportunity.status)}</Badge
+                  >
+                  <span class="text-xs text-[color:var(--text-subtle)] tabular-nums"
+                    >{opportunity.matchCount} matches</span
+                  >
+                </span>
+              </button>
+            </li>
+          {/each}
+        </ol>
+      </aside>
+
+      <main class="min-w-0 bg-[color:var(--bg)]" aria-labelledby="candidate-ranking-title">
+        {#if data.selectedOpportunity}
+          <section class="border-b border-[color:var(--border-faint)] px-5 py-4 md:px-6">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline" class={statusClass(data.selectedOpportunity.status)}>
+                    {label(data.selectedOpportunity.status)}
+                  </Badge>
+                  <span class="text-xs text-[color:var(--text-subtle)]"
+                    >{label(data.selectedOpportunity.type)}</span
+                  >
+                </div>
+                <h2
+                  id="candidate-ranking-title"
+                  class="mt-2 text-xl font-semibold text-[color:var(--text)]"
+                >
+                  {data.selectedOpportunity.title}
+                </h2>
+                {#if data.selectedOpportunity.description}
+                  <p class="mt-1 line-clamp-2 text-sm text-[color:var(--text-muted)]">
+                    {data.selectedOpportunity.description}
+                  </p>
+                {/if}
+              </div>
+              <div class="flex shrink-0 flex-wrap gap-3 text-xs text-[color:var(--text-subtle)]">
+                {#if data.selectedOpportunity.organizationName}
+                  <span class="inline-flex items-center gap-1"
+                    ><Building2 class="size-3.5" />{data.selectedOpportunity.organizationName}</span
+                  >
+                {/if}
+                {#if data.selectedOpportunity.location}
+                  <span class="inline-flex items-center gap-1"
+                    ><MapPin class="size-3.5" />{data.selectedOpportunity.location}</span
+                  >
+                {/if}
+              </div>
+            </div>
+
+            {#if criteriaEntries(data.selectedOpportunity.requiredCriteria).length > 0}
+              <div class="mt-4 flex flex-wrap items-center gap-2" aria-label="Required criteria">
+                <span
+                  class="text-[11px] font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+                  >Required</span
+                >
+                {#each criteriaEntries(data.selectedOpportunity.requiredCriteria) as [dimension, values] (dimension)}
+                  {#each values as value (`${dimension}:${value}`)}
+                    <Badge variant="neutral">{label(dimension)}: {value}</Badge>
+                  {/each}
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          {#if currentRun}
+            <section
+              class="border-b border-[color:var(--border-faint)] bg-[color:var(--bg-card)] px-5 py-3 md:px-6"
+              aria-labelledby="ranking-run-title"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0">
+                  <h3 id="ranking-run-title" class="text-xs font-semibold text-[color:var(--text)]">
+                    Ranking run
+                    {#if currentRun.rankingRevision > 0}
+                      · version {currentRun.rankingRevision}
+                    {/if}
+                  </h3>
+                  <p class="mt-0.5 text-[11px] text-[color:var(--text-subtle)]">
+                    {label(currentRun.status || currentRun.outcome)} · created {formatDate(
+                      currentRun.createdAt
+                    )}
+                    {#if currentRun.engineVersion}
+                      · engine {currentRun.engineVersion}{/if}
+                  </p>
+                </div>
+                <Badge variant="outline">{label(currentRun.status || currentRun.outcome)}</Badge>
+              </div>
+
+              {#if runActive}
+                <div class="mt-3">
+                  <div
+                    class="mb-1 flex items-center justify-between text-xs text-[color:var(--text-muted)]"
+                  >
+                    <span
+                      >{currentRun.processedCount} of {currentRun.totalCount || '…'} processed</span
+                    >
+                    <span class="tabular-nums">{currentRun.progress}%</span>
+                  </div>
+                  <Progress
+                    value={currentRun.progress}
+                    max={100}
+                    aria-label="Ranking progress: {currentRun.progress}%"
+                    class="h-1.5"
+                  />
+                  {#if pollFailures >= 3}
+                    <p class="mt-2 text-xs text-[color:var(--amber-soft-text)]">
+                      Status connection interrupted; retrying automatically.
+                    </p>
+                  {/if}
+                </div>
+              {:else if isMatchRunSkipped(currentRun)}
+                <p class="mt-3 text-xs text-[color:var(--text-muted)]">
+                  Skipped because the opportunity is paused, filled, or closed.
+                </p>
+              {:else if isMatchRunSuccessful(currentRun)}
+                <p class="mt-2 text-xs text-[color:var(--green-soft-text)]">
+                  Completed with {currentRun.resultCount} ranked candidates.
+                </p>
+              {:else if isMatchRunTerminal(currentRun)}
+                <p class="mt-2 flex items-center gap-1.5 text-xs text-[color:var(--red)]">
+                  <CircleAlert class="size-3.5" />Ranking stopped. Error code:
+                  <code>{currentRun.errorCode || 'MATCH_RECOMPUTE_FAILED'}</code>
+                </p>
+              {/if}
+
+              {#if runHistory.length > 0}
+                <details class="mt-3 text-xs text-[color:var(--text-muted)]">
+                  <summary
+                    class="cursor-pointer rounded-sm font-medium focus-visible:ring-2 focus-visible:ring-[color:var(--focus-ring)] focus-visible:outline-none"
+                  >
+                    Recent ranking versions ({runHistory.length})
+                  </summary>
+                  <ol class="mt-2 grid gap-1 sm:grid-cols-2">
+                    {#each runHistory as run (run.id)}
+                      <li
+                        class="flex items-center justify-between gap-3 rounded-md border border-[color:var(--border-faint)] px-2.5 py-2"
+                      >
+                        <span class="min-w-0 truncate">
+                          {run.rankingRevision > 0
+                            ? `Version ${run.rankingRevision}`
+                            : 'Pending version'}
+                          · {label(run.status || run.outcome)}
+                        </span>
+                        <span class="shrink-0 tabular-nums">{run.resultCount} results</span>
+                      </li>
+                    {/each}
+                  </ol>
+                </details>
+              {/if}
+            </section>
+          {/if}
+
+          {#if data.matches.length === 0}
+            <section class="flex flex-col items-center justify-center px-6 py-20 text-center">
+              <Users class="size-9 text-[color:var(--text-subtle)]" />
+              <h3 class="mt-3 text-base font-semibold text-[color:var(--text)]">
+                No candidates to review
+              </h3>
+              <p class="mt-1 max-w-md text-sm text-[color:var(--text-muted)]">
+                {data.filters.matchStatus
+                  ? 'No candidates have this decision status.'
+                  : runActive
+                    ? 'Candidate ranking is running in the background.'
+                    : 'Run an explicit recompute when people and evidence are ready.'}
+              </p>
+            </section>
+          {:else}
+            <div
+              class="flex items-center justify-between border-b border-[color:var(--border-faint)] px-5 py-2.5 text-xs text-[color:var(--text-subtle)] md:px-6"
+            >
+              <span>{data.totalMatches} ranked candidates</span>
+              <span>{data.counts.shortlisted} shortlisted · {data.counts.accepted} accepted</span>
+            </div>
+            <ol aria-label="Candidate ranking" class="divide-y divide-[color:var(--border-faint)]">
+              {#each data.matches as match (match.id)}
+                <li
+                  class="flex items-stretch {selectedMatch?.id === match.id
+                    ? 'bg-[color:var(--bg-active)]'
+                    : ''}"
+                >
+                  <button
+                    type="button"
+                    aria-pressed={selectedMatch?.id === match.id}
+                    class="group flex min-w-0 flex-1 items-start gap-3 px-5 py-4 text-left transition-colors hover:bg-[color:var(--bg-hover)] focus-visible:shadow-[inset_3px_0_0_var(--violet),0_0_0_2px_var(--focus-ring)] focus-visible:outline-none md:px-6"
+                    onclick={() => selectMatch(match)}
+                  >
+                    <span
+                      class="flex size-8 shrink-0 items-center justify-center rounded-full bg-[color:var(--bg-elevated)] text-sm font-bold text-[color:var(--text-muted)] tabular-nums"
+                    >
+                      {match.rank || '–'}
+                    </span>
+                    <span class="min-w-0 flex-1">
+                      <span class="flex flex-wrap items-center gap-2">
+                        <span class="truncate text-sm font-semibold text-[color:var(--text)]"
+                          >{match.personName}</span
+                        >
+                        <Badge variant="outline" class={statusClass(match.status)}
+                          >{label(match.status)}</Badge
+                        >
+                      </span>
+                      {#if match.personSummary.currentTitle || match.personSummary.currentCompany}
+                        <span class="mt-1 block text-xs text-[color:var(--text-subtle)]">
+                          {[match.personSummary.currentTitle, match.personSummary.currentCompany]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                      {/if}
+                      <span class="mt-1 block text-xs text-[color:var(--text-muted)]">
+                        {match.reasons[0]?.message ||
+                          match.gaps[0]?.message ||
+                          'No explanatory criteria recorded.'}
+                      </span>
+                      <span
+                        class="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-[color:var(--text-subtle)]"
+                      >
+                        <span>{Math.round(match.confidence * 100)}% confidence</span>
+                        <span>{match.evidenceLinks.length} evidence items</span>
+                        {#if match.gaps.length > 0}<span>{match.gaps.length} gaps</span>{/if}
+                      </span>
+                    </span>
+                    <span class="shrink-0 text-right">
+                      <span class="block text-2xl font-bold text-[color:var(--text)] tabular-nums"
+                        >{match.overallScore}</span
+                      >
+                      <span
+                        class="block text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase"
+                        >{scoreLabel(match.overallScore)}</span
+                      >
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    class="flex w-11 shrink-0 items-center justify-center border-l border-[color:var(--border-faint)] text-[color:var(--text-subtle)] hover:bg-[color:var(--bg-hover)] hover:text-[color:var(--text)] focus-visible:shadow-[inset_0_0_0_2px_var(--focus-ring)] focus-visible:outline-none xl:hidden"
+                    aria-label="View evidence for {match.personName}"
+                    onclick={() => openEvidence(match)}
+                  >
+                    <Eye class="size-4" />
+                  </button>
+                </li>
+              {/each}
+            </ol>
+          {/if}
+        {/if}
+      </main>
+
+      <aside
+        class="hidden min-w-0 border-l border-[color:var(--border-faint)] bg-[color:var(--bg-card)] xl:block"
+        aria-label="Match evidence"
+      >
+        {#if selectedMatch}
+          {@render evidenceContent(selectedMatch)}
+        {:else}
+          <div
+            class="flex h-full flex-col items-center justify-center px-6 text-center text-sm text-[color:var(--text-subtle)]"
+          >
+            Select a candidate to inspect the evidence.
+          </div>
+        {/if}
+      </aside>
+    </div>
+  {/if}
+</div>
+
+{#snippet evidenceContent(match)}
+  <div class="flex h-full min-h-0 flex-col">
+    <div class="border-b border-[color:var(--border-faint)] px-5 py-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <p
+            class="text-[11px] font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+          >
+            Evidence review
+          </p>
+          <h2 class="mt-1 truncate text-lg font-semibold text-[color:var(--text)]">
+            {match.personName}
+          </h2>
+        </div>
+        <div class="text-right">
+          <span class="block text-3xl font-bold text-[color:var(--text)] tabular-nums"
+            >{match.overallScore}</span
+          >
+          <span class="text-[10px] tracking-wide text-[color:var(--text-subtle)] uppercase"
+            >{scoreLabel(match.overallScore)}</span
+          >
+        </div>
+      </div>
+      {#if canDecide && decisionTargetsForStatus(match.status).length > 0}
+        <div class="mt-4 grid grid-cols-2 gap-2">
+          {#if decisionTargetsForStatus(match.status).includes('reviewing')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('reviewing')}
+            >
+              <Activity />Review
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('shortlisted')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('shortlisted')}
+            >
+              <Sparkles />Shortlist
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('accepted')}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('accepted')}
+            >
+              <Check />Accept
+            </Button>
+          {/if}
+          {#if decisionTargetsForStatus(match.status).includes('rejected')}
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={decisionBusyId === match.id}
+              onclick={() => openDecision('rejected')}
+            >
+              <X />Reject
+            </Button>
+          {/if}
+        </div>
+      {:else if decisionTargetsForStatus(match.status).length === 0}
+        <p class="mt-4 text-xs text-[color:var(--text-subtle)]">
+          This decision is final. No further manual transition is available.
+        </p>
+      {:else}
+        <p class="mt-4 text-xs text-[color:var(--text-subtle)]">
+          You do not have permission to change this decision.
+        </p>
+      {/if}
+      {#if match.decisionReason}
+        <p
+          class="mt-3 rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
+        >
+          Decision note: {match.decisionReason}
+        </p>
+      {/if}
+    </div>
+
+    <div class="flex-1 space-y-6 overflow-y-auto px-5 py-5">
+      <section aria-labelledby="score-breakdown-title">
+        <h3
+          id="score-breakdown-title"
+          class="text-xs font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+        >
+          Score breakdown
+        </h3>
+        <div class="mt-3 space-y-3">
+          {#each [['Eligibility', match.eligibilityScore], ['Fit', match.fitScore], ['Trust', match.trustScore], ['Relationship', match.relationshipScore], ['Availability', match.availabilityScore]] as [scoreName, score] (scoreName)}
+            <div>
+              <div class="mb-1 flex items-center justify-between text-xs">
+                <span class="text-[color:var(--text-muted)]">{scoreName}</span>
+                <span class="font-semibold text-[color:var(--text)] tabular-nums">{score}/100</span>
+              </div>
+              <Progress
+                value={score}
+                max={100}
+                aria-label="{scoreName} score: {score} out of 100"
+                class="h-1.5"
+              />
+            </div>
+          {/each}
+        </div>
+      </section>
+
+      <section aria-labelledby="match-reasons-title">
+        <h3
+          id="match-reasons-title"
+          class="flex items-center gap-2 text-xs font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+        >
+          <ShieldCheck class="size-3.5" />Why this person
+        </h3>
+        {#if match.reasons.length > 0}
+          <ul class="mt-3 space-y-2">
+            {#each match.reasons as reason (`${reason.dimension}:${reason.message}`)}
+              <li
+                class="rounded-md bg-[color:var(--green-soft)] px-3 py-2 text-xs text-[color:var(--green-soft-text)]"
+              >
+                {reason.message}
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="mt-2 text-xs text-[color:var(--text-subtle)]">
+            No positive criteria were recorded.
+          </p>
+        {/if}
+      </section>
+
+      {#if match.gaps.length > 0}
+        <section aria-labelledby="match-gaps-title">
+          <h3
+            id="match-gaps-title"
+            class="flex items-center gap-2 text-xs font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+          >
+            <CircleAlert class="size-3.5" />Gaps and exclusions
+          </h3>
+          <ul class="mt-3 space-y-2">
+            {#each match.gaps as gap (`${gap.dimension}:${gap.message}`)}
+              <li
+                class="rounded-md bg-[color:var(--amber-soft)] px-3 py-2 text-xs text-[color:var(--amber-soft-text)]"
+              >
+                {gap.message}
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+
+      <section aria-labelledby="supporting-evidence-title">
+        <div class="flex items-center justify-between gap-2">
+          <h3
+            id="supporting-evidence-title"
+            class="text-xs font-semibold tracking-wide text-[color:var(--text-subtle)] uppercase"
+          >
+            Supporting evidence
+          </h3>
+          <span class="text-xs text-[color:var(--text-subtle)] tabular-nums"
+            >{match.evidenceLinks.length}</span
+          >
+        </div>
+        {#if match.evidenceLinks.length > 0}
+          <ol class="mt-3 space-y-3">
+            {#each match.evidenceLinks as link, index (link.id || index)}
+              <li
+                class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-3"
+              >
+                <div class="flex flex-wrap items-center gap-2">
+                  <Badge variant="neutral">{label(link.evidence.source)}</Badge>
+                  <span class="text-[11px] text-[color:var(--text-subtle)]"
+                    >{label(link.evidence.kind)}</span
+                  >
+                  {#if link.evidence.aiGenerated && link.evidence.reviewStatus === 'pending'}
+                    <Badge
+                      variant="outline"
+                      class="border-[color:var(--amber)] text-[color:var(--amber-soft-text)]"
+                      >AI · Pending review</Badge
+                    >
+                  {:else if link.evidence.reviewStatus}
+                    <Badge variant="outline">{label(link.evidence.reviewStatus)}</Badge>
+                  {/if}
+                  {#if ['expiring', 'expired'].includes(link.evidence.freshness)}
+                    <Badge
+                      variant="outline"
+                      class={link.evidence.freshness === 'expired'
+                        ? 'border-[color:var(--red)] text-[color:var(--red-soft-text)]'
+                        : 'border-[color:var(--amber)] text-[color:var(--amber-soft-text)]'}
+                      >{label(link.evidence.freshness)}</Badge
+                    >
+                  {/if}
+                  <span class="ml-auto text-[11px] text-[color:var(--text-subtle)] tabular-nums"
+                    >{Math.round(link.evidence.confidence * 100)}% confidence</span
+                  >
+                </div>
+                <p class="mt-2 text-xs leading-5 text-[color:var(--text-muted)]">
+                  {link.evidence.summary || 'No evidence summary available.'}
+                </p>
+                {#if link.explanation}
+                  <p class="mt-2 text-[11px] text-[color:var(--violet-soft-text)]">
+                    Contribution: {link.explanation}
+                  </p>
+                {/if}
+                <div
+                  class="mt-2 flex items-center gap-1 text-[11px] text-[color:var(--text-subtle)]"
+                >
+                  <Clock class="size-3" />
+                  <time datetime={link.evidence.observedAt}
+                    >{formatDate(link.evidence.observedAt)}</time
+                  >
+                </div>
+              </li>
+            {/each}
+          </ol>
+        {:else}
+          <p class="mt-2 text-xs text-[color:var(--text-subtle)]">
+            No supporting evidence was attached to this match.
+          </p>
+        {/if}
+      </section>
+
+      <p
+        class="border-t border-[color:var(--border-faint)] pt-4 text-[11px] text-[color:var(--text-subtle)]"
+      >
+        Evaluated <time datetime={match.evaluatedAt}>{formatDate(match.evaluatedAt)}</time>
+        {#if match.engineVersion}
+          · Engine {match.engineVersion}{/if}
+        {#if match.rankingRevision > 0}
+          · Ranking version {match.rankingRevision}{/if}
+        · Decision revision {match.decisionRevision}
+      </p>
+    </div>
+  </div>
+{/snippet}
+
+<Dialog.Root bind:open={createOpportunityDialogOpen}>
+  <Dialog.Content class="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+    <Dialog.Header>
+      <Dialog.Title>Create matching opportunity</Dialog.Title>
+      <Dialog.Description>
+        Define the place and its criteria. Candidate ranking remains evidence-backed and starts only
+        when you explicitly queue a recompute.
+      </Dialog.Description>
+    </Dialog.Header>
+
+    <form
+      method="POST"
+      action="?/createOpportunity"
+      use:enhance={createOpportunityEnhance}
+      class="space-y-4"
+      aria-describedby={createOpportunityError ? 'matching-opportunity-error' : undefined}
+    >
+      {#if createOpportunityError}
+        <div
+          id="matching-opportunity-error"
+          bind:this={createOpportunityErrorElement}
+          class="rounded-lg border border-[color:var(--red)] bg-[color:var(--red-soft)] px-3 py-2 text-sm text-[color:var(--red)] outline-none"
+          role="alert"
+          tabindex="-1"
+        >
+          {createOpportunityError}
+        </div>
+      {/if}
+      <div class="space-y-1.5">
+        <label
+          for="matching-opportunity-title"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
+          Title
+        </label>
+        <Input
+          id="matching-opportunity-title"
+          name="title"
+          bind:value={opportunityTitle}
+          maxlength={255}
+          required
+          placeholder="AI growth engineer"
+        />
+      </div>
+
+      <div class="grid gap-4 sm:grid-cols-2">
+        <div class="space-y-1.5">
+          <label
+            for="matching-opportunity-type"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
+            Opportunity type
+          </label>
+          <select
+            id="matching-opportunity-type"
+            name="opportunity_type"
+            bind:value={opportunityType}
+            class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+          >
+            {#each opportunityTypeOptions as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="space-y-1.5">
+          <label
+            for="matching-opportunity-status"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
+            Initial status
+          </label>
+          <select
+            id="matching-opportunity-status"
+            name="status"
+            bind:value={opportunityStatus}
+            class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+          >
+            <option value="open">Open</option>
+            <option value="draft">Draft</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid gap-4 sm:grid-cols-2">
+        <div class="space-y-1.5">
+          <label
+            for="matching-opportunity-organization"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
+            Organization <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+          </label>
+          <Input
+            id="matching-opportunity-organization"
+            name="organization_name"
+            bind:value={opportunityOrganization}
+            maxlength={255}
+            placeholder="BottleCRM"
+          />
+        </div>
+        <div class="space-y-1.5">
+          <label
+            for="matching-opportunity-location"
+            class="text-xs font-medium text-[color:var(--text)]"
+          >
+            Location <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+          </label>
+          <Input
+            id="matching-opportunity-location"
+            name="location"
+            bind:value={opportunityLocation}
+            maxlength={255}
+            placeholder="Shanghai"
+          />
+        </div>
+      </div>
+
+      <div class="space-y-1.5">
+        <label
+          for="matching-opportunity-remote"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
+          Work arrangement <span class="font-normal text-[color:var(--text-subtle)]"
+            >(optional)</span
+          >
+        </label>
+        <select
+          id="matching-opportunity-remote"
+          name="remote_mode"
+          bind:value={opportunityRemoteMode}
+          class="h-9 w-full rounded-[var(--r-md)] border border-[color:var(--border)] bg-[color:var(--bg-input)] px-3 text-[13px] text-[color:var(--text)] outline-none focus-visible:border-[color:var(--text)] focus-visible:shadow-[0_0_0_3px_var(--focus-ring)]"
+        >
+          <option value="">Not specified</option>
+          <option value="on_site">On site</option>
+          <option value="hybrid">Hybrid</option>
+          <option value="remote">Remote</option>
+        </select>
+      </div>
+
+      <div class="space-y-1.5">
+        <label
+          for="matching-opportunity-description"
+          class="text-xs font-medium text-[color:var(--text)]"
+        >
+          Description <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        </label>
+        <Textarea
+          id="matching-opportunity-description"
+          name="description"
+          bind:value={opportunityDescription}
+          maxlength={5000}
+          rows={4}
+          placeholder="Describe the outcome, responsibilities and context…"
+        />
+      </div>
+
+      <fieldset class="space-y-3 rounded-lg border border-[color:var(--border-faint)] p-4">
+        <legend class="px-1 text-xs font-semibold text-[color:var(--text)]"
+          >Matching criteria</legend
+        >
+        <p class="text-xs text-[color:var(--text-muted)]">
+          Separate values with commas or new lines. Missing required criteria cap a candidate at 49.
+        </p>
+        <div class="grid gap-4 sm:grid-cols-2">
+          <div class="space-y-1.5">
+            <label
+              for="matching-required-skills"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
+              Required skills
+            </label>
+            <Textarea
+              id="matching-required-skills"
+              name="required_skills"
+              bind:value={opportunityRequiredSkills}
+              maxlength={4000}
+              rows={3}
+              placeholder="Python, Django, outbound automation"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label
+              for="matching-preferred-skills"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
+              Preferred skills
+            </label>
+            <Textarea
+              id="matching-preferred-skills"
+              name="preferred_skills"
+              bind:value={opportunityPreferredSkills}
+              maxlength={4000}
+              rows={3}
+              placeholder="PostgreSQL, CRM operations"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label
+              for="matching-required-titles"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
+              Required titles
+            </label>
+            <Textarea
+              id="matching-required-titles"
+              name="required_titles"
+              bind:value={opportunityRequiredTitles}
+              maxlength={4000}
+              rows={3}
+              placeholder="Growth engineer, SDR automation specialist"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label
+              for="matching-required-locations"
+              class="text-xs font-medium text-[color:var(--text)]"
+            >
+              Required locations
+            </label>
+            <Textarea
+              id="matching-required-locations"
+              name="required_locations"
+              bind:value={opportunityRequiredLocations}
+              maxlength={4000}
+              rows={3}
+              placeholder="Shanghai, Remote"
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <Dialog.Footer>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={creatingOpportunity}
+          onclick={() => (createOpportunityDialogOpen = false)}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          disabled={creatingOpportunity || !canManage || !opportunityTitle.trim()}
+        >
+          {creatingOpportunity ? 'Creating…' : 'Create opportunity'}
+        </Button>
+      </Dialog.Footer>
+    </form>
+  </Dialog.Content>
+</Dialog.Root>
+
+<PersonOnboardingDialog
+  bind:open={onboardingDialogOpen}
+  busy={onboardingBusy}
+  error={onboardingError}
+  onSubmit={submitPersonOnboarding}
+  onRequestClose={requestPersonOnboardingClose}
+  onClearError={() => (onboardingError = '')}
+/>
+
+<AlertDialog.Root bind:open={discardOnboardingDialogOpen}>
+  <AlertDialog.Content class="max-w-md">
+    <AlertDialog.Header>
+      <AlertDialog.Title>Discard this person draft?</AlertDialog.Title>
+      <AlertDialog.Description>
+        The profile, identity and evidence entered in this dialog have not been saved.
+      </AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel onclick={() => (pendingOnboardingClose = null)}>
+        Keep editing
+      </AlertDialog.Cancel>
+      <AlertDialog.Action onclick={discardPersonOnboarding}>Discard draft</AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>
+
+<Sheet.Root bind:open={evidenceSheetOpen}>
+  <Sheet.Content
+    side="right"
+    class="w-full max-w-full gap-0 overflow-hidden p-0 sm:w-[480px] sm:max-w-[480px] xl:hidden"
+  >
+    <Sheet.Header class="sr-only">
+      <Sheet.Title>Match evidence for {selectedMatch?.personName || 'candidate'}</Sheet.Title>
+      <Sheet.Description>Scores, reasons, gaps and source-attributed evidence.</Sheet.Description>
+    </Sheet.Header>
+    {#if selectedMatch}
+      {@render evidenceContent(selectedMatch)}
+    {/if}
+  </Sheet.Content>
+</Sheet.Root>
+
+<AlertDialog.Root bind:open={recomputeDialogOpen}>
+  <AlertDialog.Content class="max-w-md">
+    <AlertDialog.Header>
+      <AlertDialog.Title
+        >{recomputePersonId
+          ? 'Rank the newly added person?'
+          : 'Recompute candidate ranking?'}</AlertDialog.Title
+      >
+      <AlertDialog.Description>
+        {recomputePersonId
+          ? `This queues a focused ranking run for the new person against “${data.selectedOpportunity?.title || 'this opportunity'}”.`
+          : `This queues a background ranking run for “${data.selectedOpportunity?.title || 'this opportunity'}”.`}
+        Progress and safe failure codes will appear here. Human review decisions are preserved.
+      </AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel disabled={recomputeBusy}>Cancel</AlertDialog.Cancel>
+      <AlertDialog.Action disabled={recomputeBusy} onclick={() => recomputeForm.requestSubmit()}>
+        Queue recompute
+      </AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>
+
+<form
+  method="POST"
+  action="?/recompute"
+  bind:this={recomputeForm}
+  use:enhance={recomputeEnhance}
+  class="hidden"
+>
+  <input type="hidden" name="opportunity_id" value={data.selectedOpportunity?.id || ''} />
+  <input type="hidden" name="person_id" value={recomputePersonId} />
+  <input type="hidden" name="idempotency_key" value={recomputeIdempotencyKey} />
+</form>
+
+<Dialog.Root bind:open={decisionDialogOpen}>
+  <Dialog.Content class="sm:max-w-md">
+    <Dialog.Header>
+      <Dialog.Title
+        >{label(pendingDecision)} {selectedMatch?.personName || 'candidate'}?</Dialog.Title
+      >
+      <Dialog.Description>
+        This records an auditable decision against decision revision {selectedMatch?.decisionRevision ||
+          0} and ranking version {selectedMatch?.rankingRevision || 0}. If either changed, you will
+        be asked to review the latest version.
+      </Dialog.Description>
+    </Dialog.Header>
+
+    <form method="POST" action="?/setStatus" use:enhance={statusEnhance} class="space-y-4">
+      <input type="hidden" name="match_id" value={selectedMatch?.id || ''} />
+      <input type="hidden" name="status" value={pendingDecision} />
+      <input type="hidden" name="expected_revision" value={selectedMatch?.decisionRevision || 0} />
+      <input
+        type="hidden"
+        name="expected_ranking_revision"
+        value={selectedMatch?.rankingRevision || 0}
+      />
+      <input type="hidden" name="idempotency_key" value={decisionIdempotencyKey} />
+
+      {#if pendingDecision === 'rejected'}
+        <label
+          for="matching-rejection-reason"
+          class="block text-xs font-medium text-[color:var(--text)]"
+        >
+          Structured rejection reason
+          <select
+            id="matching-rejection-reason"
+            name="reason_code"
+            bind:value={pendingReasonCode}
+            required
+            disabled={decisionBusyId === selectedMatch?.id}
+            class="mt-1.5 w-full rounded-md border bg-transparent px-3 py-2 text-sm"
+          >
+            <option value="" disabled>Select a reason</option>
+            {#each REJECTION_REASON_CODES as code (code)}
+              <option value={code}>{label(code)}</option>
+            {/each}
+          </select>
+        </label>
+      {:else}
+        <input type="hidden" name="reason_code" value={pendingReasonCode} />
+        <div
+          class="rounded-md bg-[color:var(--bg-elevated)] px-3 py-2 text-xs text-[color:var(--text-muted)]"
+        >
+          Reason category: <span class="font-semibold text-[color:var(--text)]"
+            >{label(pendingReasonCode)}</span
+          >
+        </div>
+      {/if}
+
+      <div class="space-y-1.5">
+        <label for="matching-decision-reason" class="text-xs font-medium text-[color:var(--text)]">
+          Decision note <span class="font-normal text-[color:var(--text-subtle)]">(optional)</span>
+        </label>
+        <Textarea
+          id="matching-decision-reason"
+          name="reason"
+          bind:value={decisionReason}
+          maxlength={1000}
+          placeholder="Add concise context for the next reviewer…"
+        />
+        <p class="text-right text-[11px] text-[color:var(--text-subtle)] tabular-nums">
+          {decisionReason.length}/1000
+        </p>
+        <p class="text-[11px] text-[color:var(--text-subtle)]">
+          Do not paste identity values, private messages, source links or provider output. Aggregate
+          feedback uses the structured reason above, not this note.
+        </p>
+      </div>
+
+      <Dialog.Footer>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={decisionBusyId === selectedMatch?.id}
+          onclick={() => (decisionDialogOpen = false)}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={!pendingReasonCode || decisionBusyId === selectedMatch?.id}>
+          {decisionBusyId === selectedMatch?.id ? 'Saving…' : 'Confirm decision'}
+        </Button>
+      </Dialog.Footer>
+    </form>
+  </Dialog.Content>
+</Dialog.Root>

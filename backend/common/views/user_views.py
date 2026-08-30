@@ -3,7 +3,6 @@ from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, inline_serializer
-
 from rest_framework import serializers, status
 from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.permissions import IsAuthenticated
@@ -14,12 +13,14 @@ from cases.models import Case
 from cases.serializer import CaseSerializer
 from common import swagger_params
 from common.models import Comment, Profile, Teams, User
+from common.permissions import HasOrgContext
 from common.serializer import (
     BillingAddressSerializer,
     CommentSerializer,
     CreateProfileSerializer,
     CreateUserSerializer,
     ProfileSerializer,
+    SelfProfileUpdateSerializer,
     TeamsSerializer,
     UserCreateSwaggerSerializer,
     UserUpdateStatusSwaggerSerializer,
@@ -79,7 +80,11 @@ class UsersListView(APIView, LimitOffsetPagination):
         },
     )
     def post(self, request, format=None):
-        if self.request.profile.role != "ADMIN" and not self.request.user.is_superuser:
+        if (
+            self.request.profile.role != "ADMIN"
+            and not self.request.profile.is_organization_admin
+            and not self.request.user.is_superuser
+        ):
             return Response(
                 {"error": True, "errors": "Permission Denied"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -127,9 +132,9 @@ class UsersListView(APIView, LimitOffsetPagination):
                     Profile.objects.create(
                         user=user,
                         date_of_joining=timezone.now(),
-                        role=profile_serializer.validated_data["role"],
                         address=address_obj,
                         org=request.profile.org,
+                        **profile_serializer.validated_data,
                     )
             except IntegrityError:
                 return Response(
@@ -169,7 +174,11 @@ class UsersListView(APIView, LimitOffsetPagination):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if self.request.profile.role != "ADMIN" and not self.request.user.is_superuser:
+        if (
+            self.request.profile.role != "ADMIN"
+            and not self.request.profile.is_organization_admin
+            and not self.request.user.is_superuser
+        ):
             return Response(
                 {"error": True, "errors": "Permission Denied"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -230,7 +239,32 @@ class UsersListView(APIView, LimitOffsetPagination):
 
 
 class UserDetailView(APIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsAuthenticated, HasOrgContext)
+
+    privileged_profile_fields = frozenset(
+        {
+            "role",
+            "has_sales_access",
+            "has_marketing_access",
+            "is_organization_admin",
+            "matching_access_level",
+        }
+    )
+
+    @staticmethod
+    def is_access_admin(request):
+        profile = request.profile
+        return bool(
+            request.user.is_superuser
+            or profile.role == "ADMIN"
+            or profile.is_organization_admin
+        )
+
+    def attempts_privilege_change(self, profile, params):
+        return any(
+            field in params and params[field] != getattr(profile, field)
+            for field in self.privileged_profile_fields
+        )
 
     def get_object(self, pk):
         # Security fix: Filter by org to prevent cross-org enumeration
@@ -307,13 +341,16 @@ class UserDetailView(APIView):
         params = request.data
         profile = self.get_object(pk)
         address_obj = profile.address
-        if (
-            self.request.profile.role != "ADMIN"
-            and not self.request.user.is_superuser
-            and self.request.profile.id != profile.id
-        ):
+        is_access_admin = self.is_access_admin(request)
+        if not is_access_admin and self.request.profile.id != profile.id:
             return Response(
                 {"error": True, "errors": "Permission Denied"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not is_access_admin and self.attempts_privilege_change(profile, params):
+            return Response(
+                {"error": True, "errors": "Permission fields require an administrator."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -326,7 +363,10 @@ class UserDetailView(APIView):
             data=params, instance=profile.user, org=request.profile.org
         )
         address_serializer = BillingAddressSerializer(data=params, instance=address_obj)
-        profile_serializer = CreateProfileSerializer(data=params, instance=profile)
+        profile_serializer_class = (
+            CreateProfileSerializer if is_access_admin else SelfProfileUpdateSerializer
+        )
+        profile_serializer = profile_serializer_class(data=params, instance=profile)
         data = {}
         if not serializer.is_valid():
             data["contact_errors"] = serializer.errors
@@ -375,13 +415,16 @@ class UserDetailView(APIView):
         """Handle partial updates to a user."""
         params = request.data
         profile = self.get_object(pk)
-        if (
-            self.request.profile.role != "ADMIN"
-            and not self.request.user.is_superuser
-            and self.request.profile.id != profile.id
-        ):
+        is_access_admin = self.is_access_admin(request)
+        if not is_access_admin and self.request.profile.id != profile.id:
             return Response(
                 {"error": True, "errors": "Permission Denied"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not is_access_admin and self.attempts_privilege_change(profile, params):
+            return Response(
+                {"error": True, "errors": "Permission fields require an administrator."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -397,7 +440,10 @@ class UserDetailView(APIView):
         serializer = CreateUserSerializer(
             data=params, instance=profile.user, org=request.profile.org, partial=True
         )
-        profile_serializer = CreateProfileSerializer(
+        profile_serializer_class = (
+            CreateProfileSerializer if is_access_admin else SelfProfileUpdateSerializer
+        )
+        profile_serializer = profile_serializer_class(
             data=params, instance=profile, partial=True
         )
         data = {}

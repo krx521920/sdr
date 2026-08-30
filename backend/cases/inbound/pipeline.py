@@ -45,21 +45,22 @@ def _record_email_message(
     mailbox: InboundMailbox,
     case: Optional[Case],
     drop_reason: str = "",
+    minimize_content: bool = False,
 ) -> EmailMessage:
     """Create the audit row for this email. Idempotent on (org, message_id)."""
     defaults = {
         "case": case,
         "mailbox": mailbox,
         "direction": "inbound",
-        "in_reply_to": parsed.in_reply_to[:512],
-        "references": " ".join(parsed.references)[:65535],
+        "in_reply_to": "" if minimize_content else parsed.in_reply_to[:512],
+        "references": "" if minimize_content else " ".join(parsed.references)[:65535],
         "from_address": parsed.from_address,
         "from_display_name": parsed.from_display_name[:255],
-        "to_addresses": ", ".join(parsed.to_addresses)[:65535],
-        "cc_addresses": ", ".join(parsed.cc_addresses)[:65535],
-        "subject": (parsed.subject or "")[:512],
-        "body_text": parsed.body_text or "",
-        "body_html": parsed.body_html or "",
+        "to_addresses": "" if minimize_content else ", ".join(parsed.to_addresses)[:65535],
+        "cc_addresses": "" if minimize_content else ", ".join(parsed.cc_addresses)[:65535],
+        "subject": "" if minimize_content else (parsed.subject or "")[:512],
+        "body_text": "" if minimize_content else parsed.body_text or "",
+        "body_html": "" if minimize_content else parsed.body_html or "",
         "received_at": parsed.received_at,
         "drop_reason": drop_reason,
     }
@@ -80,10 +81,15 @@ def ingest(parsed: ParsedEmail, mailbox: InboundMailbox) -> IngestResult:
     would just trigger pointless retries.
     """
     drop, reason = should_drop(parsed)
+    minimize_content = mailbox.route_target == "sdr"
     if drop:
         with transaction.atomic():
             row = _record_email_message(
-                parsed=parsed, mailbox=mailbox, case=None, drop_reason=reason
+                parsed=parsed,
+                mailbox=mailbox,
+                case=None,
+                drop_reason=reason,
+                minimize_content=minimize_content,
             )
         return IngestResult(
             email_message=row, case=None, created_case=False, dropped=True, drop_reason=reason
@@ -101,6 +107,7 @@ def ingest(parsed: ParsedEmail, mailbox: InboundMailbox) -> IngestResult:
                 mailbox=mailbox,
                 case=None,
                 drop_reason="missing_message_id",
+                minimize_content=minimize_content,
             )
         return IngestResult(
             email_message=row,
@@ -128,8 +135,17 @@ def ingest(parsed: ParsedEmail, mailbox: InboundMailbox) -> IngestResult:
             )
 
         if mailbox.route_target != "case":
-            row = _record_email_message(parsed=parsed, mailbox=mailbox, case=None)
-            dispatch_to_route_target(mailbox=mailbox, email_message=row)
+            row = _record_email_message(
+                parsed=parsed,
+                mailbox=mailbox,
+                case=None,
+                minimize_content=minimize_content,
+            )
+            dispatch_to_route_target(
+                mailbox=mailbox,
+                email_message=row,
+                parsed_email=parsed,
+            )
             return IngestResult(
                 email_message=row,
                 case=None,

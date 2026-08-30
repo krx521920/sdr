@@ -1,13 +1,11 @@
 import re
 
+from disposable_email_domains import blocklist as disposable_domains
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from disposable_email_domains import blocklist as disposable_domains
-
-from common.utils import CURRENCY_SYMBOLS
 from common.custom_fields import (
     is_supported_target,
     validate_definition_options,
@@ -20,6 +18,7 @@ from common.models import (
     Comment,
     CustomFieldDefinition,
     Document,
+    MatchingAccessLevel,
     Notification,
     Org,
     PersonalAccessToken,
@@ -28,6 +27,7 @@ from common.models import (
     Teams,
     User,
 )
+from common.utils import CURRENCY_SYMBOLS
 
 
 class OrgAwareRefreshToken(RefreshToken):
@@ -391,6 +391,7 @@ class ShowOrganizationListSerializer(serializers.ModelSerializer):
             "alternate_phone",
             "has_sales_access",
             "has_marketing_access",
+            "matching_access_level",
             "is_organization_admin",
             "org",
         )
@@ -471,6 +472,7 @@ class CreateProfileSerializer(serializers.ModelSerializer):
             "alternate_phone",
             "has_sales_access",
             "has_marketing_access",
+            "matching_access_level",
             "is_organization_admin",
         )
 
@@ -479,6 +481,14 @@ class CreateProfileSerializer(serializers.ModelSerializer):
         self.fields["alternate_phone"].required = False
         self.fields["phone"].required = False
         self.fields["role"].required = True
+
+
+class SelfProfileUpdateSerializer(serializers.ModelSerializer):
+    """Profile fields a non-admin may safely update for themselves."""
+
+    class Meta:
+        model = Profile
+        fields = ("phone", "alternate_phone")
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -504,6 +514,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "address",
             "has_marketing_access",
             "has_sales_access",
+            "matching_access_level",
             "phone",
             "date_of_joining",
             "is_active",
@@ -715,6 +726,13 @@ class UserCreateSwaggerSerializer(serializers.Serializer):
 
     email = serializers.CharField(max_length=1000, required=True)
     role = serializers.ChoiceField(choices=ROLE_CHOICES, required=True)
+    has_sales_access = serializers.BooleanField(required=False)
+    has_marketing_access = serializers.BooleanField(required=False)
+    is_organization_admin = serializers.BooleanField(required=False)
+    matching_access_level = serializers.ChoiceField(
+        choices=MatchingAccessLevel.choices,
+        required=False,
+    )
     phone = serializers.CharField(
         max_length=12, required=False, allow_blank=True, allow_null=True
     )
@@ -788,6 +806,7 @@ class UserDetailSerializer(serializers.ModelSerializer):
                 "is_organization_admin": profile.is_organization_admin,
                 "has_sales_access": profile.has_sales_access,
                 "has_marketing_access": profile.has_marketing_access,
+                "matching_access_level": profile.matching_access_level,
             }
             for profile in profiles
         ]
@@ -809,6 +828,7 @@ class ProfileDetailSerializer(serializers.ModelSerializer):
             "is_organization_admin",
             "has_sales_access",
             "has_marketing_access",
+            "matching_access_level",
             "phone",
             "date_of_joining",
             "is_active",

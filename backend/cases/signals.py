@@ -18,7 +18,6 @@ import logging
 
 from crum import get_current_user
 from django.contrib.contenttypes.models import ContentType
-from django.utils import timezone
 from django.db.models.signals import (
     m2m_changed,
     post_delete,
@@ -26,8 +25,16 @@ from django.db.models.signals import (
     pre_save,
 )
 from django.dispatch import receiver
+from django.utils import timezone
 
-from cases.models import Case, ReopenPolicy, Solution, TimeEntry
+from cases.models import (
+    Case,
+    InboundMailbox,
+    InboundMailboxWebhookRoute,
+    ReopenPolicy,
+    Solution,
+    TimeEntry,
+)
 from common.models import Activity, Comment
 
 REOPEN_TRIGGER_STATUS = "Closed"
@@ -41,6 +48,23 @@ REOPEN_DEFAULTS = {
 logger = logging.getLogger(__name__)
 
 METADATA_BYTE_CAP = 4096
+
+
+@receiver(
+    post_save,
+    sender=InboundMailbox,
+    dispatch_uid="ensure_inbound_mailbox_webhook_route",
+)
+def ensure_inbound_mailbox_webhook_route(sender, instance, raw=False, **kwargs):
+    """Keep the non-RLS tenant bootstrap in sync with its scoped mailbox."""
+
+    if raw:
+        return
+    InboundMailboxWebhookRoute.objects.update_or_create(
+        mailbox_id=instance.id,
+        defaults={"org_id": instance.org_id},
+    )
+
 
 # Field-level UPDATE rows: only emit for these. Status/priority have their own
 # verbs; everything else is bundled into a single UPDATE row per save with
@@ -370,9 +394,7 @@ def _evaluate_reopen(case, comment):
 
     case.status = policy["reopen_to_status"]
     case.closed_on = None
-    Case.objects.filter(pk=case.pk).update(
-        status=case.status, closed_on=None
-    )
+    Case.objects.filter(pk=case.pk).update(status=case.status, closed_on=None)
     _create_activity(
         case,
         "REOPENED",
@@ -397,9 +419,7 @@ def _notify_reopen_assignees(case):
     if not assignee_ids:
         return
     try:
-        send_email_to_assigned_user.delay(
-            assignee_ids, str(case.pk), str(case.org_id)
-        )
+        send_email_to_assigned_user.delay(assignee_ids, str(case.pk), str(case.org_id))
     except Exception:  # pragma: no cover - notification failures are non-blocking
         logger.warning(
             "send_email_to_assigned_user failed for reopen of case=%s", case.pk
@@ -428,9 +448,7 @@ def maybe_reopen_for_inbound_email(case, email_message):
 
     case.status = policy["reopen_to_status"]
     case.closed_on = None
-    Case.objects.filter(pk=case.pk).update(
-        status=case.status, closed_on=None
-    )
+    Case.objects.filter(pk=case.pk).update(status=case.status, closed_on=None)
     _create_activity(
         case,
         "REOPENED",

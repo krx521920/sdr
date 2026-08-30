@@ -101,12 +101,14 @@ def test_apollo_connection_and_source_api_enforce_credit_acknowledgement(
     )
     assert created.status_code == 201, created.json()
     assert created.json()["next_sync_at"] is not None
-    queued = admin_client.post(
+    approval_intent = admin_client.post(
         f"/api/sdr/outbound/sources/{created.json()['id']}/sync/",
         format="json",
     )
-    assert queued.status_code == 202, queued.json()
-    assert queued.json()["job_id"]
+    assert approval_intent.status_code == 200, approval_intent.json()
+    assert approval_intent.json()["status"] == "approval_required"
+    assert approval_intent.json()["intent"]["action"] == "search_people"
+    assert approval_intent.json()["intent"]["units"] == 1
 
 
 class FakeApolloClient:

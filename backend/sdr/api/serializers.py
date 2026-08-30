@@ -27,6 +27,7 @@ from sdr.models import (
     OutboundProspectStatus,
     SalesFeedbackDecision,
     SalesFeedbackReason,
+    SDRApolloCandidate,
     SDRChannelComplianceRule,
     SDRComplianceChannel,
     SDRComplianceEvent,
@@ -119,9 +120,7 @@ class SDRChannelComplianceRuleSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         org = self.context["org"]
-        country = attrs.get(
-            "country_code", getattr(self.instance, "country_code", "*")
-        )
+        country = attrs.get("country_code", getattr(self.instance, "country_code", "*"))
         channel = attrs.get("channel", getattr(self.instance, "channel", ""))
         duplicate = SDRChannelComplianceRule.objects.filter(
             org=org,
@@ -227,8 +226,10 @@ class SDRDataProvenanceSerializer(serializers.ModelSerializer):
             filter(
                 None,
                 (
-                    identity.get("first_name") or obj.intake.raw_payload.get("first_name"),
-                    identity.get("last_name") or obj.intake.raw_payload.get("last_name"),
+                    identity.get("first_name")
+                    or obj.intake.raw_payload.get("first_name"),
+                    identity.get("last_name")
+                    or obj.intake.raw_payload.get("last_name"),
                 ),
             )
         )
@@ -244,9 +245,7 @@ class SDRDataProvenanceSerializer(serializers.ModelSerializer):
         lawful_basis = attrs.get(
             "lawful_basis", getattr(self.instance, "lawful_basis", "unassessed")
         )
-        consent_at = attrs.get(
-            "consent_at", getattr(self.instance, "consent_at", None)
-        )
+        consent_at = attrs.get("consent_at", getattr(self.instance, "consent_at", None))
         evidence = attrs.get(
             "consent_evidence", getattr(self.instance, "consent_evidence", "")
         )
@@ -763,7 +762,9 @@ class SDROutboundSourceSerializer(serializers.ModelSerializer):
                     f"Apollo filter {key} must be a list."
                 )
             values = list(
-                dict.fromkeys(str(item).strip() for item in raw_value if str(item).strip())
+                dict.fromkeys(
+                    str(item).strip() for item in raw_value if str(item).strip()
+                )
             )
             if len(values) > 50 or any(len(item) > 200 for item in values):
                 raise serializers.ValidationError(
@@ -843,6 +844,70 @@ class SDROutboundSourceSerializer(serializers.ModelSerializer):
         instance.full_clean()
         instance.save()
         return instance
+
+
+class SDROutboundSourceSyncRequestSerializer(serializers.Serializer):
+    approval_id = serializers.UUIDField(required=False)
+    idempotency_key = serializers.UUIDField(required=False)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError("Use an object for Apollo sync approval.")
+        unknown = sorted(set(data) - {"approval_id", "idempotency_key"})
+        if unknown:
+            raise serializers.ValidationError(
+                {key: "Unsupported field." for key in unknown}
+            )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        has_approval = "approval_id" in attrs
+        has_key = "idempotency_key" in attrs
+        if has_approval != has_key:
+            raise serializers.ValidationError(
+                "approval_id and idempotency_key must be supplied together."
+            )
+        return attrs
+
+
+class SDREmailExecutionApprovalSerializer(serializers.Serializer):
+    """Optional second-stage approval for one immutable email delivery."""
+
+    approval_id = serializers.UUIDField(required=False)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                "Use an object for email execution approval."
+            )
+        unknown = sorted(set(data) - {"approval_id"})
+        if unknown:
+            raise serializers.ValidationError(
+                {key: "Unsupported field." for key in unknown}
+            )
+        return super().to_internal_value(data)
+
+
+class SDRApolloCandidateSerializer(serializers.ModelSerializer):
+    source_id = serializers.UUIDField(read_only=True)
+    search_request_id = serializers.UUIDField(read_only=True)
+    enrichment_request_id = serializers.UUIDField(read_only=True, allow_null=True)
+    import_batch_id = serializers.UUIDField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = SDRApolloCandidate
+        fields = (
+            "id",
+            "source_id",
+            "safe_label",
+            "status",
+            "search_request_id",
+            "enrichment_request_id",
+            "import_batch_id",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
 
 
 class SDROutboundCopyGenerateSerializer(serializers.Serializer):

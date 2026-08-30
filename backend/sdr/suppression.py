@@ -23,6 +23,7 @@ from sdr.models import (
     SDREmailSuppression,
 )
 from sdr.response import record_lifecycle_event
+from sdr.tracking import delivery_signed_token
 
 UNSUBSCRIBE_SALT = "sdr.nurture.unsubscribe.v1"
 UNSUBSCRIBE_VERSION = 1
@@ -141,14 +142,14 @@ def release_suppression(
 
 
 def unsubscribe_url(delivery: LeadNurtureDelivery) -> str:
-    token = signing.dumps(
+    token = delivery_signed_token(
+        delivery,
         {
             "v": UNSUBSCRIBE_VERSION,
             "org": str(delivery.org_id),
             "delivery": str(delivery.id),
         },
         salt=UNSUBSCRIBE_SALT,
-        compress=True,
     )
     base_url = settings.SDR_NURTURE_TRACKING_BASE_URL.rstrip("/")
     return f"{base_url}/api/sdr/public/nurture/unsubscribe/{token}/"

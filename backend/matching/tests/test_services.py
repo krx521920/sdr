@@ -1,10 +1,12 @@
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
+from matching.governance import ensure_evidence_provenance
 from matching.models import (
     Evidence,
     Match,
@@ -44,7 +46,7 @@ def test_recompute_ranks_people_and_cites_supporting_evidence(org_a):
         source_record_id="linkedin-alice-1",
         confidence=Decimal("0.900"),
     )
-    Evidence.objects.create(
+    relationship_evidence = Evidence.objects.create(
         org=org_a,
         person=strong,
         kind="relationship",
@@ -53,6 +55,8 @@ def test_recompute_ranks_people_and_cites_supporting_evidence(org_a):
         facts={"relationship_strength": 0.9},
         confidence=Decimal("0.800"),
     )
+    ensure_evidence_provenance(evidence=evidence)
+    ensure_evidence_provenance(evidence=relationship_evidence)
     opportunity = MatchOpportunity.objects.create(
         org=org_a,
         opportunity_type="employment",
@@ -74,7 +78,7 @@ def test_recompute_ranks_people_and_cites_supporting_evidence(org_a):
     assert ranked[0].overall_score > ranked[1].overall_score
     assert ranked[1].overall_score <= 49
     assert ranked[0].evidence_links.filter(evidence=evidence).exists()
-    assert ranked[0].engine_version == "rules-v1"
+    assert ranked[0].engine_version == "rules-v2"
 
     partial = recompute_opportunity_matches(
         org=org_a,
@@ -121,6 +125,7 @@ def test_expired_evidence_is_not_used(org_a):
         valid_until=timezone.now() - timedelta(days=1),
         confidence=Decimal("1.000"),
     )
+    ensure_evidence_provenance(evidence=expired)
     opportunity = MatchOpportunity.objects.create(
         org=org_a,
         opportunity_type="project",
@@ -134,6 +139,43 @@ def test_expired_evidence_is_not_used(org_a):
     assert all(
         item["evidence"].id != expired.id for item in evaluation.evidence_contributions
     )
+
+
+@pytest.mark.django_db
+def test_future_evidence_is_not_used_and_recompute_locks_opportunity(org_a):
+    person = Person.objects.create(org=org_a, display_name="Alice")
+    future = Evidence.objects.create(
+        org=org_a,
+        person=person,
+        kind="skill",
+        source="manual",
+        summary="Certification is not observable yet",
+        facts={"skills": ["python"]},
+        observed_at=timezone.now() + timedelta(days=1),
+        confidence=Decimal("1.000"),
+    )
+    ensure_evidence_provenance(evidence=future)
+    opportunity = MatchOpportunity.objects.create(
+        org=org_a,
+        opportunity_type="project",
+        title="Python project",
+        required_criteria={"skills": ["python"]},
+    )
+
+    manager = MatchOpportunity.objects
+    with patch.object(
+        manager,
+        "select_for_update",
+        wraps=manager.select_for_update,
+    ) as select_for_update:
+        match = recompute_opportunity_matches(
+            org=org_a,
+            opportunity=opportunity,
+        )[0]
+
+    select_for_update.assert_called_once_with()
+    assert match.eligibility_score == 0
+    assert not match.evidence_links.filter(evidence=future).exists()
 
 
 @pytest.mark.django_db

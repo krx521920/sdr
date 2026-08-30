@@ -10,6 +10,7 @@ from integrations.models import (
     FacebookPageConnection,
     FacebookPageRoute,
     FeishuBaseConnection,
+    FeishuBasePersonImport,
     FeishuBaseSync,
     LinkedInConnection,
     LinkedInInvitation,
@@ -24,23 +25,38 @@ class FeishuBaseConnectionAdmin(admin.ModelAdmin):
     list_display = (
         "org",
         "app_id",
-        "table_id",
+        "credentials_configured",
+        "destination_configured",
         "is_active",
         "last_validated_at",
         "last_sync_at",
     )
     list_filter = ("is_active",)
-    search_fields = ("org__name", "app_id", "app_token", "table_id")
+    search_fields = ("org__name", "app_id")
     list_select_related = ("org",)
-    readonly_fields = (
-        "id",
+    exclude = (
         "app_secret_ciphertext",
         "app_secret_hint",
+        "app_token",
+        "table_id",
+    )
+    readonly_fields = (
+        "id",
+        "credentials_configured",
+        "destination_configured",
         "last_validated_at",
         "last_sync_at",
         "created_at",
         "updated_at",
     )
+
+    @admin.display(boolean=True, description="Credentials stored")
+    def credentials_configured(self, obj):
+        return bool(obj.app_id and obj.app_secret_ciphertext)
+
+    @admin.display(boolean=True, description="Destination stored")
+    def destination_configured(self, obj):
+        return bool(obj.app_token and obj.table_id)
 
     def has_add_permission(self, request):
         return False
@@ -48,24 +64,28 @@ class FeishuBaseConnectionAdmin(admin.ModelAdmin):
 
 @admin.register(FeishuBaseSync)
 class FeishuBaseSyncAdmin(admin.ModelAdmin):
+    actions = None
     list_display = (
         "intake",
         "org",
         "status",
         "attempt_count",
-        "record_id",
+        "record_safe_label",
         "synced_at",
     )
     list_filter = ("status",)
-    search_fields = ("record_id", "intake__source_record_id", "org__name")
+    search_fields = ("record_id_hash", "intake__source_record_id", "org__name")
     list_select_related = ("org", "connection", "intake")
+    exclude = ("record_id_ciphertext",)
     readonly_fields = (
         "id",
         "org",
         "connection",
         "intake",
+        "execution_request",
         "status",
-        "record_id",
+        "record_id_hash",
+        "record_safe_label",
         "destination_sha256",
         "payload_sha256",
         "attempt_count",
@@ -80,6 +100,57 @@ class FeishuBaseSyncAdmin(admin.ModelAdmin):
     )
 
     def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        # This ledger is the only durable path back to the remote record.
+        return False
+
+
+@admin.register(FeishuBasePersonImport)
+class FeishuBasePersonImportAdmin(admin.ModelAdmin):
+    actions = None
+    list_display = (
+        "id",
+        "org",
+        "status",
+        "total_count",
+        "ready_count",
+        "invalid_count",
+        "completed_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("id", "org__name", "source_namespace")
+    list_select_related = ("org", "connection", "automation_job", "import_batch")
+    exclude = ("mapping_ciphertext",)
+    readonly_fields = (
+        "id",
+        "org",
+        "connection",
+        "requested_by",
+        "execution_request",
+        "automation_job",
+        "import_batch",
+        "status",
+        "mapping_sha256",
+        "destination_sha256",
+        "source_namespace",
+        "row_limit",
+        "attempt_count",
+        "total_count",
+        "ready_count",
+        "invalid_count",
+        "error_code",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False
 
 

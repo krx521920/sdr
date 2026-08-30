@@ -24,6 +24,7 @@
   let dialogTicketType = $state('');
   let dialogAssigneeId = $state('');
   let dialogRouteTarget = $state('case');
+  let dialogSnsTopicArn = $state('');
 
   function openCreate() {
     dialogAddress = '';
@@ -31,6 +32,7 @@
     dialogTicketType = '';
     dialogAssigneeId = '';
     dialogRouteTarget = 'case';
+    dialogSnsTopicArn = '';
     dialogOpen = true;
   }
 
@@ -89,7 +91,8 @@
           <p>
             Create an SES Receipt Rule on a verified domain that publishes to an SNS Topic with
             action <strong>"SNS Notification with full content"</strong>. Subscribe the topic to the
-            webhook URL shown below for each mailbox. The first POST will be a
+            webhook URL shown below for each mailbox, then bind that mailbox to the topic's full
+            ARN. The first POST will be a
             <code>SubscriptionConfirmation</code> — we confirm it automatically. Other providers (Mailgun,
             Postmark, IMAP) will be enabled in a follow-up.
           </p>
@@ -190,23 +193,25 @@
                   </div>
                 </div>
                 <div class="space-y-1">
-                  <Label class="text-xs">Webhook secret</Label>
-                  <div class="flex items-center gap-1">
-                    <code
-                      class="flex-1 truncate rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]"
-                    >
-                      {mailbox.webhook_secret}
-                    </code>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onclick={() => copyToClipboard(mailbox.webhook_secret)}
-                      title="Copy secret"
-                    >
-                      <Copy class="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
+                  <Label class="text-xs">SNS topic binding</Label>
+                  <p
+                    class="rounded bg-[var(--surface-muted)] px-2 py-1 text-[11px]"
+                    class:text-emerald-700={mailbox.sns_topic_bound}
+                    class:text-amber-700={!mailbox.sns_topic_bound}
+                  >
+                    {mailbox.sns_topic_bound
+                      ? 'Exact topic ARN configured'
+                      : 'Not configured — webhook rejects all SNS messages'}
+                  </p>
+                  <Input
+                    name="sns_topic_arn"
+                    autocomplete="off"
+                    placeholder="Paste a new ARN only to replace the binding"
+                    aria-label="Replace SNS topic ARN"
+                  />
+                  <p class="text-[11px] text-[var(--text-secondary)]">
+                    The stored ARN is write-only and is never returned to the browser.
+                  </p>
                 </div>
 
                 <div class="space-y-1">
@@ -326,6 +331,21 @@
         />
         <p class="text-xs text-[var(--text-secondary)]">
           Must match the domain configured in your SES Receipt Rule.
+        </p>
+      </div>
+
+      <div class="space-y-1.5">
+        <Label for="sns_topic_arn">SNS topic ARN *</Label>
+        <Input
+          id="sns_topic_arn"
+          name="sns_topic_arn"
+          required
+          autocomplete="off"
+          placeholder="arn:aws:sns:region:123456789012:topic-name"
+          bind:value={dialogSnsTopicArn}
+        />
+        <p class="text-xs text-[var(--text-secondary)]">
+          The exact AWS account, region and topic are required. This value is write-only.
         </p>
       </div>
 

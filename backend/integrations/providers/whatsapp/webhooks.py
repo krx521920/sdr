@@ -4,24 +4,38 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from django.db import transaction
 from django.utils import timezone
 
 from automation.tenant_context import database_org_context
+from integrations.execution_safety import (
+    mark_execution_delivered,
+    mark_provider_accepted,
+)
 from integrations.models import (
+    ExternalExecutionRequest,
+    ExternalRequestStatus,
     WhatsAppBusinessConnection,
     WhatsAppMessage,
     WhatsAppMessageStatus,
     WhatsAppPhoneRoute,
 )
 
+logger = logging.getLogger(__name__)
+
 STATUS_ORDER = {
     WhatsAppMessageStatus.SENT: 1,
-    WhatsAppMessageStatus.DELIVERED: 2,
-    WhatsAppMessageStatus.READ: 3,
+    # A later delivery receipt is stronger evidence than a provider failure.
+    # This makes FAILED versus DELIVERED/READ deterministic regardless of
+    # webhook arrival order while never allowing SENT to revive a failure.
+    WhatsAppMessageStatus.FAILED: 2,
+    WhatsAppMessageStatus.DELIVERED: 3,
+    WhatsAppMessageStatus.READ: 4,
 }
 
 
@@ -83,11 +97,11 @@ def _apply_status(org_id, payload: Mapping[str, Any]) -> bool:
         "failed",
     }:
         return False
-    message = WhatsAppMessage.objects.filter(
+    candidate = WhatsAppMessage.objects.select_related("org").filter(
         org_id=org_id,
         provider_message_id=provider_message_id,
     ).first()
-    if message is None:
+    if candidate is None:
         return False
 
     occurred_at = _timestamp(payload.get("timestamp"))
@@ -95,41 +109,131 @@ def _apply_status(org_id, payload: Mapping[str, Any]) -> bool:
         "status": provider_status,
         "timestamp": occurred_at.isoformat(),
     }
-    updates: dict[str, Any] = {"provider_status_snapshot": snapshot}
-    if provider_status == "failed":
-        if message.status in {
-            WhatsAppMessageStatus.DELIVERED,
-            WhatsAppMessageStatus.READ,
-        }:
-            WhatsAppMessage.objects.filter(id=message.id, org_id=org_id).update(
-                provider_status_snapshot=snapshot
+    with transaction.atomic():
+        # Every path which touches both ledgers locks the execution request
+        # before the message. The inner savepoint preserves ACK-safe local
+        # projection if an execution-ledger write fails.
+        try:
+            with transaction.atomic():
+                _converge_execution_ledger(
+                    org=candidate.org,
+                    request_id=candidate.execution_request_id,
+                    provider_message_id=provider_message_id,
+                    provider_status=provider_status,
+                )
+        except Exception:
+            logger.exception(
+                "Could not converge WhatsApp execution ledger for message %s",
+                candidate.id,
             )
-            return True
+
+        message = (
+            WhatsAppMessage.objects.select_for_update()
+            .filter(
+                id=candidate.id,
+                org_id=org_id,
+                provider_message_id=provider_message_id,
+            )
+            .first()
+        )
+        if message is None:
+            return False
+        _apply_monotonic_message_status(
+            message=message,
+            payload=payload,
+            provider_status=provider_status,
+            occurred_at=occurred_at,
+            snapshot=snapshot,
+        )
+    return True
+
+
+def _apply_monotonic_message_status(
+    *,
+    message: WhatsAppMessage,
+    payload: Mapping[str, Any],
+    provider_status: str,
+    occurred_at: datetime,
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Apply only a strictly stronger provider state to a locked message."""
+
+    if message.status == WhatsAppMessageStatus.SKIPPED:
+        return
+    current_rank = STATUS_ORDER.get(message.status, 0)
+    next_status = WhatsAppMessageStatus(provider_status)
+    next_rank = STATUS_ORDER[next_status]
+    if next_rank <= current_rank:
+        return
+
+    message.status = next_status
+    message.provider_status_snapshot = dict(snapshot)
+    fields = ["status", "provider_status_snapshot", "updated_at"]
+    if next_status == WhatsAppMessageStatus.FAILED:
         errors = _mapping_list(payload.get("errors"))
         error = errors[0] if errors else {}
         code = str(error.get("code", "")).strip()
-        title = str(error.get("title", "")).strip()
-        updates.update(
-            status=WhatsAppMessageStatus.FAILED,
-            failed_at=occurred_at,
-            error_code=(f"whatsapp_provider_{code}" if code else "whatsapp_failed"),
-            error_message=title[:1000] or "WhatsApp reported delivery failure.",
+        if not code.isdigit() or len(code) > 16:
+            code = ""
+        message.failed_at = occurred_at
+        message.error_code = (
+            f"whatsapp_provider_{code}" if code else "whatsapp_failed"
+        )
+        message.error_message = "WhatsApp reported a delivery failure."
+        fields.extend(["failed_at", "error_code", "error_message"])
+    else:
+        message.failed_at = None
+        message.error_code = ""
+        message.error_message = ""
+        fields.extend(["failed_at", "error_code", "error_message"])
+        if next_status == WhatsAppMessageStatus.SENT and not message.sent_at:
+            message.sent_at = occurred_at
+            fields.append("sent_at")
+        elif next_status == WhatsAppMessageStatus.DELIVERED:
+            message.delivered_at = occurred_at
+            fields.append("delivered_at")
+        elif next_status == WhatsAppMessageStatus.READ:
+            message.read_at = occurred_at
+            fields.append("read_at")
+    message.save(update_fields=fields)
+
+
+def _converge_execution_ledger(
+    *,
+    org,
+    request_id,
+    provider_message_id: str,
+    provider_status: str,
+) -> None:
+    """Lock/converge execution state before the caller locks its message."""
+
+    if not request_id:
+        return
+    request = ExternalExecutionRequest.objects.filter(
+        org=org,
+        id=request_id,
+    ).first()
+    if request is None:
+        return
+    if request.status == ExternalRequestStatus.SENDING:
+        request = mark_provider_accepted(
+            org=org,
+            request_id=request.id,
+            provider_reference=provider_message_id,
         )
     else:
-        next_status = WhatsAppMessageStatus(provider_status)
-        current_rank = STATUS_ORDER.get(message.status, 0)
-        next_rank = STATUS_ORDER[next_status]
-        if next_rank >= current_rank:
-            updates["status"] = next_status
-            if next_status == WhatsAppMessageStatus.SENT and not message.sent_at:
-                updates["sent_at"] = occurred_at
-            elif next_status == WhatsAppMessageStatus.DELIVERED:
-                updates["delivered_at"] = occurred_at
-            elif next_status == WhatsAppMessageStatus.READ:
-                updates["read_at"] = occurred_at
-            updates.update(error_code="", error_message="")
-    WhatsAppMessage.objects.filter(id=message.id, org_id=org_id).update(**updates)
-    return True
+        request = ExternalExecutionRequest.objects.select_for_update().get(
+            org=org,
+            id=request.id,
+        )
+    if provider_status in {"delivered", "read"} and request.status in {
+        ExternalRequestStatus.ACCEPTED,
+        ExternalRequestStatus.UNKNOWN,
+        ExternalRequestStatus.DELIVERED,
+    }:
+        mark_execution_delivered(org=org, request_id=request.id)
+    # A provider-side delivery failure occurs after API acceptance. Its units
+    # remain consumed; the message retains only sanitized failure evidence.
 
 
 def _timestamp(value: Any) -> datetime:

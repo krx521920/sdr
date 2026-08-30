@@ -54,6 +54,7 @@ coverage-badge.svg
 docs/build/
 
 # Node.js / Frontend
+.pnpm-store/
 frontend/node_modules/
 frontend/.svelte-kit/
 frontend/build/

@@ -12,6 +12,7 @@ on:
       - 'docker-compose.yml'
       - '.dockerignore'
       - '.env.docker'
+      - '.gitignore'
       - '.coveragerc'
       - '.github/workflows/tests.yml'
   pull_request:
@@ -25,14 +26,21 @@ on:
       - 'docker-compose.yml'
       - '.dockerignore'
       - '.env.docker'
+      - '.gitignore'
       - '.coveragerc'
       - '.github/workflows/tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 60
 
     services:
       postgres:
@@ -51,6 +59,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -140,7 +150,6 @@ jobs:
           DBPASSWORD: crm_ci_password
           DBHOST: 127.0.0.1
           DBPORT: '5432'
-          SECURE_SSL_REDIRECT: 'False'
         run: uv run pytest -m postgres_only --no-cov --tb=short -v
 
       - name: Generate coverage badge
@@ -148,14 +157,14 @@ jobs:
         working-directory: backend
         run: uvx --from "genbadge[coverage]" genbadge coverage -i coverage.xml -o ../coverage-badge.svg
 
-      - name: Commit coverage badge
+      - name: Upload coverage badge
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add coverage-badge.svg || true
-          git diff --staged --quiet || git commit -m "Update coverage badge [skip ci]"
-          git push || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: coverage-badge.svg
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload coverage report
         if: always()
@@ -165,11 +174,103 @@ jobs:
           path: backend/htmlcov/
           retention-days: 14
 
-  frontend-checks:
+  docker-runtime-acceptance:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: sdr-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      POSTGRES_HOST_PORT: '15432'
+      REDIS_HOST_PORT: '16379'
+      BACKEND_HOST_PORT: '18000'
+      CELERY_WORKER_CONCURRENCY: '2'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check Docker Compose version
+        run: docker compose version
+
+      - name: Configure fail-closed CI runtime
+        run: |
+          printf '%s\n' \
+            'ENV_TYPE=production' \
+            'DEBUG=False' \
+            'SECRET_KEY=ci-only-runtime-secret-not-for-deployment-2026' \
+            'INTEGRATION_ENCRYPTION_KEY=MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=' \
+            'REAL_CHANNEL_EXECUTION_ENABLED=False' \
+            'EMAIL_BACKEND=django.core.mail.backends.locmem.EmailBackend' \
+            'CREATE_DEFAULT_ADMIN=False' \
+            'ADMIN_EMAIL=ci-admin@example.invalid' \
+            'ADMIN_PASSWORD=ci-only-unused-admin-password' \
+            'DEFAULT_FROM_EMAIL=noreply@example.invalid' \
+            'ALLOWED_HOSTS=localhost,127.0.0.1,backend' \
+            'CORS_ALLOW_ALL=False' \
+            'USE_S3_STORAGE=False' \
+            'SECURE_SSL_REDIRECT=True' \
+            'SESSION_COOKIE_SECURE=True' \
+            'CSRF_COOKIE_SECURE=True' \
+            'TRUST_X_FORWARDED_PROTO=True' \
+            > .env.docker.local
+
+      - name: Build backend runtime images
+        run: docker compose build --pull backend celery-worker celery-beat
+
+      - name: Start production-like runtime
+        run: >-
+          docker compose up -d --no-build --wait --wait-timeout 300
+          db redis backend celery-worker celery-beat
+
+      - name: Verify migrations and RLS role
+        run: |
+          docker compose exec -T backend python manage.py migrate --check
+          docker compose exec -T backend python manage.py manage_rls --verify-user --no-color
+
+      - name: Verify backend health loop
+        run: |
+          docker compose exec -T backend python - <<'PY'
+          import time
+          import urllib.request
+
+          for _ in range(20):
+              request = urllib.request.Request(
+                  'http://127.0.0.1:8000/healthz/',
+                  headers={'X-Forwarded-Proto': 'https'},
+              )
+              with urllib.request.urlopen(request, timeout=5) as response:
+                  assert response.status == 200
+              time.sleep(0.25)
+          print('health_loop=20/20')
+          PY
+
+      - name: Verify Celery worker and beat
+        run: |
+          docker compose exec -T backend python -c "from crm.celery import app; replies = app.control.inspect(timeout=10).ping(); assert replies and any(value.get('ok') == 'pong' for value in replies.values()), replies; print('celery_ping=ok')"
+          docker compose ps --status running --services | grep -qx celery-beat
+
+      - name: Verify real matching through Celery
+        timeout-minutes: 4
+        run: >-
+          docker compose exec -T backend python manage.py verify_matching_celery
+          --confirm-live-celery --timeout 120 --poll-interval 1
+
+      - name: Runtime logs
+        if: failure()
+        run: docker compose logs --no-color --tail=300 db redis backend celery-worker celery-beat
+
+      - name: Cleanup runtime
+        if: always()
+        run: docker compose down --volumes --remove-orphans --timeout 10
+
+  frontend-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -190,7 +291,6 @@ jobs:
         run: pnpm test
 
       - name: Prettier format check
-        continue-on-error: true
         working-directory: frontend
         run: pnpm prettier --check .
 
@@ -208,9 +308,12 @@ jobs:
 
   mcp-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -225,3 +328,36 @@ jobs:
       - name: Run MCP tests
         working-directory: mcp_server
         run: uv run pytest --tb=short -v
+
+  coverage-badge:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs:
+      - backend-tests
+      - docker-runtime-acceptance
+      - frontend-checks
+      - mcp-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download coverage badge
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-badge
+          path: .
+
+      - name: Commit coverage badge
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add -f coverage-badge.svg
+          if git diff --staged --quiet; then
+            echo 'Coverage badge is unchanged.'
+            exit 0
+          fi
+          git commit -m "Update coverage badge [skip ci]"
+          git push origin HEAD:main

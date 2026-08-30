@@ -26,6 +26,7 @@ import { error, fail } from '@sveltejs/kit';
 import { env } from '$env/dynamic/public';
 
 const API_BASE_URL = `${env.PUBLIC_DJANGO_API_URL}/api`;
+const MATCHING_ACCESS_LEVELS = new Set(['none', 'read', 'manage', 'recompute', 'decide']);
 
 /**
  * Flatten nested API validation errors into a readable message.
@@ -142,6 +143,9 @@ export async function load({ locals, cookies }) {
         odId: profile.id,
         organizationId: org.id,
         role: profile.role,
+        matchingAccessLevel: MATCHING_ACCESS_LEVELS.has(profile.matching_access_level)
+          ? profile.matching_access_level
+          : 'none',
         user: {
           id: profile.user_details?.id || profile.id,
           email: profile.user_details?.email || 'N/A',
@@ -154,6 +158,9 @@ export async function load({ locals, cookies }) {
         odId: profile.id,
         organizationId: org.id,
         role: profile.role,
+        matchingAccessLevel: MATCHING_ACCESS_LEVELS.has(profile.matching_access_level)
+          ? profile.matching_access_level
+          : 'none',
         user: {
           id: profile.user_details?.id || profile.id,
           email: profile.user_details?.email || 'N/A',
@@ -277,6 +284,41 @@ export const actions = {
         return fail(400, { error: 'Organization must have at least one admin' });
       }
       return apiFail(err, 'Failed to edit role');
+    }
+  },
+
+  /**
+   * Edit a member's matching access level.
+   */
+  edit_matching_access: async ({ request, locals, cookies }) => {
+    const org = locals.org;
+    const user = locals.user;
+
+    try {
+      const formData = await request.formData();
+      const userId = formData.get('user_id')?.toString();
+      const matchingAccessLevel = formData.get('matching_access_level')?.toString();
+
+      if (!userId || !matchingAccessLevel || !MATCHING_ACCESS_LEVELS.has(matchingAccessLevel)) {
+        return fail(400, { error: 'User and a valid matching access level are required' });
+      }
+      if (userId === user.id) {
+        return fail(400, { error: 'You cannot change your own matching access' });
+      }
+
+      await apiRequest(
+        `/user/${userId}/`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ matching_access_level: matchingAccessLevel })
+        },
+        { cookies, org }
+      );
+
+      return { success: true, action: 'edit_matching_access' };
+    } catch (err) {
+      console.error('Error editing matching access:', err);
+      return apiFail(err, 'Failed to edit matching access');
     }
   },
 

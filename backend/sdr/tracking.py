@@ -38,6 +38,40 @@ class TrackingEvent:
     target_url: str = ""
 
 
+class _DeliveryTimestampSigner(signing.TimestampSigner):
+    """TimestampSigner with a durable delivery-owned issuance timestamp."""
+
+    def __init__(self, *args, signed_at, **kwargs):
+        self._delivery_timestamp = int(signed_at.timestamp())
+        super().__init__(*args, **kwargs)
+
+    def timestamp(self) -> str:
+        return signing.b62_encode(self._delivery_timestamp)
+
+
+def delivery_signed_token(
+    delivery: LeadNurtureDelivery,
+    payload: dict,
+    *,
+    salt: str,
+) -> str:
+    """Sign a delivery token reproducibly across approval and worker execution.
+
+    The standard ``signing.dumps`` embeds the wall-clock second.  Outbound
+    approvals fingerprint the fully rendered message, so rebuilding that same
+    message in a later second must not change its tracking or unsubscribe URLs.
+    ``created_at`` is durable and the resulting token remains compatible with
+    Django's normal timestamp-aware ``signing.loads`` validation.
+    """
+
+    if delivery.created_at is None:
+        raise ValueError("A persisted nurture delivery is required.")
+    return _DeliveryTimestampSigner(
+        salt=salt,
+        signed_at=delivery.created_at,
+    ).sign_object(payload, compress=True)
+
+
 def build_tracked_email_content(
     delivery: LeadNurtureDelivery,
     body: str,
@@ -55,7 +89,7 @@ def build_tracked_email_content(
     )
     footer_plain = f"\n\nUnsubscribe: {unsubscribe}" if unsubscribe else ""
     footer_html = (
-        "<p style=\"font-size:12px;color:#64748b\">"
+        '<p style="font-size:12px;color:#64748b">'
         f'<a href="{html.escape(unsubscribe, quote=True)}">Unsubscribe</a></p>'
         if unsubscribe
         else ""
@@ -102,7 +136,7 @@ def make_tracking_token(
     }
     if destination:
         payload["url"] = destination
-    return signing.dumps(payload, salt=TRACKING_SALT, compress=True)
+    return delivery_signed_token(delivery, payload, salt=TRACKING_SALT)
 
 
 def parse_tracking_token(token: str, expected_event: str) -> TrackingEvent:
@@ -238,7 +272,11 @@ def _replace_links(
     chunks: list[str] = []
     cursor = 0
     for match in URL_PATTERN.finditer(body):
-        chunks.append(html.escape(body[cursor : match.start()]) if as_html else body[cursor : match.start()])
+        chunks.append(
+            html.escape(body[cursor : match.start()])
+            if as_html
+            else body[cursor : match.start()]
+        )
         candidate = match.group(0)
         target = candidate.rstrip(TRAILING_URL_PUNCTUATION)
         suffix = candidate[len(target) :]

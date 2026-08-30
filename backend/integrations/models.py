@@ -1,13 +1,36 @@
 """Tenant connections and global webhook routing metadata."""
 
+import hashlib
+import hmac
 import json
 import uuid
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
 from common.base import BaseOrgModel
 from integrations.secrets import decrypt_secret, encrypt_secret
+
+
+class ExecutionChannel(models.TextChoices):
+    EMAIL = "email", "Email"
+    WHATSAPP = "whatsapp", "WhatsApp"
+    LINKEDIN = "linkedin", "LinkedIn"
+    FEISHU = "feishu", "Feishu"
+    APOLLO = "apollo", "Apollo"
+    FACEBOOK = "facebook", "Facebook"
+    WECHAT = "wechat", "WeChat"
+    WECOM = "wecom", "WeCom"
+
+
+class ExternalRequestStatus(models.TextChoices):
+    RESERVED = "reserved", "Reserved"
+    SENDING = "sending", "Sending"
+    ACCEPTED = "accepted", "Accepted"
+    DELIVERED = "delivered", "Delivered"
+    FAILED = "failed", "Failed"
+    UNKNOWN = "unknown", "Unknown"
 
 
 def default_facebook_qualified_bands() -> list[str]:
@@ -487,6 +510,7 @@ class WhatsAppMessageStatus(models.TextChoices):
     SENT = "sent", "Sent"
     DELIVERED = "delivered", "Delivered"
     READ = "read", "Read"
+    UNKNOWN = "unknown", "Unknown provider outcome"
     FAILED = "failed", "Failed"
     SKIPPED = "skipped", "Skipped"
 
@@ -508,6 +532,13 @@ class WhatsAppMessage(BaseOrgModel):
         "sdr.SDROutboundProspect",
         on_delete=models.CASCADE,
         related_name="whatsapp_messages",
+    )
+    execution_request = models.OneToOneField(
+        "integrations.ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="whatsapp_message",
+        null=True,
+        blank=True,
     )
     campaign_run = models.PositiveIntegerField()
     recipient = models.CharField(max_length=32)
@@ -556,6 +587,17 @@ class WhatsAppMessage(BaseOrgModel):
             raise ValidationError("WhatsApp message relations must belong to the org")
         if self.prospect_id and self.prospect.campaign_id != self.campaign_id:
             raise ValidationError("WhatsApp prospect must belong to the campaign")
+        if self.execution_request_id:
+            execution_request = self.execution_request
+            if (
+                execution_request.org_id != self.org_id
+                or execution_request.channel != ExecutionChannel.WHATSAPP
+                or execution_request.action != "send_message"
+                or execution_request.idempotency_key != self.id
+            ):
+                raise ValidationError(
+                    "WhatsApp execution request must match the message scope"
+                )
 
     def __str__(self) -> str:
         return f"{self.recipient}:{self.status}"
@@ -761,7 +803,8 @@ class FeishuBaseConnection(BaseOrgModel):
     def set_app_secret(self, value: str) -> None:
         cleaned = value.strip()
         self.app_secret_ciphertext = encrypt_secret(cleaned)
-        self.app_secret_hint = cleaned[-8:]
+        # No fragment of a provider credential is needed by the product UI.
+        self.app_secret_hint = ""
 
     def get_app_secret(self) -> str:
         if not self.app_secret_ciphertext:
@@ -799,7 +842,6 @@ class FeishuBaseConnection(BaseOrgModel):
                 "app_secret": self.app_secret_ciphertext,
                 "app_token": self.app_token,
                 "table_id": self.table_id,
-                "intake_id field mapping": mapping.get("intake_id", ""),
             }
             missing = [name for name, value in required.items() if not value]
             if missing:
@@ -819,6 +861,15 @@ class FeishuBaseSyncStatus(models.TextChoices):
     SUCCEEDED = "succeeded", "Succeeded"
     FAILED = "failed", "Failed"
     SKIPPED = "skipped", "Skipped"
+    UNKNOWN = "unknown", "Unknown provider outcome"
+    EXTERNAL_ERASURE_PENDING = (
+        "external_erasure_pending",
+        "External erasure pending",
+    )
+    EXTERNAL_ERASURE_COMPLETED = (
+        "external_erasure_completed",
+        "External erasure completed",
+    )
 
 
 class FeishuBaseSync(BaseOrgModel):
@@ -831,15 +882,24 @@ class FeishuBaseSync(BaseOrgModel):
     )
     intake = models.OneToOneField(
         "sdr.LeadIntake",
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="feishu_base_sync",
     )
     status = models.CharField(
-        max_length=16,
+        max_length=32,
         choices=FeishuBaseSyncStatus.choices,
         default=FeishuBaseSyncStatus.PENDING,
     )
-    record_id = models.CharField(max_length=255, blank=True)
+    execution_request = models.ForeignKey(
+        "integrations.ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="feishu_base_syncs",
+        null=True,
+        blank=True,
+    )
+    record_id_ciphertext = models.TextField(blank=True)
+    record_id_hash = models.CharField(max_length=64, blank=True)
+    record_safe_label = models.CharField(max_length=120, blank=True)
     destination_sha256 = models.CharField(max_length=64)
     payload_sha256 = models.CharField(max_length=64)
     attempt_count = models.PositiveIntegerField(default=0)
@@ -857,7 +917,11 @@ class FeishuBaseSync(BaseOrgModel):
             models.Index(
                 fields=["org", "status", "-created_at"],
                 name="feishu_sync_org_status_idx",
-            )
+            ),
+            models.Index(
+                fields=["org", "record_id_hash"],
+                name="feishu_record_hash_idx",
+            ),
         ]
 
     def clean(self) -> None:
@@ -866,6 +930,367 @@ class FeishuBaseSync(BaseOrgModel):
             raise ValidationError("Feishu Base connection must belong to the org.")
         if self.org_id and self.intake.org_id != self.org_id:
             raise ValidationError("Feishu Base intake must belong to the org.")
+        if self.execution_request_id:
+            request = self.execution_request
+            if self.org_id and request.org_id != self.org_id:
+                raise ValidationError(
+                    "Feishu Base execution request must belong to the org."
+                )
+            if request.channel != ExecutionChannel.FEISHU:
+                raise ValidationError(
+                    "Feishu Base execution request has the wrong channel."
+                )
+            if request.action not in {
+                "sync_research_result",
+                "delete_research_record",
+            }:
+                raise ValidationError(
+                    "Feishu Base execution request has the wrong action."
+                )
+
+    @property
+    def has_remote_record(self) -> bool:
+        return bool(self.record_id_ciphertext and self.record_id_hash)
+
+    def set_record_id(self, value: str) -> None:
+        cleaned = str(value or "").strip()
+        if not cleaned or len(cleaned) > 255:
+            raise ValueError("Feishu Base record id is invalid")
+        digest = hash_feishu_record_identifier(org_id=self.org_id, record_id=cleaned)
+        self.record_id_ciphertext = encrypt_secret(cleaned)
+        self.record_id_hash = digest
+        self.record_safe_label = f"Feishu Base record {digest[:8]}"
+
+    def get_record_id(self) -> str:
+        if not self.record_id_ciphertext:
+            return ""
+        return decrypt_secret(self.record_id_ciphertext)
+
+    def clear_record_id(self) -> None:
+        self.record_id_ciphertext = ""
+        self.record_id_hash = ""
+        self.record_safe_label = ""
 
     def __str__(self) -> str:
         return f"{self.intake_id}:{self.status}"
+
+
+class FeishuBasePersonImportStatus(models.TextChoices):
+    QUEUED = "queued", "Queued"
+    READING = "reading", "Reading provider records"
+    PREVIEWED = "previewed", "Preview ready"
+    FAILED = "failed", "Failed"
+    UNKNOWN = "unknown", "Unknown read or local outcome"
+
+
+class FeishuBasePersonImport(BaseOrgModel):
+    """Approval-bound, read-only Base snapshot feeding the Person import ledger.
+
+    Provider field names are part of the exact one-off approval scope.  They are
+    encrypted here instead of being copied into the automation job payload or
+    exposed by status APIs.  Remote record identifiers are never stored on this
+    model; the importer converts them directly to destination-scoped HMACs.
+    """
+
+    connection = models.ForeignKey(
+        FeishuBaseConnection,
+        on_delete=models.PROTECT,
+        related_name="person_imports",
+    )
+    requested_by = models.ForeignKey(
+        "common.Profile",
+        on_delete=models.PROTECT,
+        related_name="requested_feishu_base_person_imports",
+    )
+    execution_request = models.OneToOneField(
+        "integrations.ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="feishu_base_person_import",
+    )
+    automation_job = models.OneToOneField(
+        "automation.AutomationJob",
+        on_delete=models.PROTECT,
+        related_name="feishu_base_person_import",
+        null=True,
+        blank=True,
+    )
+    import_batch = models.OneToOneField(
+        "matching.PersonImportBatch",
+        on_delete=models.PROTECT,
+        related_name="feishu_base_import",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=FeishuBasePersonImportStatus.choices,
+        default=FeishuBasePersonImportStatus.QUEUED,
+    )
+    mapping_ciphertext = models.TextField()
+    mapping_sha256 = models.CharField(max_length=64)
+    destination_sha256 = models.CharField(max_length=64)
+    source_namespace = models.CharField(max_length=128)
+    row_limit = models.PositiveSmallIntegerField(default=100)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    total_count = models.PositiveIntegerField(default=0)
+    ready_count = models.PositiveIntegerField(default=0)
+    invalid_count = models.PositiveIntegerField(default=0)
+    error_code = models.CharField(max_length=80, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "integration_feishu_base_person_import"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(
+                fields=["org", "status", "-created_at"],
+                name="feishu_import_org_status_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(row_limit__gte=1, row_limit__lte=500),
+                name="feishu_import_row_limit_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(status=FeishuBasePersonImportStatus.PREVIEWED)
+                    | models.Q(import_batch__isnull=False)
+                ),
+                name="feishu_import_preview_has_batch",
+            ),
+        ]
+
+    def set_mapping(self, value: dict[str, str]) -> None:
+        if not isinstance(value, dict):
+            raise ValueError("Feishu Base import mapping is invalid")
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.mapping_ciphertext = encrypt_secret(encoded)
+
+    def get_mapping(self) -> dict[str, str]:
+        try:
+            decoded = json.loads(decrypt_secret(self.mapping_ciphertext))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Feishu Base import mapping is unavailable") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("Feishu Base import mapping is unavailable")
+        return {str(key): str(value) for key, value in decoded.items()}
+
+    def clean(self) -> None:
+        super().clean()
+        if self.connection_id and self.connection.org_id != self.org_id:
+            raise ValidationError("Feishu Base import connection must belong to the org")
+        if self.requested_by_id and self.requested_by.org_id != self.org_id:
+            raise ValidationError("Feishu Base import requester must belong to the org")
+        if self.execution_request_id:
+            request = self.execution_request
+            if (
+                request.org_id != self.org_id
+                or request.channel != ExecutionChannel.FEISHU
+                or request.action != "import_person_records"
+            ):
+                raise ValidationError("Feishu Base import execution request is invalid")
+        if self.automation_job_id:
+            job = self.automation_job
+            if (
+                job.org_id != self.org_id
+                or job.name != "integrations.feishu_base_person_import"
+            ):
+                raise ValidationError("Feishu Base import automation job is invalid")
+        if self.import_batch_id:
+            batch = self.import_batch
+            if (
+                batch.org_id != self.org_id
+                or batch.source != "feishu"
+                or batch.source_namespace != self.source_namespace
+            ):
+                raise ValidationError("Feishu Base import batch is invalid")
+        if not 1 <= self.row_limit <= 500:
+            raise ValidationError("Feishu Base import row limit is invalid")
+
+    def __str__(self) -> str:
+        return f"{self.org_id}:{self.status}:{self.id}"
+
+
+def hash_feishu_record_identifier(*, org_id, record_id: str) -> str:
+    """Return an org-bound, non-reversible lookup digest for a remote record id."""
+
+    cleaned = str(record_id or "").strip()
+    if not org_id or not cleaned:
+        raise ValueError("Feishu Base record id is invalid")
+    message = f"feishu-base-record:v1:{org_id}:{cleaned}".encode("utf-8")
+    return hmac.new(
+        str(settings.SECRET_KEY).encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+class ChannelExecutionControl(BaseOrgModel):
+    """Fail-closed organization policy and atomic usage projection per channel."""
+
+    channel = models.CharField(max_length=24, choices=ExecutionChannel.choices)
+    enabled = models.BooleanField(default=False)
+    test_mode = models.BooleanField(default=True)
+    daily_limit = models.PositiveIntegerField(default=0)
+    per_execution_limit = models.PositiveIntegerField(default=0)
+    usage_date = models.DateField(null=True, blank=True)
+    reserved_units = models.PositiveIntegerField(default=0)
+    consumed_units = models.PositiveIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        db_table = "integration_channel_execution_control"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "channel"], name="unique_integration_channel_control"
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "enabled"], name="int_ch_ctrl_idx"
+            )
+        ]
+
+
+class OrganizationExecutionControl(BaseOrgModel):
+    """Organization-wide kill switch and cross-channel daily usage ceiling."""
+
+    enabled = models.BooleanField(default=False)
+    daily_limit = models.PositiveIntegerField(default=0)
+    usage_date = models.DateField(null=True, blank=True)
+    reserved_units = models.PositiveIntegerField(default=0)
+    consumed_units = models.PositiveIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        db_table = "integration_organization_execution_control"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org"], name="unique_integration_organization_control"
+            )
+        ]
+
+
+class ChannelTestTarget(BaseOrgModel):
+    """A test-only destination receipt; the original identifier is never stored."""
+
+    channel = models.CharField(max_length=24, choices=ExecutionChannel.choices)
+    identifier_hash = models.CharField(max_length=64)
+    safe_label = models.CharField(max_length=120)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "integration_channel_test_target"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "channel", "identifier_hash"],
+                name="unique_integration_test_target",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "is_active"], name="int_test_target_idx"
+            )
+        ]
+
+
+class ChannelExecutionApproval(BaseOrgModel):
+    """Short-lived, single-use human authorization bound to an exact request."""
+
+    channel = models.CharField(max_length=24, choices=ExecutionChannel.choices)
+    idempotency_key = models.UUIDField()
+    request_hash = models.CharField(max_length=64)
+    action = models.CharField(max_length=64)
+    target_hash = models.CharField(max_length=64)
+    payload_hash = models.CharField(max_length=64)
+    units = models.PositiveIntegerField(default=1)
+    approved_by = models.ForeignKey(
+        "common.Profile", on_delete=models.PROTECT, related_name="channel_approvals"
+    )
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    consumed_by_request = models.OneToOneField(
+        "ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="consumed_approval",
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        db_table = "integration_channel_execution_approval"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "idempotency_key"],
+                name="unique_integration_execution_approval_key",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "expires_at"], name="int_approval_exp_idx"
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.approved_by_id and self.approved_by.org_id != self.org_id:
+            raise ValidationError("Execution approver must belong to the same org")
+        if self.consumed_by_request_id and self.consumed_by_request.org_id != self.org_id:
+            raise ValidationError("Consumed request must belong to the same org")
+
+
+class ExternalExecutionRequest(BaseOrgModel):
+    """Durable state machine around one potentially side-effecting provider call."""
+
+    channel = models.CharField(max_length=24, choices=ExecutionChannel.choices)
+    action = models.CharField(max_length=64)
+    idempotency_key = models.UUIDField()
+    request_hash = models.CharField(max_length=64)
+    target_hash = models.CharField(max_length=64)
+    payload_hash = models.CharField(max_length=64)
+    units = models.PositiveIntegerField(default=1)
+    approval = models.ForeignKey(
+        ChannelExecutionApproval,
+        on_delete=models.PROTECT,
+        related_name="requests",
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=ExternalRequestStatus.choices,
+        default=ExternalRequestStatus.RESERVED,
+    )
+    provider_reference_hash = models.CharField(max_length=64, blank=True)
+    error_code = models.CharField(max_length=80, blank=True)
+    reserved_at = models.DateTimeField()
+    sending_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    failed_at = models.DateTimeField(null=True, blank=True)
+    unknown_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "integration_external_execution_request"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "channel", "idempotency_key"],
+                name="unique_integration_execution_request",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "channel", "status", "-created_at"],
+                name="int_exec_status_idx",
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.approval_id and self.approval.org_id != self.org_id:
+            raise ValidationError("Execution approval must belong to the same org")

@@ -1,5 +1,6 @@
 import os
 from datetime import timedelta
+from math import ceil
 
 from corsheaders.defaults import default_headers
 from cryptography.fernet import Fernet
@@ -24,6 +25,40 @@ if not SECRET_KEY or SECRET_KEY.startswith("django-insecure"):
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
+
+# A second, environment-owned kill switch for any newly guarded real-channel
+# side effect. Database policy alone can never enable execution.
+REAL_CHANNEL_EXECUTION_ENABLED = (
+    os.environ.get("REAL_CHANNEL_EXECUTION_ENABLED", "False").lower() == "true"
+)
+CHANNEL_EXECUTION_RESERVED_TIMEOUT_SECONDS = max(
+    60,
+    min(
+        86400,
+        int(os.environ.get("CHANNEL_EXECUTION_RESERVED_TIMEOUT_SECONDS", "900")),
+    ),
+)
+CHANNEL_EXECUTION_SENDING_TIMEOUT_SECONDS = max(
+    60,
+    min(
+        86400,
+        int(os.environ.get("CHANNEL_EXECUTION_SENDING_TIMEOUT_SECONDS", "900")),
+    ),
+)
+# Deliberately not environment-configurable. Legacy provider paths must migrate
+# to an ExternalExecutionRequest before production network I/O is possible.
+ALLOW_UNGUARDED_PROVIDER_IO = False
+
+# Staging rows can contain exact identities while an operator reviews an
+# import.  Keep that window short by default; the periodic matching task
+# scrubs uncommitted previews once they cross this age.
+MATCHING_IMPORT_PREVIEW_RETENTION_DAYS = max(
+    1,
+    min(
+        365,
+        int(os.environ.get("MATCHING_IMPORT_PREVIEW_RETENTION_DAYS", "7")),
+    ),
+)
 
 # Security: Restrict allowed hosts - set ALLOWED_HOSTS env var in production
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
@@ -167,6 +202,12 @@ elif IS_PRODUCTION:
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@localhost")
 
+# Exact SNS topic authorized to deliver SES bounce/complaint/delivery events.
+# Empty is intentionally fail-closed in the public feedback webhook.
+AWS_SES_FEEDBACK_SNS_TOPIC_ARN = os.environ.get(
+    "AWS_SES_FEEDBACK_SNS_TOPIC_ARN", ""
+).strip()
+
 # AWS SES settings (loaded when EMAIL_BACKEND is django_ses.SESBackend)
 if "django_ses" in EMAIL_BACKEND:
     AWS_SES_REGION_NAME = os.environ.get("AWS_SES_REGION_NAME", "ap-south-1")
@@ -233,9 +274,7 @@ LOGGING = {
         },
         "security_audit": {
             "class": "logging.FileHandler",
-            "filename": os.environ.get(
-                "SECURITY_AUDIT_LOG_PATH", "security_audit.log"
-            ),
+            "filename": os.environ.get("SECURITY_AUDIT_LOG_PATH", "security_audit.log"),
             "formatter": "security",
         },
     },
@@ -562,6 +601,13 @@ AUTOMATION_JOB_HANDLERS = {
     "feishu_base.sync_research_result": (
         "integrations.providers.feishu_base.sync.process_feishu_base_sync_job"
     ),
+    "integrations.feishu_base_sync": (
+        "integrations.providers.feishu_base.sync.process_feishu_base_sync_job"
+    ),
+    "integrations.feishu_base_person_import": (
+        "integrations.providers.feishu_base.person_import."
+        "process_feishu_base_person_import_job"
+    ),
     "sdr.process_intake": (
         "integrations.providers.website.jobs.process_website_intake_job"
     ),
@@ -572,7 +618,12 @@ AUTOMATION_JOB_HANDLERS = {
     "sdr.process_inbound_email": "sdr.email.process_inbound_email_job",
     "sdr.process_outbound_prospect": "sdr.outbound.process_outbound_prospect_job",
     "sdr.sync_outbound_source": "sdr.sources.process_outbound_source_sync_job",
+    "sdr.enrich_apollo_candidate": (
+        "sdr.sources.process_apollo_candidate_enrichment_job"
+    ),
     "sdr.generate_outbound_copy": "sdr.outbound_copy.process_outbound_copy_job",
+    "matching.recompute_opportunity": "matching.jobs.process_recompute_opportunity_job",
+    "matching.import_people": "matching.jobs.process_person_import_job",
 }
 INBOUND_EMAIL_ROUTE_HANDLERS = {
     "sdr": "sdr.email.enqueue_inbound_email",
@@ -584,8 +635,21 @@ AUTOMATION_RETRY_MAX_SECONDS = max(
     AUTOMATION_RETRY_BASE_SECONDS,
     int(os.environ.get("AUTOMATION_RETRY_MAX_SECONDS", "900")),
 )
+# The bounded Feishu client permits at most twenty read requests across
+# authentication, field pagination, and record pagination.  Never let
+# stale-job recovery expire that max-attempts=1 job while an allowed provider
+# request may still be in flight.  The extra two minutes cover local
+# normalization, preview persistence, and scheduler jitter.
+FEISHU_PERSON_IMPORT_MAX_PROVIDER_CALLS = 20
+FEISHU_PERSON_IMPORT_LEASE_MARGIN_SECONDS = 120
+_FEISHU_PERSON_IMPORT_MIN_LEASE_SECONDS = (
+    ceil(FEISHU_OPEN_API_TIMEOUT * FEISHU_PERSON_IMPORT_MAX_PROVIDER_CALLS)
+    + FEISHU_PERSON_IMPORT_LEASE_MARGIN_SECONDS
+)
 AUTOMATION_JOB_LEASE_SECONDS = max(
-    60, int(os.environ.get("AUTOMATION_JOB_LEASE_SECONDS", "600"))
+    60,
+    int(os.environ.get("AUTOMATION_JOB_LEASE_SECONDS", "600")),
+    _FEISHU_PERSON_IMPORT_MIN_LEASE_SECONDS,
 )
 AUTOMATION_MANUAL_RETRY_ATTEMPTS = max(
     1, int(os.environ.get("AUTOMATION_MANUAL_RETRY_ATTEMPTS", "3"))
@@ -600,9 +664,7 @@ SDR_FEISHU_TIMEOUT_SECONDS = max(
 # rotation cannot make stored integration credentials unreadable.
 INTEGRATION_ENCRYPTION_KEY = os.environ.get("INTEGRATION_ENCRYPTION_KEY", "").strip()
 if IS_PRODUCTION and not INTEGRATION_ENCRYPTION_KEY:
-    raise ImproperlyConfigured(
-        "INTEGRATION_ENCRYPTION_KEY is required in production"
-    )
+    raise ImproperlyConfigured("INTEGRATION_ENCRYPTION_KEY is required in production")
 if INTEGRATION_ENCRYPTION_KEY:
     try:
         Fernet(INTEGRATION_ENCRYPTION_KEY.encode("ascii"))

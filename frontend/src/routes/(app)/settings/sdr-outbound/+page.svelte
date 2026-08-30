@@ -42,6 +42,8 @@
   const apolloConnection = $derived(form?.apolloConnection || data.apolloConnection || null);
   const linkedinConnection = $derived(form?.linkedinConnection || data.linkedinConnection || null);
   const outboundSources = $derived(data.outboundSources || []);
+  const apolloCandidatesBySource = $derived(data.apolloCandidates || {});
+  const whatsappMessages = $derived(data.whatsappMessages?.results || []);
   const copyDrafts = $derived(data.copyDrafts || []);
   const campaignAnalytics = $derived(data.campaignAnalytics || null);
   const cohortMetrics = $derived(campaignAnalytics?.cohort || {});
@@ -137,6 +139,15 @@
       whatsappConfigTest = form.whatsappConfigTest;
       if (form.whatsappConfigTest.ok) toast.success('WhatsApp local configuration is ready.');
     }
+    if (form?.whatsappApprovalRequired) {
+      toast.info('WhatsApp send intent prepared. No provider call was queued.');
+    }
+    if (form?.whatsappExecutionQueued) {
+      toast.success('The approved WhatsApp send was reserved and queued once.');
+    }
+    if (form?.whatsappExecutionConverged) {
+      toast.success('The WhatsApp execution was already accepted; no duplicate job was created.');
+    }
     if (form?.linkedinConfigTest) {
       linkedinConfigTest = form.linkedinConfigTest;
       if (form.linkedinConfigTest.ok) toast.success('LinkedIn local configuration is ready.');
@@ -147,6 +158,15 @@
     }
     if (form?.apolloSourceSaved) toast.success('Apollo prospect source saved.');
     if (form?.apolloSourceQueued) toast.success('Apollo source sync queued.');
+    if (form?.apolloSearchApprovalRequired) {
+      toast.info('Apollo search intent prepared. No provider call was queued.');
+    }
+    if (form?.apolloEnrichmentApprovalRequired) {
+      toast.info('Apollo enrichment intent prepared. No provider call was queued.');
+    }
+    if (form?.apolloCandidateEnrichmentQueued) {
+      toast.success('Apollo candidate enrichment queued.');
+    }
     if (form?.outboundCopyQueued) toast.success('AI copy generation queued for review.');
     if (form?.outboundCopySaved) toast.success('Reviewed outbound copy saved.');
     if (form?.outboundCopyApplied) {
@@ -185,6 +205,48 @@
 
   function cancelCreate() {
     creating = false;
+  }
+
+  function apolloCandidateStatus(value) {
+    return (
+      {
+        pending_enrichment_approval: 'Awaiting enrichment approval',
+        enrichment_reserved: 'Enrichment queued',
+        import_queued: 'Import queued',
+        imported: 'Imported',
+        import_review_required: 'Import needs review',
+        import_failed: 'Import failed',
+        import_retry_required: 'Import retry required',
+        unknown: 'Provider outcome unknown',
+        skipped: 'Skipped'
+      }[value] || 'Unknown state'
+    );
+  }
+
+  function whatsappMessageStatus(value) {
+    return (
+      {
+        pending: 'Awaiting exact approval',
+        queued: 'Reserved and queued',
+        sending: 'Provider call in progress',
+        sent: 'Provider accepted',
+        delivered: 'Delivered',
+        read: 'Read',
+        unknown: 'Outcome needs reconciliation',
+        failed: 'Failed without replay',
+        skipped: 'Skipped'
+      }[value] || 'Unknown state'
+    );
+  }
+
+  function whatsappMessageStatusClass(value) {
+    if (value === 'delivered' || value === 'read') return 'bg-emerald-100 text-emerald-700';
+    if (value === 'queued' || value === 'sending' || value === 'sent') {
+      return 'bg-blue-100 text-blue-700';
+    }
+    if (value === 'unknown') return 'bg-amber-100 text-amber-800';
+    if (value === 'failed') return 'bg-red-100 text-red-700';
+    return 'bg-slate-100 text-slate-600';
   }
 
   /** @param {string} channel */
@@ -368,7 +430,7 @@
           type="password"
           autocomplete="new-password"
           placeholder={whatsappConnection?.access_token_configured
-            ? `Configured ···${whatsappConnection.access_token_hint || ''}`
+            ? 'Configured — token remains hidden'
             : 'Required'}
           class="h-9 w-full rounded-md border border-[color:var(--border-faint)] bg-[color:var(--bg)] px-3 text-sm font-normal"
         />
@@ -1407,6 +1469,153 @@
     </section>
   {/if}
 
+  {#if selected && !creating && (selected.channels?.includes('whatsapp') || whatsappMessages.length || data.whatsappMessages?.error)}
+    <section
+      class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-5"
+    >
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-2">
+            <ShieldCheck class="size-4 text-emerald-700" />
+            <h2 class="text-sm font-semibold">WhatsApp approval queue</h2>
+          </div>
+          <p class="mt-1 max-w-3xl text-xs text-[color:var(--text-muted)]">
+            Every production message is reviewed as an exact, one-unit intent. Preparing an intent
+            never calls Meta; an approved message creates one single-attempt job and cannot be
+            automatically replayed after provider I/O begins.
+          </p>
+        </div>
+        <span
+          class="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-800"
+        >
+          {whatsappMessages.length} safe ledger rows
+        </span>
+      </div>
+
+      {#if data.whatsappMessages?.error}
+        <div role="alert" class="mt-4 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {data.whatsappMessages.error}
+        </div>
+      {/if}
+
+      {#if whatsappMessages.length}
+        <div class="mt-4 grid gap-3 xl:grid-cols-2">
+          {#each whatsappMessages as message (message.id)}
+            <article class="rounded-lg border border-[color:var(--border-faint)] p-4">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="text-xs font-semibold">Message {message.id.slice(0, 8)}</p>
+                  <p class="mt-1 text-[10px] text-[color:var(--text-muted)]">
+                    Created {formatDate(message.createdAt)} · recipient and template remain server-side
+                  </p>
+                </div>
+                <span
+                  class={`rounded-full px-2 py-0.5 text-[10px] font-medium ${whatsappMessageStatusClass(message.status)}`}
+                >
+                  {whatsappMessageStatus(message.status)}
+                </span>
+              </div>
+
+              {#if message.executionRequestId}
+                <dl class="mt-3 grid gap-1 text-[11px] sm:grid-cols-[8rem_1fr]">
+                  <dt class="text-[color:var(--text-muted)]">Execution state</dt>
+                  <dd class="font-medium">{message.executionStatus}</dd>
+                  <dt class="text-[color:var(--text-muted)]">Request</dt>
+                  <dd><code class="break-all">{message.executionRequestId}</code></dd>
+                </dl>
+              {/if}
+
+              {#if message.status === 'unknown' || message.executionStatus === 'unknown'}
+                <div
+                  class="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-950"
+                >
+                  Provider outcome is uncertain and quota remains consumed. Check Meta
+                  independently, then resolve this request in Real-channel safety; this message
+                  cannot be resent.
+                  <a
+                    class="mt-2 block font-medium underline underline-offset-2"
+                    href={message.executionRequestId
+                      ? `/settings/channel-safety?request=${encodeURIComponent(message.executionRequestId)}`
+                      : '/settings/channel-safety'}
+                    target="_blank"
+                    rel="noreferrer">Open UNKNOWN reconciliation</a
+                  >
+                </div>
+              {:else if message.status === 'pending' && !message.executionRequestId}
+                {#if form?.whatsappApprovalRequired && form?.whatsappMessageId === message.id}
+                  <div
+                    role="status"
+                    class="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-950"
+                  >
+                    <p class="font-semibold">Approval required — nothing has been queued</p>
+                    <p class="mt-1">
+                      In Real-channel safety, choose the pre-registered masked WhatsApp test target,
+                      then issue an approval with these exact values.
+                    </p>
+                    <dl class="mt-2 grid gap-1.5 sm:grid-cols-[8rem_1fr]">
+                      <dt class="font-medium">Action</dt>
+                      <dd><code>{form.whatsappIntent.action}</code></dd>
+                      <dt class="font-medium">Payload SHA-256</dt>
+                      <dd><code class="break-all">{form.whatsappIntent.payloadHash}</code></dd>
+                      <dt class="font-medium">Target SHA-256</dt>
+                      <dd><code class="break-all">{form.whatsappIntent.targetHash}</code></dd>
+                      <dt class="font-medium">Units</dt>
+                      <dd>{form.whatsappIntent.units}</dd>
+                    </dl>
+                    <a
+                      class="mt-2 inline-flex font-medium underline underline-offset-2"
+                      href="/settings/channel-safety"
+                      target="_blank"
+                      rel="noreferrer">Open Real-channel safety</a
+                    >
+                    <form
+                      method="POST"
+                      action="?/executeWhatsAppMessage"
+                      use:enhance
+                      class="mt-3 flex flex-col gap-2 sm:flex-row"
+                    >
+                      <input type="hidden" name="message_id" value={message.id} />
+                      <input
+                        name="approval_id"
+                        aria-label="One-time WhatsApp approval UUID"
+                        autocomplete="off"
+                        required
+                        pattern="[0-9a-fA-F-]{36}"
+                        maxlength="36"
+                        placeholder="One-time approval UUID"
+                        class="h-9 min-w-0 flex-1 rounded-md border border-amber-300 bg-white px-3 font-mono text-xs"
+                      />
+                      <Button size="sm" type="submit">Queue approved message once</Button>
+                    </form>
+                  </div>
+                {:else}
+                  <form method="POST" action="?/executeWhatsAppMessage" use:enhance class="mt-3">
+                    <input type="hidden" name="message_id" value={message.id} />
+                    <Button size="sm" variant="outline" type="submit" disabled={!whatsappActive}>
+                      <ShieldCheck class="size-3.5" />Review exact send intent
+                    </Button>
+                  </form>
+                  {#if !whatsappActive}
+                    <p class="mt-2 text-[10px] text-amber-700">
+                      Enable the local WhatsApp connection before preparing this intent.
+                    </p>
+                  {/if}
+                {/if}
+              {/if}
+            </article>
+          {/each}
+        </div>
+      {:else if !data.whatsappMessages?.error}
+        <div class="mt-4 rounded-lg bg-[color:var(--bg-muted)] px-4 py-6 text-center">
+          <p class="text-xs font-medium">No WhatsApp message ledger rows for this campaign.</p>
+          <p class="mt-1 text-[10px] text-[color:var(--text-muted)]">
+            In production-safe mode, launching a campaign creates pending rows but performs no send.
+          </p>
+        </div>
+      {/if}
+    </section>
+  {/if}
+
   {#if selected && !creating}
     <section
       class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-5"
@@ -1418,8 +1627,8 @@
             <h2 class="text-sm font-semibold">Automatic prospect sources</h2>
           </div>
           <p class="mt-1 text-xs text-[color:var(--text-muted)]">
-            Search one Apollo page per run, skip Apollo IDs already in this campaign, then enrich
-            and import only the configured maximum.
+            Apollo search and each candidate enrichment are separate credit-bearing calls. Every
+            call needs its own exact, one-time approval; viewing this page never executes one.
           </p>
         </div>
         <span class="rounded-full bg-violet-50 px-2.5 py-1 text-[11px] font-medium text-violet-700">
@@ -1438,12 +1647,12 @@
                     <span
                       class={`rounded-full px-2 py-0.5 text-[10px] font-medium ${source.is_active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}
                     >
-                      {source.is_active ? 'Scheduled' : 'Manual'}
+                      {source.is_active ? 'Schedule intent enabled' : 'Manual intent'}
                     </span>
                   </div>
                   <p class="mt-1 text-[11px] text-[color:var(--text-muted)]">
-                    Up to {source.max_results_per_sync} enrichments every {source.interval_hours}h ·
-                    page {source.next_page}
+                    Up to {source.max_results_per_sync} candidates per search · every {source.interval_hours}h
+                    · page {source.next_page}. The scheduler cannot bypass one-time approval.
                   </p>
                 </div>
                 <form method="POST" action="?/syncApolloSource" use:enhance>
@@ -1453,6 +1662,56 @@
                   </Button>
                 </form>
               </div>
+              {#if form?.apolloSearchApprovalRequired && form?.apolloSourceId === source.id}
+                <div
+                  role="status"
+                  class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-xs text-amber-950"
+                >
+                  <p class="font-semibold">Approval required — nothing has been queued</p>
+                  <p class="mt-1 text-amber-900">
+                    In Real-channel safety, add the exact test-target identifier below, issue an
+                    approval with the same action, fingerprint and units, then paste the returned
+                    approval UUID here.
+                  </p>
+                  <dl class="mt-3 grid gap-2 sm:grid-cols-[8rem_1fr]">
+                    <dt class="font-medium">Action</dt>
+                    <dd><code class="break-all">{form.apolloSearchIntent.action}</code></dd>
+                    <dt class="font-medium">Payload SHA-256</dt>
+                    <dd><code class="break-all">{form.apolloSearchIntent.payloadHash}</code></dd>
+                    <dt class="font-medium">Test target</dt>
+                    <dd>
+                      <code class="break-all">{form.apolloSearchIntent.testTargetIdentifier}</code>
+                    </dd>
+                    <dt class="font-medium">Units</dt>
+                    <dd>{form.apolloSearchIntent.units}</dd>
+                  </dl>
+                  <a
+                    class="mt-3 inline-flex font-medium text-amber-950 underline underline-offset-2"
+                    href="/settings/channel-safety"
+                    target="_blank"
+                    rel="noreferrer">Open Real-channel safety</a
+                  >
+                  <form
+                    method="POST"
+                    action="?/syncApolloSource"
+                    use:enhance
+                    class="mt-3 flex flex-col gap-2 sm:flex-row"
+                  >
+                    <input type="hidden" name="source_id" value={source.id} />
+                    <input
+                      name="approval_id"
+                      aria-label="One-time Apollo search approval UUID"
+                      autocomplete="off"
+                      required
+                      pattern="[0-9a-fA-F-]{36}"
+                      maxlength="36"
+                      placeholder="One-time approval UUID"
+                      class="h-9 min-w-0 flex-1 rounded-md border border-amber-300 bg-white px-3 font-mono text-xs"
+                    />
+                    <Button size="sm" type="submit">Queue approved search</Button>
+                  </form>
+                </div>
+              {/if}
               {#if source.last_sync_at}
                 <p class="mt-3 text-[11px] text-[color:var(--text-muted)]">
                   Last sync {formatDate(source.last_sync_at)} · {source.last_sync_stats?.created ||
@@ -1465,6 +1724,105 @@
                 <p class="mt-3 rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
                   {source.last_error_message}
                 </p>
+              {/if}
+
+              {#if apolloCandidatesBySource[source.id]?.error}
+                <p class="mt-3 rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                  {apolloCandidatesBySource[source.id].error}
+                </p>
+              {:else if apolloCandidatesBySource[source.id]?.results?.length}
+                <div class="mt-4 border-t border-[color:var(--border-faint)] pt-4">
+                  <div class="flex items-center justify-between gap-3">
+                    <h3 class="text-xs font-semibold">Search candidates</h3>
+                    <span class="text-[11px] text-[color:var(--text-muted)]"
+                      >{apolloCandidatesBySource[source.id].count} shown</span
+                    >
+                  </div>
+                  <div class="mt-2 space-y-2">
+                    {#each apolloCandidatesBySource[source.id].results as candidate (candidate.id)}
+                      <div class="rounded-md bg-[color:var(--bg-muted)] p-3">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <p class="text-xs font-medium">{candidate.safeLabel}</p>
+                          <span class="text-[10px] text-[color:var(--text-muted)]">
+                            {apolloCandidateStatus(candidate.status)}
+                          </span>
+                        </div>
+                        {#if candidate.status === 'pending_enrichment_approval'}
+                          {#if form?.apolloEnrichmentApprovalRequired && form?.apolloCandidateId === candidate.id}
+                            <div
+                              role="status"
+                              class="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-950"
+                            >
+                              <p class="font-semibold">
+                                Enrichment approval required — nothing has been queued
+                              </p>
+                              <dl class="mt-2 grid gap-1.5 sm:grid-cols-[7rem_1fr]">
+                                <dt class="font-medium">Action</dt>
+                                <dd>
+                                  <code class="break-all">{form.apolloEnrichmentIntent.action}</code
+                                  >
+                                </dd>
+                                <dt class="font-medium">Payload SHA-256</dt>
+                                <dd>
+                                  <code class="break-all"
+                                    >{form.apolloEnrichmentIntent.payloadHash}</code
+                                  >
+                                </dd>
+                                <dt class="font-medium">Test target</dt>
+                                <dd>
+                                  <code class="break-all"
+                                    >{form.apolloEnrichmentIntent.testTargetIdentifier}</code
+                                  >
+                                </dd>
+                                <dt class="font-medium">Units</dt>
+                                <dd>{form.apolloEnrichmentIntent.units}</dd>
+                              </dl>
+                              <a
+                                class="mt-2 inline-flex font-medium underline underline-offset-2"
+                                href="/settings/channel-safety"
+                                target="_blank"
+                                rel="noreferrer">Open Real-channel safety</a
+                              >
+                              <form
+                                method="POST"
+                                action="?/enrichApolloCandidate"
+                                use:enhance
+                                class="mt-2 flex flex-col gap-2 sm:flex-row"
+                              >
+                                <input type="hidden" name="source_id" value={source.id} />
+                                <input type="hidden" name="candidate_id" value={candidate.id} />
+                                <input
+                                  name="approval_id"
+                                  aria-label="One-time Apollo enrichment approval UUID"
+                                  autocomplete="off"
+                                  required
+                                  pattern="[0-9a-fA-F-]{36}"
+                                  maxlength="36"
+                                  placeholder="One-time approval UUID"
+                                  class="h-9 min-w-0 flex-1 rounded-md border border-amber-300 bg-white px-3 font-mono text-xs"
+                                />
+                                <Button size="sm" type="submit">Queue approved enrichment</Button>
+                              </form>
+                            </div>
+                          {:else}
+                            <form
+                              method="POST"
+                              action="?/prepareApolloCandidateEnrichment"
+                              use:enhance
+                              class="mt-2"
+                            >
+                              <input type="hidden" name="source_id" value={source.id} />
+                              <input type="hidden" name="candidate_id" value={candidate.id} />
+                              <Button size="sm" variant="outline" type="submit"
+                                >Review enrichment intent</Button
+                              >
+                            </form>
+                          {/if}
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
               {/if}
             </div>
           {/each}

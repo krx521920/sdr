@@ -8,6 +8,11 @@ from typing import Any
 
 import requests
 
+from integrations.execution_safety import (
+    ExecutionSafetyError,
+    assert_provider_io_authorized,
+)
+
 
 class LinkedInInvitationsAPIError(RuntimeError):
     def __init__(
@@ -37,10 +42,14 @@ class LinkedInInvitationsClient:
         base_url: str = "https://api.linkedin.com",
         timeout: float = 10.0,
         session: requests.Session | None = None,
+        org=None,
+        execution_request_id=None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.org = org
+        self.execution_request_id = execution_request_id
 
     def send_email_invitation(
         self,
@@ -58,6 +67,17 @@ class LinkedInInvitationsClient:
                     "body": message_body.strip()
                 }
             }
+        try:
+            assert_provider_io_authorized(
+                org=self.org,
+                channel="linkedin",
+                action="send_invitation",
+                execution_request_id=self.execution_request_id,
+            )
+        except ExecutionSafetyError as exc:
+            raise LinkedInInvitationsAPIError(
+                exc.detail, retryable=False, error_code=exc.code
+            ) from exc
         try:
             response = self.session.post(
                 f"{self.base_url}/v2/invitations",

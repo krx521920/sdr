@@ -252,6 +252,48 @@ def test_feishu_handoff_uses_encrypted_official_webhook(
 
 
 @pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    ALLOW_UNGUARDED_PROVIDER_IO=False,
+)
+def test_feishu_handoff_is_not_scheduled_without_execution_approval_contract(
+    admin_client,
+    org_a,
+    admin_profile,
+    monkeypatch,
+):
+    admin_profile.has_sales_access = True
+    admin_profile.save(update_fields=["has_sales_access"])
+    configuration = SDRResponseSettings.objects.create(
+        org=org_a,
+        sales_in_app_enabled=False,
+        feishu_enabled=True,
+    )
+    configuration.set_feishu_webhook(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-hook-12345678"
+    )
+    configuration.save()
+    post = Mock()
+    monkeypatch.setattr("sdr.response.requests.post", post)
+
+    intake = accept_and_process(
+        admin_client,
+        org_a,
+        source_record_id="response-loop-feishu-fail-closed",
+    )
+
+    assert not AutomationJob.objects.filter(
+        org=org_a,
+        name__in=["sdr.notify_sales_feishu", "feishu_base.sync_research_result"],
+    ).exists()
+    assert not LeadDelivery.objects.filter(
+        intake=intake,
+        kind="sales_feishu",
+    ).exists()
+    post.assert_not_called()
+
+
+@pytest.mark.django_db
 @override_settings(ROOT_URLCONF="integrations.tests.urls")
 def test_response_settings_reject_non_feishu_webhook(admin_client):
     invalid = admin_client.put(

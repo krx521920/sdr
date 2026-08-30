@@ -96,8 +96,25 @@ app.conf.beat_schedule = {
         "task": "sdr.reconcile_outbound_sources",
         "schedule": crontab(minute="*/15"),
     },
+    # Release calls that never reached provider I/O, conservatively mark stale
+    # in-flight calls UNKNOWN, and project Person-import terminal states.
+    "reconcile-sdr-apollo-candidate-states": {
+        "task": "sdr.reconcile_apollo_candidate_states",
+        "schedule": crontab(minute="*/5"),
+    },
     "scan-sdr-compliance-retention": {
         "task": "sdr.scan_compliance_retention",
         "schedule": crontab(hour=2, minute=15),
+    },
+    "scan-matching-governance-retention": {
+        "task": "matching.scan_governance_retention",
+        "schedule": crontab(hour=2, minute=30),
+    },
+    # Uncommitted import previews contain staging-only identity data. Scrub a
+    # bounded page each hour so high-volume inboxes cannot build an indefinite
+    # privacy backlog.
+    "expire-stale-matching-import-previews": {
+        "task": "matching.expire_stale_import_previews",
+        "schedule": crontab(minute=45),
     },
 }

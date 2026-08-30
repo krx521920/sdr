@@ -9,7 +9,7 @@ from django.db import models
 from django.db.models.functions import Lower
 from django.utils import timezone
 
-from common.base import BaseOrgModel
+from common.base import BaseOrgModel, OrgScopedManager, OrgScopedQuerySet
 from common.secrets import decrypt_secret, encrypt_secret
 
 
@@ -62,7 +62,7 @@ def default_send_weekdays() -> list[int]:
 
 
 def default_compliance_channels() -> list[str]:
-    return ["email", "whatsapp", "linkedin", "phone"]
+    return ["email", "whatsapp", "linkedin", "phone", "wechat"]
 
 
 class SDRComplianceChannel(models.TextChoices):
@@ -70,6 +70,7 @@ class SDRComplianceChannel(models.TextChoices):
     WHATSAPP = "whatsapp", "WhatsApp"
     LINKEDIN = "linkedin", "LinkedIn"
     PHONE = "phone", "Phone"
+    WECHAT = "wechat", "WeChat"
 
 
 class SDRLawfulBasis(models.TextChoices):
@@ -659,7 +660,32 @@ class SDRDoNotContactEntry(BaseOrgModel):
         ]
 
 
-class SDRComplianceEvent(BaseOrgModel):
+class AppendOnlyComplianceQuerySet(OrgScopedQuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Compliance audit events cannot be updated")
+
+    def delete(self):
+        raise ValidationError("Compliance audit events cannot be deleted")
+
+
+class AppendOnlyComplianceManager(OrgScopedManager):
+    def get_queryset(self):
+        return AppendOnlyComplianceQuerySet(self.model, using=self._db)
+
+
+class AppendOnlyComplianceMixin:
+    """Application guard; PostgreSQL adds an independent database trigger."""
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Compliance audit events cannot be updated")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Compliance audit events cannot be deleted")
+
+
+class SDRComplianceEvent(AppendOnlyComplianceMixin, BaseOrgModel):
     """Immutable audit fact produced by compliance decisions and workflows."""
 
     intake = models.ForeignKey(
@@ -690,6 +716,8 @@ class SDRComplianceEvent(BaseOrgModel):
     event_key = models.CharField(max_length=255)
     snapshot = models.JSONField(default=dict, blank=True)
     occurred_at = models.DateTimeField(default=timezone.now)
+
+    objects = AppendOnlyComplianceManager()
 
     class Meta:
         db_table = "sdr_compliance_event"
@@ -782,7 +810,9 @@ class SDRSalesFeedback(BaseOrgModel):
         super().clean()
         errors = {}
         if self.intake_id and self.org_id != self.intake.org_id:
-            errors["intake"] = "Feedback and intake must belong to the same organization."
+            errors["intake"] = (
+                "Feedback and intake must belong to the same organization."
+            )
         if self.feedback_by_id and self.org_id != self.feedback_by.org_id:
             errors["feedback_by"] = (
                 "Feedback author must belong to the same organization."
@@ -1513,6 +1543,103 @@ class SDROutboundSource(BaseOrgModel):
 
     def __str__(self) -> str:
         return f"{self.campaign}:{self.name}"
+
+
+class ApolloCandidateStatus(models.TextChoices):
+    PENDING_ENRICHMENT_APPROVAL = (
+        "pending_enrichment_approval",
+        "Pending enrichment approval",
+    )
+    ENRICHMENT_RESERVED = "enrichment_reserved", "Enrichment reserved"
+    IMPORT_QUEUED = "import_queued", "Person import queued"
+    IMPORTED = "imported", "Imported"
+    IMPORT_REVIEW_REQUIRED = "import_review_required", "Import review required"
+    IMPORT_FAILED = "import_failed", "Import failed"
+    IMPORT_RETRY_REQUIRED = "import_retry_required", "Import retry required"
+    UNKNOWN = "unknown", "Unknown provider outcome"
+    SKIPPED = "skipped", "Skipped"
+
+
+class SDRApolloCandidate(BaseOrgModel):
+    """Minimal, encrypted Apollo search result awaiting explicit enrichment approval."""
+
+    source = models.ForeignKey(
+        SDROutboundSource,
+        on_delete=models.CASCADE,
+        related_name="apollo_candidates",
+    )
+    search_request = models.ForeignKey(
+        "integrations.ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="apollo_search_candidates",
+    )
+    enrichment_request = models.ForeignKey(
+        "integrations.ExternalExecutionRequest",
+        on_delete=models.PROTECT,
+        related_name="apollo_enrichment_candidates",
+        null=True,
+        blank=True,
+    )
+    import_batch = models.ForeignKey(
+        "matching.PersonImportBatch",
+        on_delete=models.SET_NULL,
+        related_name="apollo_candidates",
+        null=True,
+        blank=True,
+    )
+    provider_person_id_ciphertext = models.TextField()
+    provider_person_id_hash = models.CharField(max_length=64)
+    safe_label = models.CharField(max_length=120)
+    status = models.CharField(
+        max_length=40,
+        choices=ApolloCandidateStatus.choices,
+        default=ApolloCandidateStatus.PENDING_ENRICHMENT_APPROVAL,
+    )
+
+    class Meta:
+        db_table = "sdr_apollo_candidate"
+        ordering = ("created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "source", "provider_person_id_hash"],
+                name="unique_sdr_apollo_candidate",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["org", "source", "status"],
+                name="sdr_apollo_cand_status_idx",
+            )
+        ]
+
+    def set_provider_person_id(self, value: str) -> None:
+        self.provider_person_id_ciphertext = encrypt_secret(value)
+
+    def get_provider_person_id(self) -> str:
+        return decrypt_secret(self.provider_person_id_ciphertext)
+
+    def clean(self) -> None:
+        super().clean()
+        if self.source_id and self.org_id and self.source.org_id != self.org_id:
+            raise ValidationError("Apollo candidate source must belong to the org")
+        if (
+            self.search_request_id
+            and self.org_id
+            and self.search_request.org_id != self.org_id
+        ):
+            raise ValidationError("Apollo search request must belong to the org")
+        if (
+            self.enrichment_request_id
+            and self.org_id
+            and self.enrichment_request.org_id != self.org_id
+        ):
+            raise ValidationError("Apollo enrichment request must belong to the org")
+        if (
+            self.import_batch_id
+            and self.org_id
+            and self.import_batch.org_id != self.org_id
+        ):
+            raise ValidationError("Apollo import batch must belong to the org")
 
 
 class SDROutboundCopyDraft(BaseOrgModel):

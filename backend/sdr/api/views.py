@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
@@ -20,6 +21,7 @@ from sdr.api.serializers import (
     LeadNurtureEnrollmentActionSerializer,
     LeadNurtureEnrollmentSerializer,
     SDRAnalyticsQuerySerializer,
+    SDRApolloCandidateSerializer,
     SDRChannelComplianceRuleSerializer,
     SDRComplianceDeletionActionSerializer,
     SDRComplianceEventSerializer,
@@ -28,6 +30,7 @@ from sdr.api.serializers import (
     SDRDataProvenanceSerializer,
     SDRDoNotContactCreateSerializer,
     SDRDoNotContactSerializer,
+    SDREmailExecutionApprovalSerializer,
     SDREmailSuppressionCreateSerializer,
     SDREmailSuppressionSerializer,
     SDRIntelligenceSettingsSerializer,
@@ -42,6 +45,7 @@ from sdr.api.serializers import (
     SDROutboundProspectActionSerializer,
     SDROutboundProspectSerializer,
     SDROutboundSourceSerializer,
+    SDROutboundSourceSyncRequestSerializer,
     SDRResponseSettingsSerializer,
     SDRRoutingPreviewSerializer,
     SDRRoutingRuleSerializer,
@@ -63,10 +67,15 @@ from sdr.domain import (
     QualificationBand,
     QualificationResult,
 )
+from sdr.email_execution import EMAIL_SEND_ACTION, reserve_email_send
 from sdr.email_safety import clear_campaign_safety_hold
 from sdr.models import (
+    ApolloCandidateStatus,
     EmailSuppressionReason,
     EmailSuppressionSource,
+    LeadDelivery,
+    LeadDeliveryKind,
+    LeadDeliveryStatus,
     LeadInspection,
     LeadInspectionStatus,
     LeadIntake,
@@ -79,6 +88,7 @@ from sdr.models import (
     NurtureReplySentiment,
     OutboundCampaignStatus,
     OutboundProspectStatus,
+    SDRApolloCandidate,
     SDRChannelComplianceRule,
     SDRComplianceChannel,
     SDRComplianceEvent,
@@ -99,7 +109,13 @@ from sdr.models import (
     SDRRoutingStrategy,
     SDRSalesFeedback,
 )
-from sdr.nurture import pause_enrollment, resume_enrollment, stop_enrollment
+from sdr.nurture import (
+    enqueue_approved_nurture_delivery,
+    nurture_email_execution_intent,
+    pause_enrollment,
+    resume_enrollment,
+    stop_enrollment,
+)
 from sdr.outbound import (
     OutboundCampaignExecutionError,
     OutboundImportError,
@@ -118,9 +134,24 @@ from sdr.outbound_copy import (
     apply_outbound_copy_draft,
     enqueue_outbound_copy_generation,
 )
+from sdr.provider_ports import (
+    ExecutionChannel,
+    ExecutionSafetyError,
+    ExternalRequestStatus,
+)
+from sdr.response import (
+    acknowledgement_email_execution_intent,
+    enqueue_approved_acknowledgement_delivery,
+)
 from sdr.routing import RuleBasedSalesRouter
 from sdr.sales_feedback import feedback_choices
-from sdr.sources import OutboundSourceUnavailable, enqueue_outbound_source_sync
+from sdr.sources import (
+    OutboundSourceUnavailable,
+    apollo_enrichment_execution_intent,
+    apollo_search_execution_intent,
+    enqueue_apollo_candidate_enrichment,
+    enqueue_outbound_source_sync,
+)
 from sdr.suppression import release_suppression, suppress_email
 
 
@@ -301,9 +332,7 @@ class SDRDoNotContactListCreateView(APIView):
                 **serializer.validated_data,
             )
         except ValueError as exc:
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(
             SDRDoNotContactSerializer(entry).data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
@@ -352,9 +381,11 @@ class SDRDataProvenanceDetailView(APIView):
     permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
 
     def patch(self, request, intake_id):
-        provenance = SDRDataProvenance.objects.filter(
-            org=request.org, intake_id=intake_id
-        ).select_related("intake").first()
+        provenance = (
+            SDRDataProvenance.objects.filter(org=request.org, intake_id=intake_id)
+            .select_related("intake")
+            .first()
+        )
         if provenance is None:
             return Response(status=status.HTTP_404_NOT_FOUND)
         serializer = SDRDataProvenanceSerializer(
@@ -526,8 +557,7 @@ class SDRSalesFeedbackLeadView(APIView):
                         "intake": intake,
                         "qualification_score_snapshot": (
                             inspection.qualification_score
-                            if inspection
-                            and inspection.qualification_score is not None
+                            if inspection and inspection.qualification_score is not None
                             else intake.qualification_score
                         ),
                         "qualification_band_snapshot": (
@@ -1044,15 +1074,126 @@ class SDROutboundSourceSyncView(APIView):
                 {"detail": "Reopen the campaign before syncing its sources."},
                 status=status.HTTP_409_CONFLICT,
             )
+        serializer = SDROutboundSourceSyncRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approval_id = serializer.validated_data.get("approval_id")
+        idempotency_key = serializer.validated_data.get("idempotency_key")
+        if approval_id is None:
+            return Response(
+                {
+                    "status": "approval_required",
+                    "intent": apollo_search_execution_intent(source).as_dict(),
+                    "detail": (
+                        "Approve this exact one-unit Apollo search, then POST "
+                        "approval_id with a new UUID idempotency_key."
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
         try:
-            job = enqueue_outbound_source_sync(source, manual=True)
+            job = enqueue_outbound_source_sync(
+                source,
+                manual=True,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+            )
         except OutboundSourceUnavailable as exc:
             return Response(
-                {"detail": str(exc)},
+                {"code": exc.code, "detail": str(exc)},
                 status=status.HTTP_409_CONFLICT,
             )
         return Response(
             {"job_id": str(job.id), "status": job.status},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class SDROutboundSourceApolloCandidateListView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["SDR Outbound"])
+    def get(self, request, source_id):
+        source = SDROutboundSource.objects.filter(
+            id=source_id,
+            org=request.org,
+        ).first()
+        if source is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        candidates = list(
+            SDRApolloCandidate.objects.filter(
+                org=request.org,
+                source=source,
+            ).order_by("created_at", "id")[:500]
+        )
+        data = SDRApolloCandidateSerializer(candidates, many=True).data
+        for item, candidate in zip(data, candidates, strict=True):
+            item["enrichment_intent"] = (
+                apollo_enrichment_execution_intent(candidate).as_dict()
+                if candidate.status == ApolloCandidateStatus.PENDING_ENRICHMENT_APPROVAL
+                else None
+            )
+        return Response({"results": data, "count": len(data)})
+
+
+class SDRApolloCandidateEnrichView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(tags=["SDR Outbound"])
+    def post(self, request, candidate_id):
+        candidate = (
+            SDRApolloCandidate.objects.filter(
+                id=candidate_id,
+                org=request.org,
+            )
+            .select_related("source", "source__campaign")
+            .first()
+        )
+        if candidate is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SDROutboundSourceSyncRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approval_id = serializer.validated_data.get("approval_id")
+        idempotency_key = serializer.validated_data.get("idempotency_key")
+        if approval_id is None:
+            if candidate.status != ApolloCandidateStatus.PENDING_ENRICHMENT_APPROVAL:
+                return Response(
+                    {
+                        "code": "apollo_candidate_not_pending",
+                        "detail": "This candidate is not awaiting enrichment approval.",
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            return Response(
+                {
+                    "status": "approval_required",
+                    "candidate_id": str(candidate.id),
+                    "intent": apollo_enrichment_execution_intent(candidate).as_dict(),
+                    "detail": (
+                        "Approve this exact one-unit Apollo enrichment, then POST "
+                        "approval_id with a new UUID idempotency_key."
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
+        try:
+            job = enqueue_apollo_candidate_enrichment(
+                candidate,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+            )
+        except OutboundSourceUnavailable as exc:
+            return Response(
+                {"code": exc.code, "detail": str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+        candidate.refresh_from_db()
+        return Response(
+            {
+                "job_id": str(job.id),
+                "status": job.status,
+                "candidate_id": str(candidate.id),
+                "execution_request_id": str(candidate.enrichment_request_id),
+            },
             status=status.HTTP_202_ACCEPTED,
         )
 
@@ -1188,9 +1329,9 @@ class SDROutboundCopyDraftActionView(APIView):
                 {"detail": str(exc)},
                 status=status.HTTP_409_CONFLICT,
             )
-        draft = SDROutboundCopyDraft.objects.select_related(
-            "reviewed_by__user"
-        ).get(id=draft.id, org=request.org)
+        draft = SDROutboundCopyDraft.objects.select_related("reviewed_by__user").get(
+            id=draft.id, org=request.org
+        )
         return Response(
             {
                 "draft": SDROutboundCopyDraftSerializer(draft).data,
@@ -1432,6 +1573,238 @@ class LeadInspectionDetailView(APIView):
         if inspection is None:
             return Response(status=status.HTTP_404_NOT_FOUND)
         return Response(LeadInspectionSerializer(inspection).data)
+
+
+EMAIL_APPROVABLE_DELIVERY_STATUSES = frozenset(
+    {
+        LeadDeliveryStatus.PENDING,
+        LeadDeliveryStatus.FAILED,
+    }
+)
+NURTURE_EMAIL_APPROVABLE_DELIVERY_STATUSES = frozenset(
+    {
+        NurtureDeliveryStatus.PENDING,
+        NurtureDeliveryStatus.FAILED,
+    }
+)
+
+
+def _email_execution_intent_payload(*, delivery_id, intent):
+    """Project an exact approval scope without recipient or message content."""
+
+    return {
+        "channel": ExecutionChannel.EMAIL,
+        "action": EMAIL_SEND_ACTION,
+        "delivery_id": str(delivery_id),
+        "target_sha256": intent.target_hash,
+        "payload_sha256": intent.payload_hash,
+        "units": intent.units,
+    }
+
+
+def _email_execution_error(exc: ExecutionSafetyError):
+    response_status = exc.status_code
+    if not isinstance(response_status, int) or not 400 <= response_status < 600:
+        response_status = status.HTTP_409_CONFLICT
+    return Response(
+        {"code": exc.code, "detail": exc.detail},
+        status=response_status,
+    )
+
+
+def _email_intent_unavailable():
+    return Response(
+        {
+            "code": "email_execution_unavailable",
+            "detail": "The email delivery cannot be approved in its current state.",
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _email_job_response(*, job, execution_request, replayed):
+    return Response(
+        {
+            "job_id": str(job.id),
+            "status": job.status,
+            "execution_request_id": str(execution_request.id),
+            "execution_status": execution_request.status,
+            "replayed": replayed,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+def _email_non_reserved_replay_response(execution_request):
+    response_status = (
+        status.HTTP_200_OK
+        if execution_request.status
+        in {
+            ExternalRequestStatus.ACCEPTED,
+            ExternalRequestStatus.DELIVERED,
+        }
+        else status.HTTP_409_CONFLICT
+    )
+    return Response(
+        {
+            "code": "email_execution_not_replayable",
+            "detail": (
+                "This email execution has already left RESERVED state; "
+                "no provider job was queued."
+            ),
+            "execution_request_id": str(execution_request.id),
+            "execution_status": execution_request.status,
+            "replayed": True,
+        },
+        status=response_status,
+    )
+
+
+class SDRAcknowledgementEmailExecutionView(APIView):
+    """Preview or reserve one exact acknowledgement-email provider attempt."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["SDR Email Execution"],
+        request=SDREmailExecutionApprovalSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request, delivery_id):
+        delivery = (
+            LeadDelivery.objects.filter(
+                id=delivery_id,
+                org=request.org,
+                intake__org=request.org,
+            )
+            .select_related("intake__org")
+            .first()
+        )
+        if delivery is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if delivery.kind != LeadDeliveryKind.ACKNOWLEDGEMENT_EMAIL:
+            return Response(
+                {
+                    "code": "email_delivery_kind_mismatch",
+                    "detail": "This delivery is not an acknowledgement email.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if delivery.status not in EMAIL_APPROVABLE_DELIVERY_STATUSES:
+            return _email_intent_unavailable()
+
+        serializer = SDREmailExecutionApprovalSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            intent = acknowledgement_email_execution_intent(delivery)
+        except ExecutionSafetyError as exc:
+            return _email_execution_error(exc)
+        except (DjangoValidationError, ValueError):
+            return _email_intent_unavailable()
+
+        approval_id = serializer.validated_data.get("approval_id")
+        if approval_id is None:
+            return Response(
+                {
+                    "approval_required": True,
+                    "intent": _email_execution_intent_payload(
+                        delivery_id=delivery.id,
+                        intent=intent,
+                    ),
+                }
+            )
+        try:
+            reservation = reserve_email_send(
+                org=request.org,
+                delivery_id=delivery.id,
+                approval_id=approval_id,
+                intent=intent,
+            )
+            if reservation.request.status != ExternalRequestStatus.RESERVED:
+                return _email_non_reserved_replay_response(reservation.request)
+            job = enqueue_approved_acknowledgement_delivery(
+                delivery,
+                execution_request_id=reservation.request.id,
+            )
+        except ExecutionSafetyError as exc:
+            return _email_execution_error(exc)
+        return _email_job_response(
+            job=job,
+            execution_request=reservation.request,
+            replayed=reservation.replayed,
+        )
+
+
+class SDRNurtureEmailExecutionView(APIView):
+    """Preview or reserve one exact nurture-email provider attempt."""
+
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["SDR Email Execution"],
+        request=SDREmailExecutionApprovalSerializer,
+        responses={200: dict, 202: dict},
+    )
+    def post(self, request, delivery_id):
+        delivery = (
+            LeadNurtureDelivery.objects.filter(
+                id=delivery_id,
+                org=request.org,
+                enrollment__org=request.org,
+                enrollment__intake__org=request.org,
+            )
+            .select_related(
+                "enrollment__intake__org",
+                "enrollment__sequence",
+                "step",
+            )
+            .first()
+        )
+        if delivery is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if delivery.status not in NURTURE_EMAIL_APPROVABLE_DELIVERY_STATUSES:
+            return _email_intent_unavailable()
+
+        serializer = SDREmailExecutionApprovalSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            intent = nurture_email_execution_intent(delivery)
+        except ExecutionSafetyError as exc:
+            return _email_execution_error(exc)
+        except (DjangoValidationError, ValueError):
+            return _email_intent_unavailable()
+
+        approval_id = serializer.validated_data.get("approval_id")
+        if approval_id is None:
+            return Response(
+                {
+                    "approval_required": True,
+                    "intent": _email_execution_intent_payload(
+                        delivery_id=delivery.id,
+                        intent=intent,
+                    ),
+                }
+            )
+        try:
+            reservation = reserve_email_send(
+                org=request.org,
+                delivery_id=delivery.id,
+                approval_id=approval_id,
+                intent=intent,
+            )
+            if reservation.request.status != ExternalRequestStatus.RESERVED:
+                return _email_non_reserved_replay_response(reservation.request)
+            job = enqueue_approved_nurture_delivery(
+                delivery,
+                execution_request_id=reservation.request.id,
+            )
+        except ExecutionSafetyError as exc:
+            return _email_execution_error(exc)
+        return _email_job_response(
+            job=job,
+            execution_request=reservation.request,
+            replayed=reservation.replayed,
+        )
 
 
 class SDRResponseSettingsView(APIView):

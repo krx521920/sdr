@@ -46,6 +46,23 @@ services:
       - ./docker/backend/entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          request = urllib.request.Request(
+          'http://127.0.0.1:8000/healthz/',
+          headers={'X-Forwarded-Proto': 'https'});
+          assert urllib.request.urlopen(request, timeout=5).status == 200
+      interval: 10s
+      timeout: 6s
+      # A fresh production database can spend more than a minute applying the
+      # full migration history before Gunicorn starts accepting requests.
+      retries: 12
+      start_period: 120s
     depends_on:
       db:
         condition: service_healthy
@@ -62,12 +79,17 @@ services:
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
+    environment:
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
       - ./backend:/app
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     command: >-
       celery -A crm worker --loglevel=info --queues=celery,default
@@ -82,12 +104,17 @@ services:
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
+    environment:
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
       - ./backend:/app
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     command: celery -A crm beat --loglevel=info --schedule=/tmp/celerybeat-schedule
 

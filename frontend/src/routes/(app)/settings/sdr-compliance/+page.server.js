@@ -67,7 +67,9 @@ export const actions = {
         {
           method: ruleId ? 'PATCH' : 'POST',
           body: {
-            country_code: String(form.get('country_code') || '*').trim().toUpperCase(),
+            country_code: String(form.get('country_code') || '*')
+              .trim()
+              .toUpperCase(),
             channel: String(form.get('channel') || 'email'),
             is_allowed: form.has('is_allowed'),
             requires_consent: form.has('requires_consent'),
@@ -108,7 +110,9 @@ export const actions = {
           body: {
             channel: String(form.get('channel') || 'email'),
             identifier: String(form.get('identifier') || '').trim(),
-            country_code: String(form.get('country_code') || '').trim().toUpperCase(),
+            country_code: String(form.get('country_code') || '')
+              .trim()
+              .toUpperCase(),
             reason: String(form.get('reason') || 'admin')
           }
         },
@@ -167,7 +171,8 @@ export const actions = {
     const action = String(form.get('deletion_action') || 'request');
     if (!UUID_PATTERN.test(intakeId)) return fail(400, { actionError: 'Invalid intake.' });
     const body = { action };
-    if (action === 'anonymize') body.confirm_intake_id = String(form.get('confirm_intake_id') || '');
+    if (action === 'anonymize')
+      body.confirm_intake_id = String(form.get('confirm_intake_id') || '');
     try {
       await apiRequest(
         `/sdr/compliance/intakes/${intakeId}/deletion/`,

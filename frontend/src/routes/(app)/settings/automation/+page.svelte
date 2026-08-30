@@ -1,5 +1,6 @@
 <script>
   import { enhance } from '$app/forms';
+  import { resolve } from '$app/paths';
   import { toast } from 'svelte-sonner';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
@@ -29,9 +30,10 @@
   const responseMetrics = $derived(data.intakes?.response_metrics || {});
   const responseSettings = $derived(data.responseSettings || {});
   const feishuBase = $derived(data.feishuBase || {});
-  const feishuSyncSummary = $derived(feishuBase.sync_summary || {});
+  const feishuSyncSummary = $derived(feishuBase.syncSummary || {});
+  const feishuSyncs = $derived(data.feishuSyncs?.results || []);
   const feishuMappingFields = [
-    { key: 'intake_id', label: 'Intake ID', required: true, hint: 'Unique text business key' },
+    { key: 'intake_id', label: 'Intake ID', required: false, hint: 'Required for outbound sync' },
     { key: 'company_name', label: 'Company', hint: 'Text' },
     { key: 'contact_name', label: 'Contact', hint: 'Text' },
     { key: 'email', label: 'Email', hint: 'Text' },
@@ -64,9 +66,14 @@
     if (form?.actionError) toast.error(form.actionError);
     if (form?.retried) toast.success('Dead-letter job reopened for processing.');
     if (form?.responseSaved) toast.success('Lead response settings saved.');
-    if (form?.feishuBaseSaved) toast.success('Feishu Base connection saved.');
-    if (form?.feishuBaseTested) {
-      toast.success(`Feishu Base mapping validated against ${form.feishuBaseFieldCount} fields.`);
+    if (form?.feishuBaseSaved) {
+      toast.success('Feishu Base connection saved in fail-closed mode. No provider call was made.');
+    }
+    if (form?.feishuApprovalRequired) {
+      toast.info('Approval intent prepared. No Feishu request was sent.');
+    }
+    if (form?.feishuExecutionQueued) {
+      toast.success('Approved Feishu operation queued with a new server idempotency key.');
     }
   });
 
@@ -108,7 +115,8 @@
         'sdr.send_acknowledgement': 'Acknowledgement email',
         'sdr.notify_sales_in_app': 'Sales in-app notification',
         'sdr.notify_sales_feishu': 'Sales Feishu notification',
-        'feishu_base.sync_research_result': 'Feishu Base research sync'
+        'integrations.feishu_base_sync': 'Approved Feishu Base execution',
+        'feishu_base.sync_research_result': 'Legacy Feishu Base sync (disabled)'
       }[name] || name
     );
   }
@@ -238,7 +246,9 @@
         <p class="mt-2 text-2xl font-semibold text-[color:var(--text-primary)]">
           {responseMetrics.responded || 0}
         </p>
-        <p class="mt-1 text-xs text-[color:var(--text-muted)]">Recent sample of {responseMetrics.sample_size || 0}</p>
+        <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+          Recent sample of {responseMetrics.sample_size || 0}
+        </p>
       </div>
       <div
         class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-4"
@@ -292,7 +302,9 @@
           />
           <span>
             <strong class="block">Customer email</strong>
-            <span class="text-xs text-[color:var(--text-muted)]">Acknowledge each valid email once.</span>
+            <span class="text-xs text-[color:var(--text-muted)]"
+              >Acknowledge each valid email once.</span
+            >
           </span>
         </label>
         <label
@@ -306,21 +318,20 @@
           />
           <span>
             <strong class="block">In-app sales alert</strong>
-            <span class="text-xs text-[color:var(--text-muted)]">Notify the assigned CRM user.</span>
+            <span class="text-xs text-[color:var(--text-muted)]">Notify the assigned CRM user.</span
+            >
           </span>
         </label>
         <label
-          class="flex items-start gap-2 rounded-md border border-[color:var(--border-faint)] p-3 text-sm"
+          class="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"
         >
-          <input
-            type="checkbox"
-            name="feishu_enabled"
-            checked={responseSettings.feishu_enabled}
-            class="mt-0.5"
-          />
+          <input type="checkbox" name="feishu_enabled" checked={false} disabled class="mt-0.5" />
           <span>
-            <strong class="block">Feishu group alert</strong>
-            <span class="text-xs text-[color:var(--text-muted)]">Send the complete handoff to a custom bot.</span>
+            <strong class="block">Feishu group alert · production disabled</strong>
+            <span class="text-xs">
+              The legacy webhook bypasses exact approvals. It remains off until it has an
+              independent safety contract.
+            </span>
           </span>
         </label>
       </div>
@@ -353,7 +364,8 @@
           rows="6"
           required
           class="w-full rounded-md border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] px-3 py-2 text-sm text-[color:var(--text-primary)]"
-        >{responseSettings.acknowledgement_body || ''}</textarea>
+          >{responseSettings.acknowledgement_body || ''}</textarea
+        >
         <span class="text-xs text-[color:var(--text-muted)]">
           Variables: {'{{ first_name }}'}, {'{{ company_name }}'}, {'{{ organization_name }}'}.
         </span>
@@ -361,15 +373,18 @@
 
       <div class="grid gap-4 md:grid-cols-[1fr_180px]">
         <label class="space-y-1.5 text-sm">
-          <span class="font-medium text-[color:var(--text-primary)]">Feishu custom-bot webhook</span>
+          <span class="font-medium text-[color:var(--text-primary)]">Feishu custom-bot webhook</span
+          >
           <Input
             type="password"
             name="feishu_webhook_url"
             autocomplete="new-password"
-            placeholder={responseSettings.feishu_configured
-              ? `Configured …${responseSettings.feishu_webhook_hint}`
-              : 'https://open.feishu.cn/open-apis/bot/v2/hook/...'}
+            placeholder="Production disabled pending an independent approval contract"
+            disabled
           />
+          <span class="text-xs text-amber-700"
+            >Saving this policy cannot enable or send a Feishu alert.</span
+          >
         </label>
         <label class="space-y-1.5 text-sm">
           <span class="font-medium text-[color:var(--text-primary)]">Response SLA (seconds)</span>
@@ -397,39 +412,76 @@
   <SectionCard>
     {#snippet title()}
       <div>
-        <h3 class="flex items-center gap-2 text-[16px] font-medium text-[color:var(--text-primary)]">
+        <h3
+          class="flex items-center gap-2 text-[16px] font-medium text-[color:var(--text-primary)]"
+        >
           <DatabaseZap class="size-4 text-violet-500" />Feishu Base research sync
         </h3>
         <p class="text-[12px] text-[color:var(--text-muted)]">
-          Upsert each completed research result by intake ID through the official Base API.
+          Prepare an exact intent first; a separate one-time approval may then queue one provider
+          call.
         </p>
       </div>
     {/snippet}
 
-    <div class="mb-5 grid gap-3 sm:grid-cols-3">
+    <div class="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
       <div class="rounded-md border border-[color:var(--border-faint)] p-3">
-        <p class="text-xs text-[color:var(--text-muted)]">Synced</p>
-        <p class="mt-1 text-xl font-semibold text-emerald-600">{feishuSyncSummary.succeeded || 0}</p>
+        <p class="text-xs text-[color:var(--text-muted)]">Provider-confirmed</p>
+        <p class="mt-1 text-xl font-semibold text-emerald-600">
+          {feishuSyncSummary.succeeded || 0}
+        </p>
       </div>
       <div class="rounded-md border border-[color:var(--border-faint)] p-3">
-        <p class="text-xs text-[color:var(--text-muted)]">In progress</p>
+        <p class="text-xs text-[color:var(--text-muted)]">Reserved / in progress</p>
         <p class="mt-1 text-xl font-semibold text-blue-600">
-          {(feishuSyncSummary.pending || 0) + (feishuSyncSummary.queued || 0) + (feishuSyncSummary.syncing || 0)}
+          {(feishuSyncSummary.pending || 0) +
+            (feishuSyncSummary.queued || 0) +
+            (feishuSyncSummary.syncing || 0)}
         </p>
       </div>
       <div class="rounded-md border border-[color:var(--border-faint)] p-3">
         <p class="text-xs text-[color:var(--text-muted)]">Failed</p>
         <p class="mt-1 text-xl font-semibold text-red-600">{feishuSyncSummary.failed || 0}</p>
       </div>
+      <div class="rounded-md border border-amber-300 bg-amber-50 p-3">
+        <p class="text-xs font-medium text-amber-900">UNKNOWN · manual reconciliation</p>
+        <p class="mt-1 text-xl font-semibold text-amber-700">{feishuSyncSummary.unknown || 0}</p>
+      </div>
+      <div class="rounded-md border border-violet-200 bg-violet-50 p-3">
+        <p class="text-xs text-violet-900">Remote erasure pending / completed</p>
+        <p class="mt-1 text-xl font-semibold text-violet-700">
+          {feishuSyncSummary.external_erasure_pending || 0} / {feishuSyncSummary.external_erasure_completed ||
+            0}
+        </p>
+      </div>
+    </div>
+
+    <div class="mb-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+      <strong>Fail-closed:</strong> saving credentials does not validate, sync, or delete anything. Automatic
+      Feishu Base sync is disabled. Every provider operation requires the environment, organization and
+      Feishu guards, an exact test target, limits, and a short-lived one-time approval.
     </div>
 
     <form method="POST" action="?/saveFeishuBase" use:enhance class="space-y-5">
-      <label class="flex items-start gap-2 rounded-md border border-[color:var(--border-faint)] p-3 text-sm">
-        <input type="checkbox" name="is_active" checked={feishuBase.is_active} class="mt-0.5" />
+      <div class="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+        Connection: {feishuBase.configured ? 'credentials stored' : 'not configured'} · Provider execution:
+        disabled until exact approval
+      </div>
+
+      <label
+        class="flex items-start gap-2 rounded-md border border-[color:var(--border-faint)] p-3 text-sm"
+      >
+        <input
+          type="checkbox"
+          name="connection_enabled"
+          checked={feishuBase.active}
+          class="mt-0.5"
+        />
         <span>
-          <strong class="block">Enable automatic Base sync</strong>
+          <strong class="block">Enable this connection configuration</strong>
           <span class="text-xs text-[color:var(--text-muted)]">
-            New and recently completed intakes are queued through the durable job ledger.
+            This only makes the saved configuration eligible for intent preparation. It does not
+            enable automatic sync or authorize any provider request.
           </span>
         </span>
       </label>
@@ -437,7 +489,12 @@
       <div class="grid gap-4 md:grid-cols-2">
         <label class="space-y-1.5 text-sm">
           <span class="font-medium text-[color:var(--text-primary)]">Feishu app ID</span>
-          <Input name="app_id" value={feishuBase.app_id || ''} placeholder="cli_..." />
+          <Input
+            name="app_id"
+            value=""
+            autocomplete="off"
+            placeholder={feishuBase.appIdConfigured ? 'Stored · enter only to replace' : 'cli_...'}
+          />
         </label>
         <label class="space-y-1.5 text-sm">
           <span class="font-medium text-[color:var(--text-primary)]">App secret</span>
@@ -445,18 +502,32 @@
             type="password"
             name="app_secret"
             autocomplete="new-password"
-            placeholder={feishuBase.app_secret_configured
-              ? `Configured …${feishuBase.app_secret_hint}`
+            placeholder={feishuBase.secretConfigured
+              ? 'Stored · enter only to replace'
               : 'App secret'}
           />
         </label>
         <label class="space-y-1.5 text-sm">
           <span class="font-medium text-[color:var(--text-primary)]">Base app token</span>
-          <Input name="app_token" value={feishuBase.app_token || ''} placeholder="bascn..." />
+          <Input
+            type="password"
+            name="app_token"
+            value=""
+            autocomplete="new-password"
+            placeholder={feishuBase.targetConfigured
+              ? 'Stored · enter only to replace'
+              : 'bascn...'}
+          />
         </label>
         <label class="space-y-1.5 text-sm">
           <span class="font-medium text-[color:var(--text-primary)]">Table ID</span>
-          <Input name="table_id" value={feishuBase.table_id || ''} placeholder="tbl..." />
+          <Input
+            type="password"
+            name="table_id"
+            value=""
+            autocomplete="new-password"
+            placeholder={feishuBase.targetConfigured ? 'Stored · enter only to replace' : 'tbl...'}
+          />
         </label>
       </div>
 
@@ -465,7 +536,8 @@
           <p class="text-sm font-medium text-[color:var(--text-primary)]">Field mapping</p>
           <p class="text-xs text-[color:var(--text-muted)]">
             Enter existing field names exactly as they appear in the target table. Formula, lookup,
-            attachment, and system fields are not writable.
+            attachment, and system fields are not writable. Inbound people imports use a separate
+            one-time mapping. Outbound research sync additionally requires Intake ID.
           </p>
         </div>
         <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -479,7 +551,7 @@
               </span>
               <Input
                 name={`mapping_${item.key}`}
-                value={feishuBase.field_mapping?.[item.key] || ''}
+                value={feishuBase.fieldMapping?.[item.key] || ''}
                 placeholder="Exact Base field name"
                 required={item.required}
               />
@@ -490,27 +562,154 @@
 
       <div class="flex flex-wrap items-center justify-between gap-3">
         <p class="max-w-2xl text-xs text-[color:var(--text-muted)]">
-          Add the custom app to this Base with management permission and grant record/field read-write
-          scopes. Credentials are encrypted at rest.
+          Inputs are write-only and never rendered back. Saving or enabling the connection performs
+          no external request; automatic sync remains disabled.
         </p>
         <Button type="submit">Save Base connection</Button>
       </div>
     </form>
 
-    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-4">
+    <div
+      class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--border-faint)] pt-4"
+    >
       <p class="text-xs text-[color:var(--text-muted)]">
-        Last validated: {formatDate(feishuBase.last_validated_at)} · Last sync: {formatDate(feishuBase.last_sync_at)}
+        Last provider-confirmed validation: {formatDate(feishuBase.lastValidatedAt)} · Last provider-confirmed
+        sync: {formatDate(feishuBase.lastSyncAt)}
       </p>
-      <form method="POST" action="?/testFeishuBase" use:enhance>
-        <Button type="submit" variant="outline" disabled={!feishuBase.id}>Validate credentials & fields</Button>
+      <form method="POST" action="?/prepareFeishuSchemaValidation" use:enhance>
+        <Button type="submit" variant="outline" disabled={!feishuBase.id}
+          >Prepare schema-validation intent</Button
+        >
       </form>
+    </div>
+
+    {#if form?.feishuApprovalRequired && form.feishuIntent}
+      <div
+        class="mt-5 rounded-lg border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950"
+      >
+        <p class="font-semibold">Exact approval required · no provider request has been made</p>
+        <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+          <div>
+            <dt class="text-violet-700">Action</dt>
+            <dd class="font-mono">{form.feishuIntent.action}</dd>
+          </div>
+          <div>
+            <dt class="text-violet-700">Units</dt>
+            <dd>{form.feishuIntent.units}</dd>
+          </div>
+          <div class="sm:col-span-2">
+            <dt class="text-violet-700">Internal test target</dt>
+            <dd class="font-mono break-all">{form.feishuIntent.testTargetIdentifier}</dd>
+          </div>
+          <div class="sm:col-span-2">
+            <dt class="text-violet-700">Payload SHA-256</dt>
+            <dd class="font-mono break-all">{form.feishuIntent.payloadHash}</dd>
+          </div>
+        </dl>
+        <p class="mt-3 text-xs">
+          Issue an exact one-time approval in <a
+            class="font-medium underline"
+            href={resolve('/settings/channel-safety')}
+            target="_blank"
+            rel="noreferrer">Channel safety</a
+          >, then paste only its UUID below.
+        </p>
+        <form
+          method="POST"
+          action={form.feishuOperation === 'schema'
+            ? '?/validateFeishuSchema'
+            : form.feishuOperation === 'sync'
+              ? '?/syncFeishuIntake'
+              : '?/deleteFeishuSync'}
+          use:enhance
+          class="mt-4 flex flex-col gap-3 sm:flex-row"
+        >
+          {#if form.feishuOperation === 'sync'}
+            <input type="hidden" name="intake_id" value={form.feishuObjectId} />
+          {:else if form.feishuOperation === 'delete'}
+            <input type="hidden" name="sync_id" value={form.feishuObjectId} />
+          {/if}
+          <Input
+            name="approval_id"
+            aria-label="One-time approval UUID"
+            autocomplete="off"
+            placeholder="One-time approval UUID"
+            required
+          />
+          <Button type="submit">Queue exactly once</Button>
+        </form>
+      </div>
+    {/if}
+
+    <div class="mt-6 grid gap-5 border-t border-[color:var(--border-faint)] pt-5 lg:grid-cols-2">
+      <div>
+        <h4 class="text-sm font-medium text-[color:var(--text-primary)]">
+          Synthetic single-record sync
+        </h4>
+        <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+          Selects only an internal intake UUID. Preparing the intent does not contact Feishu.
+        </p>
+        <form
+          method="POST"
+          action="?/prepareFeishuSync"
+          use:enhance
+          class="mt-3 flex flex-col gap-3 sm:flex-row"
+        >
+          <select
+            name="intake_id"
+            required
+            class="h-10 min-w-0 flex-1 rounded-md border bg-transparent px-3 text-sm"
+          >
+            <option value="">Select an internal intake</option>
+            {#each intakes as intake (intake.id)}
+              <option value={intake.id}>Intake {String(intake.id).slice(0, 8)}</option>
+            {/each}
+          </select>
+          <Button type="submit" variant="outline" disabled={!feishuBase.id}
+            >Prepare sync intent</Button
+          >
+        </form>
+      </div>
+      <div>
+        <h4 class="text-sm font-medium text-[color:var(--text-primary)]">Remote deletion</h4>
+        <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+          Uses only a local sync-ledger UUID. A remote record ID is never submitted by the browser.
+        </p>
+        {#if feishuSyncs.some((item) => item.canDelete)}
+          <div class="mt-3 space-y-2">
+            {#each feishuSyncs.filter((item) => item.canDelete) as item (item.id)}
+              <form
+                method="POST"
+                action="?/prepareFeishuDelete"
+                use:enhance
+                class="flex items-center justify-between gap-3 rounded-md border p-3 text-xs"
+              >
+                <div class="min-w-0">
+                  <p class="truncate font-medium">{item.safeLabel}</p>
+                  <p class="text-[color:var(--text-muted)]">
+                    {item.status} · deletion {item.erasureStatus}
+                  </p>
+                </div>
+                <input type="hidden" name="sync_id" value={item.id} />
+                <Button type="submit" variant="outline" size="sm">Prepare deletion</Button>
+              </form>
+            {/each}
+          </div>
+        {:else}
+          <p class="mt-3 text-xs text-[color:var(--text-muted)]">
+            No provider-confirmed record is eligible for deletion.
+          </p>
+        {/if}
+      </div>
     </div>
   </SectionCard>
 
   <SectionCard>
     {#snippet title()}
       <div>
-        <h3 class="text-[16px] font-medium text-[color:var(--text-primary)]">Lead response ledger</h3>
+        <h3 class="text-[16px] font-medium text-[color:var(--text-primary)]">
+          Lead response ledger
+        </h3>
         <p class="text-[12px] text-[color:var(--text-muted)]">
           Intake, qualification, CRM handoff, and delivery state in one view.
         </p>
@@ -538,13 +737,16 @@
                     <a
                       href="/leads/{intake.lead_id}"
                       class="font-medium text-violet-600 hover:underline"
-                    >{intake.company_name || intake.contact_email || 'Inbound lead'}</a>
+                      >{intake.company_name || intake.contact_email || 'Inbound lead'}</a
+                    >
                   {:else}
                     <p class="font-medium text-[color:var(--text-primary)]">
                       {intake.company_name || intake.contact_email || 'Inbound lead'}
                     </p>
                   {/if}
-                  <p class="mt-1 text-xs text-[color:var(--text-muted)]">{intake.contact_email || '—'}</p>
+                  <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+                    {intake.contact_email || '—'}
+                  </p>
                 </td>
                 <td class="px-4 py-3">
                   <Badge class={intakeStatusClass(intake.status)}>{intake.status}</Badge>
@@ -552,14 +754,19 @@
                 </td>
                 <td class="px-4 py-3">
                   <p class="font-medium text-[color:var(--text-primary)]">
-                    {intake.qualification_score ?? '—'} {intake.qualification_band || ''}
+                    {intake.qualification_score ?? '—'}
+                    {intake.qualification_band || ''}
                   </p>
                   <p class="mt-1 text-xs text-[color:var(--text-muted)]">
                     {intake.assigned_sales?.name || intake.assigned_sales?.email || 'Unassigned'}
                   </p>
                 </td>
                 <td class="px-4 py-3">
-                  <p class={intake.sla_breached ? 'font-medium text-red-600' : 'text-[color:var(--text-primary)]'}>
+                  <p
+                    class={intake.sla_breached
+                      ? 'font-medium text-red-600'
+                      : 'text-[color:var(--text-primary)]'}
+                  >
                     {deliveryStatus(intake, 'acknowledgement_email')}
                   </p>
                   <p class="mt-1 text-xs text-[color:var(--text-muted)]">
