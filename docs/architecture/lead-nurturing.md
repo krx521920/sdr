@@ -44,10 +44,14 @@ sequence is created or enabled by default.
   generation, so an already-completed paused worker job cannot lose the step.
 - Converted, closed, or inactive CRM leads stop before the next external send.
 
-Email delivery is at-least-once across a process crash between the external
-email provider accepting a message and the database recording success. The
-delivery ledger prevents ordinary broker redelivery from sending a completed
-step again.
+Production email delivery is a two-stage, single-attempt operation. An
+administrator first reviews an exact non-PII intent and consumes a matching
+one-time approval; only then is a provider job created. The delivery UUID is
+also the execution idempotency key. A worker moves the request from `RESERVED`
+to `SENDING` immediately before provider I/O. If the provider accepts the
+message, local state can converge from `ACCEPTED` without another provider
+call. If the outcome is uncertain, the request becomes charged `UNKNOWN` and
+is never replayed automatically.
 
 ## A/B and engagement metrics
 
@@ -89,9 +93,12 @@ AWS SNS posts delivery, bounce, and complaint notifications to:
 POST /api/sdr/public/ses-feedback/
 ```
 
-The endpoint verifies the SNS certificate signature before trusting the tenant
-or delivery tags and setting the RLS context. Sanitized events are persisted in
-an idempotent provider-event ledger keyed by the SNS message ID. Recipient and
+The endpoint first requires an exact `AWS_SES_FEEDBACK_SNS_TOPIC_ARN` binding,
+then verifies the SNS certificate signature before trusting the tenant or
+delivery tags and setting the RLS context. The exact ARN binds the AWS account,
+region, partition, and topic; an otherwise valid message from another AWS SNS
+topic is rejected. Sanitized events are persisted in an idempotent
+provider-event ledger keyed by the SNS message ID. Recipient and
 provider-message-ID mismatches are ignored instead of being associated by email
 alone.
 
@@ -102,8 +109,10 @@ alone.
 
 The sequence API and administration UI expose delivery, bounce, complaint, and
 per-variant bounce metrics. Configure `AWS_SES_CONFIGURATION_SET`, publish its
-Delivery/Bounce/Complaint events to an SNS topic, and subscribe the endpoint
-above to that topic.
+Delivery/Bounce/Complaint events to an SNS topic, set that topic's complete ARN
+as `AWS_SES_FEEDBACK_SNS_TOPIC_ARN`, and subscribe the endpoint above to the
+same topic. The feedback endpoint intentionally returns `503` while this exact
+binding is absent or malformed.
 
 ## Unsubscribe and suppression
 
@@ -143,7 +152,9 @@ Supported enrollment actions are pause, resume, cancel, mark replied, and mark
 converted. Templates use the same safe simple-variable allow-list as the lead
 acknowledgement email.
 
-Apply migrations through `sdr.0010_ses_delivery_feedback`. Configure
-`SDR_NURTURE_TRACKING_BASE_URL` as the externally reachable application origin;
-signed links default to `FRONTEND_URL` and expire after 366 days. Run Celery
-worker and Beat so due jobs and the nurture reconciler continue to execute.
+Apply all repository migrations with `python manage.py migrate --noinput`, then
+require `python manage.py migrate --check` to pass before starting workers.
+Configure `SDR_NURTURE_TRACKING_BASE_URL` as the externally reachable
+application origin; signed links default to `FRONTEND_URL` and expire after 366
+days. Run Celery worker and Beat so due jobs and the nurture reconciler continue
+to execute.
