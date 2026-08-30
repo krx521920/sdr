@@ -8,13 +8,16 @@ from django.utils.module_loading import import_string
 
 from cases.models import EmailMessage, InboundMailbox
 
-RouteTargetHandler = Callable[[EmailMessage], None]
+from .parser import ParsedEmail
+
+RouteTargetHandler = Callable[..., None]
 
 
 def dispatch_to_route_target(
     *,
     mailbox: InboundMailbox,
     email_message: EmailMessage,
+    parsed_email: ParsedEmail,
 ) -> None:
     dotted_path = settings.INBOUND_EMAIL_ROUTE_HANDLERS.get(mailbox.route_target)
     if not dotted_path:
@@ -26,4 +29,7 @@ def dispatch_to_route_target(
         raise ImproperlyConfigured(
             f"Inbound email handler for {mailbox.route_target!r} is not callable."
         )
-    handler(email_message)
+    # Parsed content remains request-local. Route handlers must derive only
+    # bounded, non-content state before returning; it is never placed on a
+    # durable job payload by this dispatcher.
+    handler(email_message, parsed_email=parsed_email)

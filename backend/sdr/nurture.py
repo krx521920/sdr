@@ -17,11 +17,22 @@ from django.db import transaction
 from django.template import Context, Template, TemplateSyntaxError
 from django.utils import timezone
 
-from automation.errors import PermanentJobError, RetryableJobError
+from automation.errors import PermanentJobError
 from automation.jobs import JobRequest
 from automation.models import AutomationJobStatus
 from automation.services import dispatch_job, enqueue_job
 from sdr.compliance import evaluate_contact
+from sdr.email_execution import (
+    EmailExecutionIntent,
+    bound_email_execution,
+    claim_email_execution,
+    email_execution_request_id,
+    email_send_intent,
+    release_reserved_email_execution,
+    settle_email_delivered,
+    settle_email_provider_accepted,
+    settle_email_provider_unknown,
+)
 from sdr.email_safety import (
     CAMPAIGN_SAFETY_PAUSE_REASON,
     reserve_delivery_send,
@@ -39,6 +50,7 @@ from sdr.models import (
     SDRNurtureSequence,
     SDRNurtureStep,
 )
+from sdr.provider_ports import ExecutionSafetyError, ExternalRequestStatus
 from sdr.response import record_lifecycle_event, validate_message_template
 from sdr.suppression import unsubscribe_url
 from sdr.tracking import build_tracked_email_content
@@ -297,13 +309,61 @@ def ensure_enrollment_schedule(
 def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     delivery = _load_delivery(payload)
     enrollment = delivery.enrollment
+    try:
+        execution_request_id = email_execution_request_id(payload)
+        execution_request = bound_email_execution(
+            org=enrollment.intake.org,
+            delivery_id=delivery.id,
+            request_id=execution_request_id,
+        )
+    except ExecutionSafetyError as exc:
+        _fail_delivery(delivery, code=exc.code, message=exc.detail)
+        raise PermanentJobError(exc.detail, code=exc.code) from exc
+
+    if execution_request is not None and execution_request.status in {
+        ExternalRequestStatus.ACCEPTED,
+        ExternalRequestStatus.DELIVERED,
+    }:
+        return _recover_accepted_nurture_email(delivery, execution_request)
+    if execution_request is not None and execution_request.status != (
+        ExternalRequestStatus.RESERVED
+    ):
+        if execution_request.status not in {
+            ExternalRequestStatus.SENDING,
+            ExternalRequestStatus.UNKNOWN,
+        }:
+            _fail_delivery(
+                delivery,
+                code="email_execution_not_replayable",
+                message="The approved email execution was already attempted.",
+            )
+        raise PermanentJobError(
+            "The approved email execution cannot be replayed.",
+            code="email_execution_not_replayable",
+        )
+
     if delivery.status == NurtureDeliveryStatus.SENT:
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="email_delivery_already_sent",
+        )
         ensure_enrollment_schedule(enrollment)
         return _delivery_result(delivery)
     if delivery.status == NurtureDeliveryStatus.SKIPPED:
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="email_delivery_already_skipped",
+        )
         return _delivery_result(delivery)
     if enrollment.status in TERMINAL_ENROLLMENT_STATUSES:
         _skip_delivery(delivery, code=f"enrollment_{enrollment.status}")
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code=f"enrollment_{enrollment.status}",
+        )
         return _delivery_result(delivery)
     if _email_not_permitted(
         enrollment.intake,
@@ -316,8 +376,18 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             reason="The email address is on the tenant suppression list.",
         )
         _skip_delivery(delivery, code="email_suppressed")
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="email_suppressed",
+        )
         return _delivery_result(delivery)
     if enrollment.status == NurtureEnrollmentStatus.PAUSED:
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="enrollment_paused",
+        )
         return {**_delivery_result(delivery), "paused": True}
 
     stopped_status = _lead_stop_status(enrollment)
@@ -328,9 +398,19 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             reason="The CRM lead is no longer eligible for nurture.",
         )
         _skip_delivery(delivery, code=f"lead_{stopped_status}")
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code=f"lead_{stopped_status}",
+        )
         return _delivery_result(delivery)
     if not enrollment.sequence.is_active:
         pause_enrollment(enrollment, reason="The nurture sequence is disabled.")
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="nurture_sequence_disabled",
+        )
         return {**_delivery_result(delivery), "paused": True}
 
     try:
@@ -339,21 +419,68 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         validate_message_template(delivery.body_template)
     except (ValidationError, ValueError) as exc:
         _fail_delivery(delivery, code="invalid_nurture_message", message=str(exc))
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="invalid_nurture_message",
+        )
         raise PermanentJobError(str(exc), code="invalid_nurture_message") from exc
 
-    safety = reserve_delivery_send(delivery)
+    try:
+        safety = reserve_delivery_send(delivery)
+    except Exception as exc:
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="email_safety_check_failed",
+        )
+        _fail_delivery(
+            delivery,
+            code="email_safety_check_failed",
+            message="The nurture email safety check could not be completed.",
+        )
+        raise PermanentJobError(
+            "The nurture email safety check could not be completed.",
+            code="email_safety_check_failed",
+        ) from exc
     if not safety.allowed:
         if safety.reason == "campaign_safety_hold":
             pause_enrollment(
                 enrollment,
                 reason=CAMPAIGN_SAFETY_PAUSE_REASON,
             )
+            release_reserved_email_execution(
+                org=enrollment.intake.org,
+                request=execution_request,
+                error_code="campaign_safety_hold",
+            )
             return {
                 **_delivery_result(delivery),
                 "paused": True,
                 "safety_reason": safety.reason,
             }
-        _enqueue_delivery(delivery)
+        try:
+            _enqueue_delivery(
+                delivery,
+                execution_request_id=(
+                    execution_request.id if execution_request is not None else None
+                ),
+            )
+        except Exception as exc:
+            release_reserved_email_execution(
+                org=enrollment.intake.org,
+                request=execution_request,
+                error_code="email_local_defer_failed",
+            )
+            _fail_delivery(
+                delivery,
+                code="email_local_defer_failed",
+                message="The deferred email could not be queued safely.",
+            )
+            raise PermanentJobError(
+                "The deferred email could not be queued safely.",
+                code="email_local_defer_failed",
+            ) from exc
         return {
             **_delivery_result(delivery),
             "deferred": True,
@@ -364,73 +491,267 @@ def process_nurture_email_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             "used_today": safety.used_today,
             "daily_limit": safety.daily_limit,
         }
-    context = _template_context(enrollment.intake)
     try:
-        subject = Template(delivery.subject_template).render(Context(context))
-        body = Template(delivery.body_template).render(Context(context))
-        opt_out_url = unsubscribe_url(delivery)
-        tracked_body, html_body = build_tracked_email_content(
-            delivery,
-            body,
-            unsubscribe=opt_out_url,
+        email, intent = _build_nurture_email(delivery)
+        sending_request = claim_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            intent=intent,
         )
-        email = EmailMultiAlternatives(
-            subject=subject.strip()[:255],
-            body=tracked_body,
-            from_email=(enrollment.sequence.from_email or settings.DEFAULT_FROM_EMAIL),
-            to=[delivery.recipient],
-            headers={
-                "List-Unsubscribe": f"<{opt_out_url}>",
-                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-                "X-SES-MESSAGE-TAGS": (
-                    f"sdr_org={delivery.org_id},sdr_delivery={delivery.id}"
-                ),
-            },
-        )
-        email.attach_alternative(html_body, "text/html")
-        sent = email.send(fail_silently=False)
-        if sent != 1:
-            raise RuntimeError("The email backend did not accept the message.")
+    except ExecutionSafetyError as exc:
+        if execution_request is not None:
+            current_request = bound_email_execution(
+                org=enrollment.intake.org,
+                delivery_id=delivery.id,
+                request_id=execution_request.id,
+            )
+            if current_request.status in {
+                ExternalRequestStatus.ACCEPTED,
+                ExternalRequestStatus.DELIVERED,
+            }:
+                return _recover_accepted_nurture_email(
+                    delivery,
+                    current_request,
+                )
+            if current_request.status in {
+                ExternalRequestStatus.SENDING,
+                ExternalRequestStatus.UNKNOWN,
+            }:
+                raise PermanentJobError(
+                    "The approved email execution cannot be replayed.",
+                    code="email_execution_not_replayable",
+                ) from exc
+        _fail_delivery(delivery, code=exc.code, message=exc.detail)
+        raise PermanentJobError(exc.detail, code=exc.code) from exc
     except (TemplateSyntaxError, ValueError) as exc:
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="invalid_nurture_message",
+        )
         _fail_delivery(delivery, code="invalid_nurture_message", message=str(exc))
         raise PermanentJobError(str(exc), code="invalid_nurture_message") from exc
     except Exception as exc:
-        _fail_delivery(delivery, code="nurture_email_failed", message=str(exc))
-        raise RetryableJobError(
-            "The nurture email could not be delivered.",
-            code="nurture_email_failed",
+        release_reserved_email_execution(
+            org=enrollment.intake.org,
+            request=execution_request,
+            error_code="email_local_start_failed",
+        )
+        _fail_delivery(
+            delivery,
+            code="email_local_start_failed",
+            message="The nurture email could not be prepared safely.",
+        )
+        raise PermanentJobError(
+            "The nurture email could not be prepared safely.",
+            code="email_local_start_failed",
         ) from exc
 
-    _complete_delivery(
+    try:
+        sent = email.send(fail_silently=False)
+        if sent != 1:
+            raise RuntimeError("The email backend did not accept the message.")
+        accepted_request = settle_email_provider_accepted(
+            org=enrollment.intake.org,
+            request=sending_request,
+        )
+    except Exception as exc:
+        try:
+            settle_email_provider_unknown(
+                org=enrollment.intake.org,
+                request=sending_request,
+            )
+        except Exception:
+            logger.exception(
+                "Could not settle uncertain nurture email execution %s",
+                getattr(sending_request, "id", None),
+            )
+        _fail_delivery(
+            delivery,
+            code="email_execution_outcome_unknown",
+            message="The email provider outcome is unknown; automatic replay is disabled.",
+        )
+        raise PermanentJobError(
+            "The email provider outcome is unknown; automatic replay is disabled.",
+            code="email_execution_outcome_unknown",
+        ) from exc
+
+    return _finish_accepted_nurture_email(
         delivery,
+        accepted_request,
         provider_message_id=str(email.extra_headers.get("message_id") or ""),
     )
-    LeadNurtureEnrollment.objects.filter(
-        id=enrollment.id,
-        org_id=enrollment.org_id,
-    ).update(
-        current_step_position=delivery.step_position,
-        next_run_at=None,
-        stop_reason="",
+
+
+def nurture_email_execution_intent(
+    delivery: LeadNurtureDelivery,
+) -> EmailExecutionIntent:
+    """Return the exact immutable snapshot an administrator must approve."""
+
+    _, intent = _build_nurture_email(delivery)
+    return intent
+
+
+def enqueue_approved_nurture_delivery(
+    delivery: LeadNurtureDelivery,
+    *,
+    execution_request_id: UUID,
+):
+    """Queue one approved provider attempt with retries disabled."""
+
+    bound_email_execution(
+        org=delivery.enrollment.intake.org,
+        delivery_id=delivery.id,
+        request_id=execution_request_id,
     )
-    enrollment.current_step_position = delivery.step_position
-    enrollment.next_run_at = None
-    enrollment.stop_reason = ""
-    if enrollment.lead_id:
-        enrollment.lead.last_contacted = timezone.localdate()
-        enrollment.lead.save(update_fields=["last_contacted", "updated_at"])
-    record_lifecycle_event(
-        intake=enrollment.intake,
-        event_type=LeadLifecycleEventType.NURTURE_EMAIL_SENT,
-        event_key=f"nurture:step:{delivery.step_position}",
-        data={
-            "sequence_id": str(enrollment.sequence_id),
-            "step": delivery.step_position,
-            "variant": delivery.variant,
-        },
+    return _enqueue_delivery(
+        delivery,
+        execution_request_id=execution_request_id,
     )
-    ensure_enrollment_schedule(enrollment)
+
+
+def _build_nurture_email(
+    delivery: LeadNurtureDelivery,
+) -> tuple[EmailMultiAlternatives, EmailExecutionIntent]:
+    enrollment = delivery.enrollment
+    validate_email(delivery.recipient)
+    validate_message_template(delivery.subject_template)
+    validate_message_template(delivery.body_template)
+    context = _template_context(enrollment.intake)
+    subject = Template(delivery.subject_template).render(Context(context)).strip()[:255]
+    body = Template(delivery.body_template).render(Context(context))
+    opt_out_url = unsubscribe_url(delivery)
+    tracked_body, html_body = build_tracked_email_content(
+        delivery,
+        body,
+        unsubscribe=opt_out_url,
+    )
+    from_email = enrollment.sequence.from_email or settings.DEFAULT_FROM_EMAIL
+    headers = {
+        "List-Unsubscribe": f"<{opt_out_url}>",
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        "X-SES-MESSAGE-TAGS": (f"sdr_org={delivery.org_id},sdr_delivery={delivery.id}"),
+    }
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=tracked_body,
+        from_email=from_email,
+        to=[delivery.recipient],
+        headers=headers,
+    )
+    email.attach_alternative(html_body, "text/html")
+    intent = email_send_intent(
+        org=enrollment.intake.org,
+        recipient=delivery.recipient,
+        subject=subject,
+        text_body=tracked_body,
+        html_body=html_body,
+        from_email=from_email,
+        headers=headers,
+    )
+    return email, intent
+
+
+def _recover_accepted_nurture_email(delivery, execution_request):
+    return _finish_accepted_nurture_email(
+        delivery,
+        execution_request,
+        provider_message_id=delivery.provider_message_id,
+    )
+
+
+def _finish_accepted_nurture_email(
+    delivery: LeadNurtureDelivery,
+    execution_request,
+    *,
+    provider_message_id: str,
+) -> Mapping[str, Any]:
+    try:
+        _finalize_nurture_email_delivery(
+            delivery,
+            provider_message_id=provider_message_id,
+        )
+        settle_email_delivered(
+            org=delivery.enrollment.intake.org,
+            request=execution_request,
+        )
+    except Exception as exc:
+        _fail_delivery(
+            delivery,
+            code="email_local_state_incomplete",
+            message=(
+                "The provider accepted the email, but local completion is incomplete; "
+                "automatic provider replay is disabled."
+            ),
+        )
+        raise PermanentJobError(
+            "The provider accepted the email, but local completion is incomplete.",
+            code="email_local_state_incomplete",
+        ) from exc
     return _delivery_result(delivery)
+
+
+def _finalize_nurture_email_delivery(
+    delivery: LeadNurtureDelivery,
+    *,
+    provider_message_id: str = "",
+) -> None:
+    with transaction.atomic():
+        # Lock only the delivery row here.  PostgreSQL rejects FOR UPDATE when
+        # Django expands nullable ``select_related`` paths (step, lead, or
+        # crm_lead) into outer joins.  Load the related rows separately after
+        # the delivery claim so the provider-accepted result can always be
+        # converged locally without weakening the row lock.
+        locked_delivery = LeadNurtureDelivery.objects.select_for_update().get(
+            id=delivery.id,
+            org_id=delivery.org_id,
+        )
+        locked_enrollment = LeadNurtureEnrollment.objects.select_for_update().get(
+            id=locked_delivery.enrollment_id,
+            org_id=delivery.org_id,
+        )
+        locked_intake = locked_enrollment.intake
+        if locked_delivery.status != NurtureDeliveryStatus.SENT:
+            _complete_delivery(
+                locked_delivery,
+                provider_message_id=provider_message_id,
+            )
+        next_position = max(
+            locked_enrollment.current_step_position,
+            locked_delivery.step_position,
+        )
+        LeadNurtureEnrollment.objects.filter(
+            id=locked_enrollment.id,
+            org_id=locked_enrollment.org_id,
+        ).update(
+            current_step_position=next_position,
+            next_run_at=None,
+            stop_reason="",
+        )
+        locked_enrollment.current_step_position = next_position
+        locked_enrollment.next_run_at = None
+        locked_enrollment.stop_reason = ""
+        if locked_enrollment.lead_id:
+            locked_enrollment.lead.last_contacted = timezone.localdate()
+            locked_enrollment.lead.save(update_fields=["last_contacted", "updated_at"])
+        record_lifecycle_event(
+            intake=locked_intake,
+            event_type=LeadLifecycleEventType.NURTURE_EMAIL_SENT,
+            event_key=f"nurture:step:{locked_delivery.step_position}",
+            data={
+                "sequence_id": str(locked_enrollment.sequence_id),
+                "step": locked_delivery.step_position,
+                "variant": locked_delivery.variant,
+            },
+        )
+        delivery.status = locked_delivery.status
+        delivery.sent_at = locked_delivery.sent_at
+        delivery.provider_message_id = locked_delivery.provider_message_id
+        enrollment = locked_enrollment
+        enrollment.current_step_position = next_position
+        enrollment.next_run_at = None
+        enrollment.stop_reason = ""
+    ensure_enrollment_schedule(enrollment)
 
 
 def pause_enrollment(
@@ -582,22 +903,39 @@ def _create_delivery(
     return delivery
 
 
-def _enqueue_delivery(delivery: LeadNurtureDelivery) -> None:
+def _enqueue_delivery(
+    delivery: LeadNurtureDelivery,
+    *,
+    execution_request_id: UUID | None = None,
+):
+    if execution_request_id is None and not getattr(
+        settings, "ALLOW_UNGUARDED_PROVIDER_IO", False
+    ):
+        # In production the durable delivery is the first-stage review item.
+        # Do not manufacture a job that must fail closed before an
+        # administrator reserves its exact email execution intent.
+        return None
     enrollment = delivery.enrollment
+    execution_suffix = (
+        f":execution:{execution_request_id}" if execution_request_id is not None else ""
+    )
+    job_payload = {
+        "org_id": str(delivery.org_id),
+        "delivery_id": str(delivery.id),
+    }
+    if execution_request_id is not None:
+        job_payload["execution_request_id"] = str(execution_request_id)
     enqueued = enqueue_job(
         JobRequest(
             org_id=delivery.org_id,
             name=NURTURE_EMAIL_JOB,
             idempotency_key=(
                 f"nurture-delivery:{delivery.id}:defer:{delivery.deferral_count}:"
-                f"dispatch:{enrollment.resume_count}"
+                f"dispatch:{enrollment.resume_count}{execution_suffix}"
             ),
-            payload={
-                "org_id": str(delivery.org_id),
-                "delivery_id": str(delivery.id),
-            },
+            payload=job_payload,
             scheduled_for=delivery.scheduled_for,
-            max_attempts=5,
+            max_attempts=1 if execution_request_id is not None else 5,
         )
     )
     if (
@@ -609,6 +947,7 @@ def _enqueue_delivery(delivery: LeadNurtureDelivery) -> None:
             dispatch_job(enqueued.job)
         except Exception:
             logger.exception("Could not dispatch nurture delivery %s", delivery.id)
+    return enqueued.job
 
 
 def _load_delivery(payload: Mapping[str, Any]) -> LeadNurtureDelivery:

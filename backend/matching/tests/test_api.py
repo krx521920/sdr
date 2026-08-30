@@ -67,7 +67,7 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
             "person": person_id,
             "kind": "email",
             "normalized_value": " ALICE@EXAMPLE.COM ",
-            "source": "crm",
+            "source": "manual",
             "is_primary": True,
         },
         format="json",
@@ -77,13 +77,13 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
         {
             "person": person_id,
             "kind": "experience",
-            "source": "linkedin",
+            "source": "manual",
             "summary": "Built Django-based outbound automation.",
             "facts": {
                 "skills": ["Python", "Django"],
                 "titles": ["Growth Engineer"],
             },
-            "source_uri": "https://example.com/private/profile?token=secret",
+            "source_uri": "https://example.com/profile/alice",
             "source_record_id": "li-123",
             "confidence": "0.900",
         },
@@ -113,7 +113,8 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
 
     assert person_response.status_code == 201
     assert identity_response.status_code == 201
-    assert identity_response.json()["normalized_value"] == "alice@example.com"
+    assert identity_response.json()["masked_value"] == "a***@example.com"
+    assert "normalized_value" not in identity_response.json()
     duplicate_identity = admin_client.post(
         "/api/matching/identities/",
         {
@@ -126,6 +127,9 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
     assert duplicate_identity.status_code == 400
     assert evidence_response.status_code == 201
     assert len(evidence_response.json()["content_hash"]) == 64
+    assert "facts" not in evidence_response.json()
+    assert "source_uri" not in evidence_response.json()
+    assert "source_record_id" not in evidence_response.json()
     assert opportunity_response.status_code == 201
     assert match_response.status_code == 202
     run = MatchRun.objects.get(id=match_response.json()["id"])
@@ -215,6 +219,66 @@ def test_end_to_end_person_evidence_opportunity_match(admin_client):
     assert decisions["count"] == 1
     assert "idempotency_key" not in decisions["results"][0]
     assert "facts" not in str(revisions["results"][0]["evidence_snapshot"])
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="matching.tests.urls")
+def test_direct_identity_and_evidence_writes_cannot_impersonate_providers(
+    admin_client,
+    org_a,
+):
+    person = Person.objects.create(org=org_a, display_name="Manual person")
+    identity = admin_client.post(
+        "/api/matching/identities/",
+        {
+            "person": str(person.id),
+            "kind": "linkedin",
+            "normalized_value": "provider-id",
+            "source": "linkedin",
+        },
+        format="json",
+    )
+    base_evidence = {
+        "person": str(person.id),
+        "kind": "profile",
+        "source": "manual",
+        "summary": "Controlled direct API evidence.",
+        "facts": {"skills": ["Python"]},
+    }
+    forged_source = admin_client.post(
+        "/api/matching/evidence/",
+        {**base_evidence, "source": "linkedin"},
+        format="json",
+    )
+    unknown_facts = admin_client.post(
+        "/api/matching/evidence/",
+        {**base_evidence, "facts": {"unreviewed": ["value"]}},
+        format="json",
+    )
+    sensitive_reference = admin_client.post(
+        "/api/matching/evidence/",
+        {
+            **base_evidence,
+            "source_uri": "https://example.com/callback#access_token=secret",
+        },
+        format="json",
+    )
+    created = admin_client.post(
+        "/api/matching/evidence/",
+        {**base_evidence, "source_uri": "https://example.com/profile"},
+        format="json",
+    )
+    listed = admin_client.get(f"/api/matching/evidence/?person={person.id}")
+
+    assert identity.status_code == 400
+    assert forged_source.status_code == 400
+    assert unknown_facts.status_code == 400
+    assert sensitive_reference.status_code == 400
+    assert created.status_code == 201
+    for body in (created.json(), listed.json()["results"][0]):
+        assert "facts" not in body
+        assert "source_uri" not in body
+        assert "source_record_id" not in body
 
 
 @pytest.mark.django_db

@@ -6,7 +6,14 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from matching.models import Match, MatchDecisionEvent, MatchStatus
+from matching.models import (
+    Match,
+    MatchDecisionEvent,
+    MatchProjectionState,
+    MatchStatus,
+    PersonGovernanceStatus,
+    PersonStatus,
+)
 
 ALLOWED_MATCH_TRANSITIONS = {
     MatchStatus.PROPOSED: frozenset(
@@ -193,7 +200,13 @@ def _apply_match_decision(*, org, request_data):
     if actor is not None and actor.org_id != org.id:
         raise MatchDecisionError("Decision actor belongs to another organization")
 
-    match = Match.objects.filter(org=org, id=request_data["match_id"]).first()
+    match = Match.objects.filter(
+        org=org,
+        id=request_data["match_id"],
+        projection_state=MatchProjectionState.CURRENT,
+        person__status=PersonStatus.ACTIVE,
+        person__governance_status=PersonGovernanceStatus.ACTIVE,
+    ).first()
     if match is None:
         raise MatchDecisionNotFound("Match does not exist in this organization")
 
@@ -226,6 +239,9 @@ def _apply_match_decision(*, org, request_data):
     updated = Match.objects.filter(
         org=org,
         id=match.id,
+        projection_state=MatchProjectionState.CURRENT,
+        person__status=PersonStatus.ACTIVE,
+        person__governance_status=PersonGovernanceStatus.ACTIVE,
         status=match.status,
         decision_revision=expected_revision,
         ranking_revision=expected_ranking_revision,

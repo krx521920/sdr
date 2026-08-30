@@ -19,6 +19,7 @@ from matching.views import (
     PersonDetailView,
     PersonIdentityListCreateView,
     PersonListCreateView,
+    PersonOnboardingView,
 )
 
 
@@ -87,6 +88,9 @@ def test_all_matching_views_declare_the_expected_method_contract():
         "GET": MatchingAccessLevel.READ,
         "POST": MatchingAccessLevel.MANAGE,
     }
+    assert PersonOnboardingView.matching_access_by_method == {
+        "POST": MatchingAccessLevel.MANAGE,
+    }
     assert PersonDetailView.matching_access_by_method == {
         "GET": MatchingAccessLevel.READ,
         "PATCH": MatchingAccessLevel.MANAGE,
@@ -146,6 +150,11 @@ def test_capabilities_are_available_without_matching_access(
         "manage": False,
         "recompute": False,
         "decide": False,
+        "feedback": False,
+        "calibrate": False,
+        "export": False,
+        "delete": False,
+        "retention": False,
     }
 
 

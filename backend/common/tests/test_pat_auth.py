@@ -1,5 +1,6 @@
-import pytest
 from datetime import timedelta
+
+import pytest
 from django.db import connection
 from django.test import Client, RequestFactory
 from django.utils import timezone
@@ -36,7 +37,8 @@ class TestPATAuthentication:
 
     def test_revoked_pat_raises(self, admin_profile):
         raw, pat = PersonalAccessToken.generate(profile=admin_profile, name="cli")
-        pat.revoked_at = timezone.now(); pat.save()
+        pat.revoked_at = timezone.now()
+        pat.save()
         req = self.factory.get("/api/leads/", HTTP_AUTHORIZATION=f"Bearer {raw}")
         with pytest.raises(AuthenticationFailed):
             self.auth.authenticate(req)
@@ -57,7 +59,8 @@ class TestPATAuthentication:
 
     def test_inactive_profile_raises(self, admin_profile):
         raw, _ = PersonalAccessToken.generate(profile=admin_profile, name="cli")
-        admin_profile.is_active = False; admin_profile.save()
+        admin_profile.is_active = False
+        admin_profile.save()
         req = self.factory.get("/api/leads/", HTTP_AUTHORIZATION=f"Bearer {raw}")
         with pytest.raises(AuthenticationFailed):
             self.auth.authenticate(req)
@@ -124,8 +127,8 @@ def test_cross_org_pat_cannot_read_other_orgs_leads(org_a, admin_profile):
     if connection.vendor != "postgresql":
         pytest.skip("RLS isolation is enforced by PostgreSQL; skipping on non-Postgres DB")
 
-    from leads.models import Lead
     from conftest import set_rls_context
+    from leads.models import Lead
 
     # Create org B and a lead in it directly, with org explicitly set.
     org_b = Org.objects.create(name="Cross-Org Isolation Org B")
@@ -141,7 +144,11 @@ def test_cross_org_pat_cannot_read_other_orgs_leads(org_a, admin_profile):
     set_rls_context(org_a)
     raw, _ = PersonalAccessToken.generate(profile=admin_profile, name="cross-org-cli")
     client = Client()
-    response = client.get("/api/leads/", HTTP_AUTHORIZATION=f"Bearer {raw}")
+    response = client.get(
+        "/api/leads/",
+        secure=True,
+        HTTP_AUTHORIZATION=f"Bearer {raw}",
+    )
 
     assert response.status_code == 200, response.content
     lead_ids = _collect_lead_ids(response.json())

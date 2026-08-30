@@ -15,6 +15,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.core.validators import validate_email
+from django.db import transaction
 from django.template import Context, Template, TemplateSyntaxError
 from django.utils import timezone
 
@@ -23,6 +24,17 @@ from automation.jobs import JobRequest
 from automation.services import dispatch_job, enqueue_job
 from common import notifications
 from sdr.compliance import intake_data_restriction
+from sdr.email_execution import (
+    EmailExecutionIntent,
+    bound_email_execution,
+    claim_email_execution,
+    email_execution_request_id,
+    email_send_intent,
+    release_reserved_email_execution,
+    settle_email_delivered,
+    settle_email_provider_accepted,
+    settle_email_provider_unknown,
+)
 from sdr.models import (
     LeadDelivery,
     LeadDeliveryKind,
@@ -35,6 +47,8 @@ from sdr.models import (
     SDRResponseSettings,
 )
 from sdr.provider_ports import (
+    ExecutionSafetyError,
+    ExternalRequestStatus,
     ProviderAdapterError,
     ProviderAdapterUnavailable,
     research_result_sink_adapter,
@@ -150,8 +164,10 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
             )
         )
 
+    allow_legacy_feishu_io = getattr(settings, "ALLOW_UNGUARDED_PROVIDER_IO", False)
     if (
-        configuration.feishu_enabled
+        allow_legacy_feishu_io
+        and configuration.feishu_enabled
         and configuration.feishu_webhook_ciphertext
         and intake.assigned_profile_id
     ):
@@ -164,14 +180,17 @@ def schedule_post_handoff_jobs(intake: LeadIntake) -> list:
             )
         )
 
-    try:
-        sink = research_result_sink_adapter("feishu_base")
-        if sink.is_ready(org_id=intake.org_id):
-            jobs.append(sink.enqueue(intake=intake))
-    except ProviderAdapterUnavailable:
-        logger.debug("Feishu Base research-result sink is not registered")
-    except ProviderAdapterError:
-        logger.exception("Could not schedule Feishu Base sync for intake %s", intake.id)
+    if allow_legacy_feishu_io:
+        try:
+            sink = research_result_sink_adapter("feishu_base")
+            if sink.is_ready(org_id=intake.org_id):
+                jobs.append(sink.enqueue(intake=intake))
+        except ProviderAdapterUnavailable:
+            logger.debug("Feishu Base research-result sink is not registered")
+        except ProviderAdapterError:
+            logger.exception(
+                "Could not schedule Feishu Base sync for intake %s", intake.id
+            )
 
     for job in jobs:
         if job.name == ACKNOWLEDGEMENT_JOB:
@@ -191,6 +210,17 @@ def schedule_acknowledgement_job(intake: LeadIntake):
     configuration = response_settings_for(intake.org_id)
     email = _lead_email(intake)
     if not configuration.acknowledgement_email_enabled or not email:
+        return None
+    if not getattr(settings, "ALLOW_UNGUARDED_PROVIDER_IO", False):
+        # Production execution is intentionally two-stage. Persist the
+        # auditable delivery now, then let an administrator approve its exact
+        # hashed provider intent before an AutomationJob is created.
+        LeadDelivery.objects.get_or_create(
+            org_id=intake.org_id,
+            intake=intake,
+            kind=LeadDeliveryKind.ACKNOWLEDGEMENT_EMAIL,
+            recipient=email,
+        )
         return None
     job = _create_delivery_job(
         intake=intake,
@@ -230,6 +260,7 @@ def _create_delivery_job(
     kind: str,
     recipient: str,
     job_name: str,
+    execution_request_id: UUID | None = None,
 ):
     delivery, _ = LeadDelivery.objects.get_or_create(
         org_id=intake.org_id,
@@ -237,17 +268,23 @@ def _create_delivery_job(
         kind=kind,
         recipient=recipient,
     )
+    execution_suffix = (
+        f":execution:{execution_request_id}" if execution_request_id is not None else ""
+    )
+    job_payload = {
+        "org_id": str(intake.org_id),
+        "intake_id": str(intake.id),
+        "delivery_id": str(delivery.id),
+    }
+    if execution_request_id is not None:
+        job_payload["execution_request_id"] = str(execution_request_id)
     enqueued = enqueue_job(
         JobRequest(
             org_id=intake.org_id,
             name=job_name,
-            idempotency_key=f"delivery:{delivery.id}",
-            payload={
-                "org_id": str(intake.org_id),
-                "intake_id": str(intake.id),
-                "delivery_id": str(delivery.id),
-            },
-            max_attempts=5,
+            idempotency_key=f"delivery:{delivery.id}{execution_suffix}",
+            payload=job_payload,
+            max_attempts=1 if execution_request_id is not None else 5,
         )
     )
     return enqueued.job
@@ -260,62 +297,296 @@ def process_acknowledgement_email_job(
         payload,
         expected_kind=LeadDeliveryKind.ACKNOWLEDGEMENT_EMAIL,
     )
+    try:
+        execution_request_id = email_execution_request_id(payload)
+        execution_request = bound_email_execution(
+            org=intake.org,
+            delivery_id=delivery.id,
+            request_id=execution_request_id,
+        )
+    except ExecutionSafetyError as exc:
+        _fail_delivery(delivery, code=exc.code, message=exc.detail)
+        raise PermanentJobError(exc.detail, code=exc.code) from exc
+
+    if execution_request is not None and execution_request.status in {
+        ExternalRequestStatus.ACCEPTED,
+        ExternalRequestStatus.DELIVERED,
+    }:
+        return _recover_accepted_acknowledgement(delivery, execution_request)
+    if execution_request is not None and execution_request.status != (
+        ExternalRequestStatus.RESERVED
+    ):
+        if execution_request.status not in {
+            ExternalRequestStatus.SENDING,
+            ExternalRequestStatus.UNKNOWN,
+        }:
+            _fail_delivery(
+                delivery,
+                code="email_execution_not_replayable",
+                message="The approved email execution was already attempted.",
+            )
+        raise PermanentJobError(
+            "The approved email execution cannot be replayed.",
+            code="email_execution_not_replayable",
+        )
+
     if delivery.status in (LeadDeliveryStatus.SENT, LeadDeliveryStatus.SKIPPED):
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code=f"email_delivery_already_{delivery.status}",
+        )
         return _delivery_result(delivery)
 
     restriction = intake_data_restriction(intake)
     if restriction:
         _skip_delivery(delivery, code=restriction.code)
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code=restriction.code,
+        )
         return _delivery_result(delivery)
 
     configuration = response_settings_for(intake.org_id)
     if not configuration.acknowledgement_email_enabled:
         _skip_delivery(delivery, code="acknowledgement_disabled")
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code="acknowledgement_disabled",
+        )
         return _delivery_result(delivery)
 
-    email = _lead_email(intake)
+    email = delivery.recipient.strip().lower()
     try:
         validate_email(email)
     except ValidationError:
         _skip_delivery(delivery, code="recipient_email_unavailable")
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code="recipient_email_unavailable",
+        )
         return _delivery_result(delivery)
 
-    _start_delivery(delivery)
-    context = _template_context(intake)
     try:
-        subject = _render_message_template(
-            configuration.acknowledgement_subject, context
+        message, intent = _build_acknowledgement_email(
+            intake=intake,
+            delivery=delivery,
+            configuration=configuration,
         )
-        body = _render_message_template(configuration.acknowledgement_body, context)
+        _start_delivery(delivery)
+        sending_request = claim_email_execution(
+            org=intake.org,
+            request=execution_request,
+            intent=intent,
+        )
+    except ExecutionSafetyError as exc:
+        if execution_request is not None:
+            current_request = bound_email_execution(
+                org=intake.org,
+                delivery_id=delivery.id,
+                request_id=execution_request.id,
+            )
+            if current_request.status in {
+                ExternalRequestStatus.ACCEPTED,
+                ExternalRequestStatus.DELIVERED,
+            }:
+                return _recover_accepted_acknowledgement(
+                    delivery,
+                    current_request,
+                )
+            if current_request.status in {
+                ExternalRequestStatus.SENDING,
+                ExternalRequestStatus.UNKNOWN,
+            }:
+                raise PermanentJobError(
+                    "The approved email execution cannot be replayed.",
+                    code="email_execution_not_replayable",
+                ) from exc
+        _fail_delivery(delivery, code=exc.code, message=exc.detail)
+        raise PermanentJobError(exc.detail, code=exc.code) from exc
+    except (TemplateSyntaxError, ValueError) as exc:
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code="invalid_email_template",
+        )
+        _fail_delivery(delivery, code="invalid_email_template", message=str(exc))
+        raise PermanentJobError(str(exc), code="invalid_email_template") from exc
+    except Exception as exc:
+        release_reserved_email_execution(
+            org=intake.org,
+            request=execution_request,
+            error_code="email_local_start_failed",
+        )
+        _fail_delivery(
+            delivery,
+            code="email_local_start_failed",
+            message="The email delivery could not be prepared safely.",
+        )
+        raise PermanentJobError(
+            "The email delivery could not be prepared safely.",
+            code="email_local_start_failed",
+        ) from exc
+
+    try:
         sent = send_mail(
-            subject=subject.strip()[:255],
-            message=body,
-            from_email=(
-                configuration.acknowledgement_from_email or settings.DEFAULT_FROM_EMAIL
-            ),
-            recipient_list=[email],
+            subject=message["subject"],
+            message=message["body"],
+            from_email=message["from_email"],
+            recipient_list=[message["recipient"]],
             fail_silently=False,
         )
         if sent != 1:
             raise RuntimeError("The email backend did not accept the message.")
-    except (TemplateSyntaxError, ValueError) as exc:
-        _fail_delivery(delivery, code="invalid_email_template", message=str(exc))
-        raise PermanentJobError(str(exc), code="invalid_email_template") from exc
+        accepted_request = settle_email_provider_accepted(
+            org=intake.org,
+            request=sending_request,
+        )
     except Exception as exc:
-        _fail_delivery(delivery, code="email_delivery_failed", message=str(exc))
-        raise RetryableJobError(
-            "The acknowledgement email could not be delivered.",
-            code="email_delivery_failed",
+        try:
+            settle_email_provider_unknown(
+                org=intake.org,
+                request=sending_request,
+            )
+        except Exception:
+            logger.exception(
+                "Could not settle uncertain acknowledgement execution %s",
+                getattr(sending_request, "id", None),
+            )
+        _fail_delivery(
+            delivery,
+            code="email_execution_outcome_unknown",
+            message="The email provider outcome is unknown; automatic replay is disabled.",
+        )
+        raise PermanentJobError(
+            "The email provider outcome is unknown; automatic replay is disabled.",
+            code="email_execution_outcome_unknown",
         ) from exc
 
-    _complete_delivery(delivery)
-    record_lifecycle_event(
-        intake=intake,
-        event_type=LeadLifecycleEventType.ACKNOWLEDGEMENT_SENT,
-        event_key="delivery:acknowledgement_email",
-        data={"recipient": email},
+    return _finish_accepted_acknowledgement(
+        delivery,
+        accepted_request,
     )
+
+
+def acknowledgement_email_execution_intent(
+    delivery: LeadDelivery,
+) -> EmailExecutionIntent:
+    """Return the exact immutable snapshot an administrator must approve."""
+
+    configuration = response_settings_for(delivery.org_id)
+    _, intent = _build_acknowledgement_email(
+        intake=delivery.intake,
+        delivery=delivery,
+        configuration=configuration,
+    )
+    return intent
+
+
+def enqueue_approved_acknowledgement_delivery(
+    delivery: LeadDelivery,
+    *,
+    execution_request_id: UUID,
+):
+    """Queue one approved provider attempt with retries disabled."""
+
+    bound_email_execution(
+        org=delivery.intake.org,
+        delivery_id=delivery.id,
+        request_id=execution_request_id,
+    )
+    return _create_delivery_job(
+        intake=delivery.intake,
+        kind=LeadDeliveryKind.ACKNOWLEDGEMENT_EMAIL,
+        recipient=delivery.recipient,
+        job_name=ACKNOWLEDGEMENT_JOB,
+        execution_request_id=execution_request_id,
+    )
+
+
+def _build_acknowledgement_email(
+    *,
+    intake: LeadIntake,
+    delivery: LeadDelivery,
+    configuration: SDRResponseSettings,
+) -> tuple[dict[str, str], EmailExecutionIntent]:
+    recipient = delivery.recipient.strip().lower()
+    validate_email(recipient)
+    context = _template_context(intake)
+    subject = _render_message_template(
+        configuration.acknowledgement_subject,
+        context,
+    ).strip()[:255]
+    body = _render_message_template(
+        configuration.acknowledgement_body,
+        context,
+    )
+    from_email = configuration.acknowledgement_from_email or settings.DEFAULT_FROM_EMAIL
+    intent = email_send_intent(
+        org=intake.org,
+        recipient=recipient,
+        subject=subject,
+        text_body=body,
+        from_email=from_email,
+    )
+    return {
+        "recipient": recipient,
+        "subject": subject,
+        "body": body,
+        "from_email": from_email,
+    }, intent
+
+
+def _recover_accepted_acknowledgement(delivery, execution_request):
+    return _finish_accepted_acknowledgement(delivery, execution_request)
+
+
+def _finish_accepted_acknowledgement(
+    delivery: LeadDelivery,
+    execution_request,
+) -> Mapping[str, Any]:
+    try:
+        _finalize_acknowledgement_delivery(delivery)
+        settle_email_delivered(
+            org=delivery.intake.org,
+            request=execution_request,
+        )
+    except Exception as exc:
+        _fail_delivery(
+            delivery,
+            code="email_local_state_incomplete",
+            message=(
+                "The provider accepted the email, but local completion is incomplete; "
+                "automatic provider replay is disabled."
+            ),
+        )
+        raise PermanentJobError(
+            "The provider accepted the email, but local completion is incomplete.",
+            code="email_local_state_incomplete",
+        ) from exc
     return _delivery_result(delivery)
+
+
+def _finalize_acknowledgement_delivery(delivery: LeadDelivery) -> None:
+    with transaction.atomic():
+        locked = (
+            LeadDelivery.objects.select_for_update()
+            .select_related("intake__org")
+            .get(id=delivery.id, org_id=delivery.org_id)
+        )
+        if locked.status != LeadDeliveryStatus.SENT:
+            _complete_delivery(locked)
+        record_lifecycle_event(
+            intake=locked.intake,
+            event_type=LeadLifecycleEventType.ACKNOWLEDGEMENT_SENT,
+            event_key="delivery:acknowledgement_email",
+            data={"recipient": locked.recipient},
+        )
+        delivery.status = locked.status
+        delivery.sent_at = locked.sent_at
 
 
 def process_sales_in_app_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -379,6 +650,9 @@ def process_sales_feishu_job(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         expected_kind=LeadDeliveryKind.SALES_FEISHU,
     )
     if delivery.status in (LeadDeliveryStatus.SENT, LeadDeliveryStatus.SKIPPED):
+        return _delivery_result(delivery)
+    if not getattr(settings, "ALLOW_UNGUARDED_PROVIDER_IO", False):
+        _skip_delivery(delivery, code="feishu_execution_approval_required")
         return _delivery_result(delivery)
     restriction = intake_data_restriction(intake)
     if restriction:

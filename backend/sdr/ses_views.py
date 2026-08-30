@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
+from django.conf import settings
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -13,6 +14,8 @@ from rest_framework.views import APIView
 from cases.inbound.sns import (
     SNSVerificationError,
     confirm_subscription,
+    parse_sns_topic_arn,
+    validate_sns_topic_binding,
     verify_sns_message,
 )
 from common.tasks import set_rls_context
@@ -37,10 +40,29 @@ class SESFeedbackWebhookView(APIView):
                 {"ok": False, "error": "invalid_json"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        configured_topic_arn = str(
+            getattr(settings, "AWS_SES_FEEDBACK_SNS_TOPIC_ARN", "") or ""
+        ).strip()
+        if not configured_topic_arn:
+            logger.error("SES feedback SNS topic binding is not configured")
+            return Response(
+                {"ok": False, "error": "configuration_error"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         try:
+            expected_topic_arn = parse_sns_topic_arn(configured_topic_arn).arn
+        except SNSVerificationError:
+            logger.error("SES feedback SNS topic binding is invalid")
+            return Response(
+                {"ok": False, "error": "configuration_error"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        try:
+            validate_sns_topic_binding(payload, expected_topic_arn)
             verify_sns_message(payload)
         except SNSVerificationError:
-            logger.warning("Rejected an invalid SES feedback SNS signature")
+            logger.warning("Rejected an invalid or unbound SES feedback SNS message")
             return Response(
                 {"ok": False, "error": "invalid_signature"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -49,9 +71,15 @@ class SESFeedbackWebhookView(APIView):
         message_type = payload.get("Type")
         if message_type == "SubscriptionConfirmation":
             try:
-                confirm_subscription(payload)
-            except Exception:
-                logger.exception("Could not confirm SES feedback SNS subscription")
+                confirm_subscription(
+                    payload,
+                    expected_topic_arn=expected_topic_arn,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not confirm SES feedback SNS subscription error_type=%s",
+                    type(exc).__name__,
+                )
                 return Response(
                     {"ok": False, "error": "subscription_confirmation_failed"},
                     status=status.HTTP_502_BAD_GATEWAY,

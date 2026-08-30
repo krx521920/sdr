@@ -22,3 +22,10 @@ CELERY_RESULT_BACKEND = "cache+memory://"
 # nearly every test, so that dominates the run. MD5 is fine here: it is never
 # used outside crm.test_settings, and no test asserts on the hash algorithm.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+# Test clients intentionally use HTTP. Production environment variables must
+# not turn focused API assertions into redirects.
+SECURE_SSL_REDIRECT = False
+
+# Existing provider unit tests use fake sessions and predate execution approvals.
+ALLOW_UNGUARDED_PROVIDER_IO = True

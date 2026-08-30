@@ -6,6 +6,7 @@ from rest_framework import serializers
 from integrations.models import (
     FEISHU_BASE_FIELD_KEYS,
     ApolloConnection,
+    ExecutionChannel,
     FacebookConversionEvent,
     FacebookConversionSettings,
     FacebookOAuthSession,
@@ -16,9 +17,42 @@ from integrations.models import (
     LinkedInInvitation,
     WhatsAppBusinessConnection,
     WhatsAppMessage,
+    WhatsAppMessageStatus,
 )
 from integrations.providers.facebook.messenger import validate_auto_reply_template
 from sdr.domain import QualificationBand
+
+
+class ChannelSafetyOrganizationWriteSerializer(serializers.Serializer):
+    enabled = serializers.BooleanField()
+    daily_limit = serializers.IntegerField(min_value=0, max_value=10_000_000)
+    expected_revision = serializers.IntegerField(min_value=0)
+
+
+class ChannelSafetyChannelWriteSerializer(serializers.Serializer):
+    enabled = serializers.BooleanField()
+    test_mode = serializers.BooleanField()
+    daily_limit = serializers.IntegerField(min_value=0, max_value=1_000_000)
+    per_execution_limit = serializers.IntegerField(min_value=0, max_value=1_000_000)
+    expected_revision = serializers.IntegerField(min_value=0)
+
+
+class ChannelSafetyTargetWriteSerializer(serializers.Serializer):
+    channel = serializers.ChoiceField(choices=ExecutionChannel.choices)
+    identifier = serializers.CharField(max_length=1000, trim_whitespace=True)
+    safe_label = serializers.CharField(max_length=120, trim_whitespace=True)
+
+
+class ChannelSafetyApprovalWriteSerializer(serializers.Serializer):
+    target_id = serializers.UUIDField()
+    action = serializers.RegexField(r"^[a-z][a-z0-9_.:-]{0,63}$")
+    payload_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$")
+    units = serializers.IntegerField(min_value=1, max_value=1_000_000)
+    expires_in_seconds = serializers.IntegerField(min_value=60, max_value=86400)
+
+
+class ChannelSafetyUnknownResolveSerializer(serializers.Serializer):
+    outcome = serializers.ChoiceField(choices=("delivered", "failed_consumed"))
 
 EVENT_NAME_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]{1,100}$")
 
@@ -148,6 +182,9 @@ class LinkedInConnectionWriteSerializer(serializers.Serializer):
 
 class FeishuBaseConnectionSerializer(serializers.ModelSerializer):
     app_secret_configured = serializers.SerializerMethodField()
+    app_id_configured = serializers.SerializerMethodField()
+    app_token_configured = serializers.SerializerMethodField()
+    table_id_configured = serializers.SerializerMethodField()
     sync_summary = serializers.SerializerMethodField()
 
     class Meta:
@@ -155,10 +192,10 @@ class FeishuBaseConnectionSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "app_id",
+            "app_id_configured",
             "app_secret_configured",
-            "app_secret_hint",
-            "app_token",
-            "table_id",
+            "app_token_configured",
+            "table_id_configured",
             "field_mapping",
             "is_active",
             "last_validated_at",
@@ -172,6 +209,15 @@ class FeishuBaseConnectionSerializer(serializers.ModelSerializer):
     def get_app_secret_configured(self, obj) -> bool:
         return bool(obj.app_secret_ciphertext)
 
+    def get_app_id_configured(self, obj) -> bool:
+        return bool(obj.app_id)
+
+    def get_app_token_configured(self, obj) -> bool:
+        return bool(obj.app_token)
+
+    def get_table_id_configured(self, obj) -> bool:
+        return bool(obj.table_id)
+
     def get_sync_summary(self, obj) -> dict[str, int]:
         counts = {
             row["status"]: row["count"]
@@ -179,7 +225,17 @@ class FeishuBaseConnectionSerializer(serializers.ModelSerializer):
             .values("status")
             .annotate(count=Count("id"))
         }
-        statuses = ("pending", "queued", "syncing", "succeeded", "failed", "skipped")
+        statuses = (
+            "pending",
+            "queued",
+            "syncing",
+            "succeeded",
+            "failed",
+            "skipped",
+            "unknown",
+            "external_erasure_pending",
+            "external_erasure_completed",
+        )
         return {
             "total": sum(counts.values()),
             **{value: counts.get(value, 0) for value in statuses},
@@ -232,13 +288,6 @@ class FeishuBaseConnectionWriteSerializer(serializers.Serializer):
                 "table_id", connection.table_id if connection else ""
             ),
         }
-        mapping = attrs.get(
-            "field_mapping", connection.field_mapping if connection else {}
-        )
-        if not mapping.get("intake_id"):
-            raise serializers.ValidationError(
-                {"field_mapping": "Map intake_id to a unique Feishu text field."}
-            )
         missing = [name for name, value in values.items() if not value]
         if missing:
             raise serializers.ValidationError(
@@ -246,6 +295,103 @@ class FeishuBaseConnectionWriteSerializer(serializers.Serializer):
                     name: "This value is required before enabling Base sync."
                     for name in missing
                 }
+            )
+        return attrs
+
+
+class FeishuBaseExecutionWriteSerializer(serializers.Serializer):
+    """Second-stage grant for one exact Feishu Base execution.
+
+    An empty object deliberately remains valid: it is the read-only first
+    stage that returns the execution intent. Supplying either grant field
+    requires the other so no partial authorization can reach the service.
+    """
+
+    approval_id = serializers.UUIDField(required=False)
+    idempotency_key = serializers.UUIDField(required=False)
+
+    def validate(self, attrs):
+        unknown = sorted(
+            set(getattr(self, "initial_data", {}) or {})
+            - {"approval_id", "idempotency_key"}
+        )
+        if unknown:
+            raise serializers.ValidationError(
+                {name: "This field is not accepted." for name in unknown}
+            )
+        has_approval = "approval_id" in attrs
+        has_key = "idempotency_key" in attrs
+        if has_approval != has_key:
+            raise serializers.ValidationError(
+                "approval_id and idempotency_key must be supplied together."
+            )
+        return attrs
+
+
+class FeishuBasePersonImportWriteSerializer(serializers.Serializer):
+    """One-off Base-to-Person mapping plus an optional exact execution grant."""
+
+    mapping = serializers.DictField(
+        child=serializers.CharField(max_length=100, trim_whitespace=True),
+        allow_empty=False,
+    )
+    limit = serializers.IntegerField(
+        required=False,
+        default=100,
+        min_value=1,
+        max_value=500,
+    )
+    approval_id = serializers.UUIDField(required=False)
+    idempotency_key = serializers.UUIDField(required=False)
+
+    def validate_mapping(self, value):
+        allowed = {
+            "display_name",
+            "first_name",
+            "last_name",
+            "current_title",
+            "current_company",
+            "location",
+            "email",
+            "phone",
+            "linkedin",
+            "evidence_summary",
+            "observed_at",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise serializers.ValidationError("Unsupported person import field.")
+        names = list(value.values())
+        if len(names) != len(set(names)):
+            raise serializers.ValidationError(
+                "Each Feishu field can be mapped only once."
+            )
+        if not {"email", "phone", "linkedin"}.intersection(value):
+            raise serializers.ValidationError(
+                "Map at least one of email, phone, or linkedin."
+            )
+        if "display_name" not in value and not {"first_name", "last_name"}.intersection(
+            value
+        ):
+            raise serializers.ValidationError(
+                "Map display_name, first_name, or last_name."
+            )
+        return value
+
+    def validate(self, attrs):
+        unknown = sorted(
+            set(getattr(self, "initial_data", {}) or {})
+            - {"mapping", "limit", "approval_id", "idempotency_key"}
+        )
+        if unknown:
+            raise serializers.ValidationError(
+                {name: "This field is not accepted." for name in unknown}
+            )
+        has_approval = "approval_id" in attrs
+        has_key = "idempotency_key" in attrs
+        if has_approval != has_key:
+            raise serializers.ValidationError(
+                "approval_id and idempotency_key must be supplied together."
             )
         return attrs
 
@@ -527,11 +673,52 @@ class WhatsAppBusinessConnectionSerializer(serializers.ModelSerializer):
                     "sent",
                     "delivered",
                     "read",
+                    "unknown",
                     "failed",
                     "skipped",
                 )
             },
         }
+
+
+class WhatsAppMessageExecutionSerializer(serializers.Serializer):
+    """Strict optional approval for one immutable WhatsApp message."""
+
+    approval_id = serializers.UUIDField(required=False)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                "Use an object for WhatsApp execution approval."
+            )
+        unknown = sorted(set(data) - {"approval_id"})
+        if unknown:
+            raise serializers.ValidationError(
+                {key: "Unsupported field." for key in unknown}
+            )
+        return super().to_internal_value(data)
+
+
+class WhatsAppMessageListQuerySerializer(serializers.Serializer):
+    campaign_id = serializers.UUIDField(required=False)
+    status = serializers.ChoiceField(
+        choices=WhatsAppMessageStatus.choices,
+        required=False,
+    )
+    limit = serializers.IntegerField(
+        min_value=1,
+        max_value=100,
+        default=50,
+        required=False,
+    )
+
+    def to_internal_value(self, data):
+        unknown = sorted(set(data.keys()) - {"campaign_id", "status", "limit"})
+        if unknown:
+            raise serializers.ValidationError(
+                {key: "Unsupported query parameter." for key in unknown}
+            )
+        return super().to_internal_value(data)
 
 
 class WhatsAppBusinessConnectionWriteSerializer(serializers.Serializer):

@@ -24,6 +24,17 @@ from sdr.models import (
     SDRResponseSettings,
 )
 
+SES_FEEDBACK_TOPIC_ARN = (
+    "arn:aws:sns:us-east-1:123456789012:sdr-ses-feedback-test"
+)
+SES_FEEDBACK_SIGNING_CERT_URL = (
+    "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-test.pem"
+)
+SES_FEEDBACK_SUBSCRIBE_URL = (
+    "https://sns.us-east-1.amazonaws.com/"
+    "?Action=ConfirmSubscription&Token=test-confirmation-token"
+)
+
 
 def sent_delivery(org, *, email="ada@example.com", provider_message_id="ses-message-1"):
     lead = Lead.objects.create(org=org, email=email, status="in process")
@@ -124,6 +135,8 @@ def post_feedback(client, delivery, event_type, *, event_id, **message_kwargs):
         "/api/sdr/public/ses-feedback/",
         {
             "Type": "Notification",
+            "TopicArn": SES_FEEDBACK_TOPIC_ARN,
+            "SigningCertURL": SES_FEEDBACK_SIGNING_CERT_URL,
             "MessageId": event_id,
             "Message": feedback_message(delivery, event_type, **message_kwargs),
         },
@@ -132,7 +145,10 @@ def post_feedback(client, delivery, event_type, *, event_id, **message_kwargs):
 
 
 @pytest.mark.django_db
-@override_settings(ROOT_URLCONF="integrations.tests.urls")
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
 def test_permanent_ses_bounce_is_idempotent_and_suppresses_email(
     admin_client,
     unauthenticated_client,
@@ -179,7 +195,10 @@ def test_permanent_ses_bounce_is_idempotent_and_suppresses_email(
 
 
 @pytest.mark.django_db
-@override_settings(ROOT_URLCONF="integrations.tests.urls")
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
 def test_ses_complaint_suppresses_and_delivery_event_updates_metrics(
     admin_client,
     unauthenticated_client,
@@ -222,7 +241,10 @@ def test_ses_complaint_suppresses_and_delivery_event_updates_metrics(
 
 
 @pytest.mark.django_db
-@override_settings(ROOT_URLCONF="integrations.tests.urls")
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
 def test_ses_bounce_threshold_auto_pauses_outbound_campaign(
     admin_client,
     unauthenticated_client,
@@ -295,7 +317,10 @@ def test_ses_bounce_threshold_auto_pauses_outbound_campaign(
 
 
 @pytest.mark.django_db
-@override_settings(ROOT_URLCONF="integrations.tests.urls")
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
 def test_transient_bounce_is_audited_without_suppression(
     unauthenticated_client,
     org_a,
@@ -326,7 +351,10 @@ def test_transient_bounce_is_audited_without_suppression(
 
 
 @pytest.mark.django_db
-@override_settings(ROOT_URLCONF="integrations.tests.urls")
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
 def test_ses_feedback_rejects_bad_signature_and_ignores_recipient_mismatch(
     unauthenticated_client,
     org_a,
@@ -366,3 +394,98 @@ def test_ses_feedback_rejects_bad_signature_and_ignores_recipient_mismatch(
         "reason": "recipient_mismatch",
     }
     assert not SDREmailProviderEvent.objects.exists()
+
+
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN="",
+)
+def test_ses_feedback_fails_closed_when_topic_is_not_configured(
+    unauthenticated_client,
+    monkeypatch,
+):
+    verified = False
+
+    def mark_verified(payload):
+        nonlocal verified
+        verified = True
+
+    monkeypatch.setattr(ses_views, "verify_sns_message", mark_verified)
+    response = unauthenticated_client.post(
+        "/api/sdr/public/ses-feedback/",
+        {
+            "Type": "Notification",
+            "TopicArn": SES_FEEDBACK_TOPIC_ARN,
+            "SigningCertURL": SES_FEEDBACK_SIGNING_CERT_URL,
+            "Message": "{}",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "error": "configuration_error"}
+    assert verified is False
+
+
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
+def test_ses_feedback_rejects_message_from_another_topic_before_verification(
+    unauthenticated_client,
+    monkeypatch,
+):
+    verified = False
+
+    def mark_verified(payload):
+        nonlocal verified
+        verified = True
+
+    monkeypatch.setattr(ses_views, "verify_sns_message", mark_verified)
+    response = unauthenticated_client.post(
+        "/api/sdr/public/ses-feedback/",
+        {
+            "Type": "Notification",
+            "TopicArn": "arn:aws:sns:us-east-1:999999999999:other-topic",
+            "SigningCertURL": SES_FEEDBACK_SIGNING_CERT_URL,
+            "Message": "{}",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"ok": False, "error": "invalid_signature"}
+    assert verified is False
+
+
+@override_settings(
+    ROOT_URLCONF="integrations.tests.urls",
+    AWS_SES_FEEDBACK_SNS_TOPIC_ARN=SES_FEEDBACK_TOPIC_ARN,
+)
+def test_ses_subscription_confirmation_uses_exact_configured_topic(
+    unauthenticated_client,
+    monkeypatch,
+):
+    confirmed_with = None
+
+    monkeypatch.setattr(ses_views, "verify_sns_message", lambda payload: None)
+
+    def confirm(payload, *, expected_topic_arn):
+        nonlocal confirmed_with
+        confirmed_with = expected_topic_arn
+
+    monkeypatch.setattr(ses_views, "confirm_subscription", confirm)
+    response = unauthenticated_client.post(
+        "/api/sdr/public/ses-feedback/",
+        {
+            "Type": "SubscriptionConfirmation",
+            "TopicArn": SES_FEEDBACK_TOPIC_ARN,
+            "SigningCertURL": SES_FEEDBACK_SIGNING_CERT_URL,
+            "SubscribeURL": SES_FEEDBACK_SUBSCRIBE_URL,
+        },
+        format="json",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "subscribed": True}
+    assert confirmed_with == SES_FEEDBACK_TOPIC_ARN

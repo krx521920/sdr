@@ -46,6 +46,21 @@ services:
       - ./docker/backend/entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          request = urllib.request.Request(
+          'http://127.0.0.1:8000/healthz/',
+          headers={'X-Forwarded-Proto': 'https'});
+          assert urllib.request.urlopen(request, timeout=5).status == 200
+      interval: 10s
+      timeout: 6s
+      retries: 5
+      start_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -69,6 +84,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      backend:
+        condition: service_healthy
     command: >-
       celery -A crm worker --loglevel=info --queues=celery,default
       --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
@@ -88,6 +105,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     command: celery -A crm beat --loglevel=info --schedule=/tmp/celerybeat-schedule
 

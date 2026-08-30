@@ -41,11 +41,18 @@ def has_matching_access(profile, required_level) -> bool:
 
 
 def matching_capabilities(profile) -> dict:
+    admin = is_org_admin(profile)
+    decide = has_matching_access(profile, MatchingAccessLevel.DECIDE)
     return {
         "read": has_matching_access(profile, MatchingAccessLevel.READ),
         "manage": has_matching_access(profile, MatchingAccessLevel.MANAGE),
         "recompute": has_matching_access(profile, MatchingAccessLevel.RECOMPUTE),
-        "decide": has_matching_access(profile, MatchingAccessLevel.DECIDE),
+        "decide": decide,
+        "feedback": decide,
+        "calibrate": admin,
+        "export": admin,
+        "delete": admin,
+        "retention": admin,
     }
 
 

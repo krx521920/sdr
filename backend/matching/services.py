@@ -14,19 +14,33 @@ from django.utils import timezone
 
 from automation.jobs import JobRequest
 from automation.services import dispatch_job, enqueue_job
+from matching.locking import lock_matching_org
 from matching.models import (
     Evidence,
+    EvidenceConfirmationStatus,
     EvidenceKind,
+    EvidenceProcessingStatus,
     Match,
     MatchEvidence,
     MatchEvidenceDirection,
     MatchOpportunity,
+    MatchProjectionState,
+    MatchRevision,
+    MatchRevisionKind,
+    MatchRun,
     Person,
+    PersonGovernanceStatus,
+    PersonStatus,
+)
+from matching.scoring import (
+    DEFAULT_COMPONENT_WEIGHTS,
+    PolicySelection,
+    resolve_policy_for_opportunity,
 )
 
 logger = logging.getLogger(__name__)
 
-ENGINE_VERSION = "rules-v1"
+ENGINE_VERSION = "rules-v2"
 MAX_SYNC_RECOMPUTE_PEOPLE = 100
 MAX_ASYNC_RECOMPUTE_PEOPLE = 500
 RECOMPUTE_JOB_NAME = "matching.recompute_opportunity"
@@ -102,7 +116,229 @@ class RecomputeSnapshotChanged(ValueError):
     """The queued candidate snapshot is no longer safe to evaluate."""
 
 
-def _request_hash(*, opportunity_id: UUID, person_ids: list[UUID] | None) -> str:
+def _match_revision_snapshot(match: Match) -> dict:
+    return {
+        "status": match.status,
+        "projection_state": match.projection_state,
+        "retired_at": match.retired_at.isoformat() if match.retired_at else None,
+        "retirement_reason": match.retirement_reason,
+        "overall_score": match.overall_score,
+        "eligibility_score": match.eligibility_score,
+        "fit_score": match.fit_score,
+        "trust_score": match.trust_score,
+        "relationship_score": match.relationship_score,
+        "availability_score": match.availability_score,
+        "confidence": str(match.confidence),
+        "rank": match.rank,
+        "reasons": match.reasons,
+        "gaps": match.gaps,
+        "score_breakdown": match.score_breakdown,
+    }
+
+
+def _match_evidence_snapshot(match: Match) -> list[dict]:
+    return [
+        {
+            "evidence_id": str(link.evidence_id),
+            "content_hash": link.evidence.content_hash,
+            "direction": link.direction,
+            "relevance": str(link.relevance),
+            "contribution": str(link.contribution),
+            "explanation": link.explanation,
+        }
+        for link in MatchEvidence.objects.filter(
+            org=match.org,
+            match=match,
+        ).select_related("evidence")
+    ]
+
+
+@transaction.atomic
+def retire_person_match_projections(*, person: Person, reason: str) -> tuple[UUID, ...]:
+    """Retire one person's live projections and keep remaining ranks contiguous.
+
+    The tenant mutex is always acquired before lower-level matching row locks.
+    Immutable revisions preserve recommendation and human-decision history
+    without overloading Match.status.
+    """
+
+    reason = str(reason or "").strip()[:64]
+    if not reason:
+        raise ValueError("A retirement reason is required.")
+    lock_matching_org(person.org_id)
+    opportunity_ids = list(
+        Match.objects.filter(
+            org=person.org,
+            person=person,
+            projection_state=MatchProjectionState.CURRENT,
+        )
+        .order_by("opportunity_id")
+        .values_list("opportunity_id", flat=True)
+    )
+    if not opportunity_ids:
+        return ()
+
+    now = timezone.now()
+    run_ids = []
+    opportunities = MatchOpportunity.objects.select_for_update().filter(
+        org=person.org,
+        id__in=opportunity_ids,
+    ).order_by("id")
+    for opportunity in opportunities:
+        match = (
+            Match.objects.select_for_update()
+            .filter(
+                org=person.org,
+                person=person,
+                opportunity=opportunity,
+                projection_state=MatchProjectionState.CURRENT,
+            )
+            .first()
+        )
+        if match is None:
+            continue
+
+        policy = resolve_policy_for_opportunity(opportunity)
+        next_revision = opportunity.ranking_revision + 1
+        opportunity.ranking_revision = next_revision
+        opportunity.save(update_fields=["ranking_revision", "updated_at"])
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "action": "retire_person_projection",
+                    "opportunity_id": str(opportunity.id),
+                    "person_id": str(person.id),
+                    "ranking_revision": next_revision,
+                    "reason": reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        run = MatchRun.objects.create(
+            org=person.org,
+            opportunity=opportunity,
+            request_hash=request_hash,
+            requested_person_ids=[str(person.id)],
+            total_count=1,
+            processed_count=1,
+            ranking_revision=next_revision,
+            engine_version=ENGINE_VERSION,
+            scoring_policy_version=policy.version,
+            scoring_policy_checksum=policy.checksum,
+            dimension_weights=policy.dimension_weights,
+            component_weights=policy.component_weights,
+            started_at=now,
+            completed_at=now,
+            outcome="succeeded",
+        )
+
+        match.projection_state = MatchProjectionState.RETIRED
+        match.retired_at = now
+        match.retirement_reason = reason
+        match.rank = None
+        match.ranking_revision = next_revision
+        match.save(
+            update_fields=[
+                "projection_state",
+                "retired_at",
+                "retirement_reason",
+                "rank",
+                "ranking_revision",
+                "updated_at",
+            ]
+        )
+
+        # Resolve eligibility without a row lock, then lock a Match-only query.
+        # Filtering the locked queryset through person__status would add a JOIN;
+        # PostgreSQL's unqualified FOR UPDATE would lock those joined Person
+        # rows and recreate Person -> Opportunity -> other Person lock inversion.
+        eligible_person_ids = set(
+            Person.objects.filter(
+                org=person.org,
+                status=PersonStatus.ACTIVE,
+                governance_status=PersonGovernanceStatus.ACTIVE,
+            ).values_list("id", flat=True)
+        )
+        locked_current = list(
+            Match.objects.select_for_update()
+            .filter(
+                org=person.org,
+                opportunity=opportunity,
+                projection_state=MatchProjectionState.CURRENT,
+            )
+            .order_by("-overall_score", "-confidence", "person_id")
+        )
+        remaining = [
+            candidate
+            for candidate in locked_current
+            if candidate.person_id in eligible_person_ids
+        ]
+        reranked = []
+        for rank, candidate in enumerate(remaining, start=1):
+            if candidate.rank != rank:
+                candidate.rank = rank
+                candidate.ranking_revision = next_revision
+                candidate.updated_at = now
+                reranked.append(candidate)
+        # Clear every live rank first. Conditional unique constraints are checked
+        # during an UPDATE on SQLite, so a direct 2 -> 1 swap can otherwise
+        # collide with the old rank. This also strips a rank from any ineligible
+        # row created by a bulk-update/script bypass of Person.save().
+        Match.objects.filter(
+            org=person.org,
+            opportunity=opportunity,
+            projection_state=MatchProjectionState.CURRENT,
+        ).update(rank=None)
+        if remaining:
+            Match.objects.bulk_update(remaining, ["rank"])
+        if reranked:
+            Match.objects.bulk_update(
+                reranked,
+                ["ranking_revision", "updated_at"],
+            )
+
+        run.result_count = len(remaining)
+        run.save(update_fields=["result_count", "updated_at"])
+        MatchRevision.objects.create(
+            org=person.org,
+            match=match,
+            run=run,
+            revision=next_revision,
+            revision_kind=MatchRevisionKind.RETIREMENT,
+            snapshot=_match_revision_snapshot(match),
+            evidence_snapshot=_match_evidence_snapshot(match),
+            engine_version=match.engine_version,
+            scoring_policy_version=policy.version,
+            scoring_policy_checksum=policy.checksum,
+            dimension_weights=policy.dimension_weights,
+            component_weights=policy.component_weights,
+            evaluated_at=now,
+        )
+        for candidate in reranked:
+            MatchRevision.objects.create(
+                org=person.org,
+                match=candidate,
+                run=run,
+                revision=next_revision,
+                revision_kind=MatchRevisionKind.RERANK,
+                snapshot=_match_revision_snapshot(candidate),
+                evidence_snapshot=_match_evidence_snapshot(candidate),
+                engine_version=candidate.engine_version,
+                scoring_policy_version=policy.version,
+                scoring_policy_checksum=policy.checksum,
+                dimension_weights=policy.dimension_weights,
+                component_weights=policy.component_weights,
+                evaluated_at=now,
+            )
+        run_ids.append(run.id)
+    return tuple(run_ids)
+
+
+def _request_hash(
+    *, opportunity_id: UUID, person_ids: list[UUID] | None,
+    criteria_hash: str, policy_checksum: str
+) -> str:
     payload = json.dumps(
         {
             "opportunity_id": str(opportunity_id),
@@ -112,6 +348,8 @@ def _request_hash(*, opportunity_id: UUID, person_ids: list[UUID] | None) -> str
                 if person_ids is None
                 else [str(person_id) for person_id in person_ids]
             ),
+            "criteria_hash": criteria_hash,
+            "policy_checksum": policy_checksum,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -144,7 +382,11 @@ def enqueue_opportunity_recompute(
     if opportunity.org_id != org.id:
         raise RecomputeEnqueueError("Opportunity does not belong to this org.")
 
-    people = Person.objects.filter(org=org, status="active")
+    people = Person.objects.filter(
+        org=org,
+        status="active",
+        governance_status=PersonGovernanceStatus.ACTIVE,
+    )
     requested_ids = None
     if person_ids is not None:
         requested_ids = list(dict.fromkeys(person_ids))
@@ -163,9 +405,22 @@ def enqueue_opportunity_recompute(
             f"A recompute run cannot include more than {MAX_ASYNC_RECOMPUTE_PEOPLE} people."
         )
 
+    policy = resolve_policy_for_opportunity(opportunity)
     request_hash = _request_hash(
         opportunity_id=opportunity.id,
         person_ids=None if requested_ids is None else resolved_ids,
+        criteria_hash=hashlib.sha256(
+            json.dumps(
+                {
+                    "required": opportunity.required_criteria,
+                    "preferred": opportunity.preferred_criteria,
+                    "exclusions": opportunity.exclusion_criteria,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        policy_checksum=policy.checksum,
     )
     proposed_run_id = uuid.uuid4()
     enqueued = enqueue_job(
@@ -196,6 +451,10 @@ def enqueue_opportunity_recompute(
             "requested_person_ids": [str(person_id) for person_id in resolved_ids],
             "total_count": len(resolved_ids),
             "engine_version": ENGINE_VERSION,
+            "scoring_policy_version": policy.version,
+            "scoring_policy_checksum": policy.checksum,
+            "dimension_weights": policy.dimension_weights,
+            "component_weights": policy.component_weights,
         },
     )
     if run.request_hash != request_hash:
@@ -231,8 +490,32 @@ def execute_opportunity_recompute(
 ):
     """Execute one run while serializing ranking writes per opportunity."""
 
-    from matching.models import MatchOpportunityStatus, MatchRun
+    from matching.models import MatchOpportunityStatus
 
+    run_snapshot = (
+        MatchRun.objects
+        .filter(
+            org_id=org_id,
+            id=run_id,
+            opportunity_id=opportunity_id,
+            request_hash=request_hash,
+        )
+        .first()
+    )
+    if run_snapshot is None:
+        raise RecomputeTargetNotFound("The matching run no longer exists.")
+    if run_snapshot.completed_at is not None:
+        return _run_result(run_snapshot)
+
+    # All projection writers acquire this tenant mutex before lower-level row
+    # locks. Same-tenant writes are serialized while different tenants remain
+    # independent, avoiding deferred-FK lock cycles at transaction commit.
+    lock_matching_org(org_id)
+    locked_people = list(
+        Person.objects.select_for_update()
+        .filter(org_id=org_id, id__in=run_snapshot.requested_person_ids)
+        .order_by("id")
+    )
     opportunity = (
         MatchOpportunity.objects.select_for_update()
         .filter(org_id=org_id, id=opportunity_id)
@@ -275,13 +558,14 @@ def execute_opportunity_recompute(
         )
         return _run_result(run, reason=f"opportunity_{opportunity.status}")
 
-    people = Person.objects.filter(
-        org_id=org_id,
-        status="active",
-        id__in=run.requested_person_ids,
-    )
+    eligible_people = [
+        person
+        for person in locked_people
+        if person.status == PersonStatus.ACTIVE
+        and person.governance_status == PersonGovernanceStatus.ACTIVE
+    ]
     resolved_person_ids = {
-        str(person_id) for person_id in people.values_list("id", flat=True)
+        str(person.id) for person in eligible_people
     }
     if resolved_person_ids != set(run.requested_person_ids):
         raise RecomputeSnapshotChanged(
@@ -297,7 +581,10 @@ def execute_opportunity_recompute(
     matches = recompute_opportunity_matches(
         org=opportunity.org,
         opportunity=opportunity,
-        people=people,
+        people=Person.objects.filter(
+            org_id=org_id,
+            id__in=[person.id for person in eligible_people],
+        ),
         run=run,
         ranking_revision=next_revision,
         max_people=MAX_ASYNC_RECOMPUTE_PEOPLE,
@@ -318,7 +605,7 @@ def execute_opportunity_recompute(
     return _run_result(run)
 
 
-def evaluate_person(person, opportunity, evidence_items=None):
+def evaluate_person(person, opportunity, evidence_items=None, *, policy=None):
     """Return a reproducible assessment using only stored structured facts."""
 
     now = timezone.now()
@@ -328,7 +615,14 @@ def evaluate_person(person, opportunity, evidence_items=None):
                 org=person.org,
                 person=person,
                 observed_at__lte=now,
-            ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
+                provenance__confirmation_status=EvidenceConfirmationStatus.CONFIRMED,
+                provenance__processing_status=EvidenceProcessingStatus.ACTIVE,
+            )
+            .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
+            .filter(
+                Q(provenance__retention_until__isnull=True)
+                | Q(provenance__retention_until__gte=now)
+            )
         )
     else:
         evidence_items = [
@@ -336,6 +630,14 @@ def evaluate_person(person, opportunity, evidence_items=None):
             for item in evidence_items
             if item.observed_at <= now
             and (item.valid_until is None or item.valid_until >= now)
+            and hasattr(item, "provenance")
+            and item.provenance.confirmation_status
+            == EvidenceConfirmationStatus.CONFIRMED
+            and item.provenance.processing_status == EvidenceProcessingStatus.ACTIVE
+            and (
+                item.provenance.retention_until is None
+                or item.provenance.retention_until >= now
+            )
         ]
 
     candidate = {
@@ -356,7 +658,8 @@ def evaluate_person(person, opportunity, evidence_items=None):
     required = opportunity.required_criteria or {}
     preferred = opportunity.preferred_criteria or {}
     exclusions = opportunity.exclusion_criteria or {}
-    weights = opportunity.scoring_weights or {}
+    policy = policy or resolve_policy_for_opportunity(opportunity)
+    weights = policy.dimension_weights
 
     reasons = []
     gaps = []
@@ -488,13 +791,15 @@ def evaluate_person(person, opportunity, evidence_items=None):
         }.get(_text(person.availability), 40)
 
     exclusion_hit = any(item["matched_exclusions"] for item in breakdown.values())
+    components = {**DEFAULT_COMPONENT_WEIGHTS, **policy.component_weights}
+    component_total = sum(max(0.0, float(value)) for value in components.values()) or 1
     overall_score = (
-        0.50 * fit_score
-        + 0.15 * eligibility_score
-        + 0.15 * trust_score
-        + 0.10 * relationship_score
-        + 0.10 * availability_score
-    )
+        float(components["fit"]) * fit_score
+        + float(components["eligibility"]) * eligibility_score
+        + float(components["trust"]) * trust_score
+        + float(components["relationship"]) * relationship_score
+        + float(components["availability"]) * availability_score
+    ) / component_total
     if required_matched < required_total:
         overall_score = min(overall_score, 49)
     if exclusion_hit:
@@ -563,22 +868,47 @@ def recompute_opportunity_matches(
 
     if opportunity.org_id != org.id:
         raise ValueError("Opportunity does not belong to the requested org")
+    lock_matching_org(org.id)
+    queryset = (
+        Person.objects.filter(
+            org=org,
+            status="active",
+            governance_status=PersonGovernanceStatus.ACTIVE,
+        )
+        if people is None
+        else people.filter(
+            org=org,
+            status="active",
+            governance_status=PersonGovernanceStatus.ACTIVE,
+        )
+    )
+    people_list = list(
+        queryset.select_for_update()
+        .order_by("id")[: max_people + 1]
+    )
+    if len(people_list) > max_people:
+        raise ValueError(f"Recompute is limited to {max_people} people.")
     opportunity = MatchOpportunity.objects.select_for_update().get(
         org=org,
         id=opportunity.id,
     )
-    queryset = (
-        Person.objects.filter(org=org, status="active")
-        if people is None
-        else people.filter(org=org, status="active")
-    )
-    people_list = list(queryset.order_by("display_name", "id")[: max_people + 1])
-    if len(people_list) > max_people:
-        raise ValueError(f"Recompute is limited to {max_people} people.")
-    previous_ranks = dict(
-        Match.objects.filter(org=org, opportunity=opportunity).values_list(
-            "id", "rank"
+    if run is not None and run.dimension_weights and run.component_weights:
+        policy = PolicySelection(
+            run.scoring_policy_version,
+            run.scoring_policy_checksum,
+            dict(run.dimension_weights),
+            dict(run.component_weights),
         )
+    else:
+        policy = resolve_policy_for_opportunity(opportunity)
+    previous_ranks = dict(
+        Match.objects.filter(
+            org=org,
+            opportunity=opportunity,
+            projection_state=MatchProjectionState.CURRENT,
+            person__status=PersonStatus.ACTIVE,
+            person__governance_status=PersonGovernanceStatus.ACTIVE,
+        ).values_list("id", "rank")
     )
     evidence_by_person = {}
     now = timezone.now()
@@ -586,7 +916,14 @@ def recompute_opportunity_matches(
         org=org,
         person_id__in=[person.id for person in people_list],
         observed_at__lte=now,
-    ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
+        provenance__confirmation_status=EvidenceConfirmationStatus.CONFIRMED,
+        provenance__processing_status=EvidenceProcessingStatus.ACTIVE,
+    ).select_related("provenance").filter(
+        Q(valid_until__isnull=True) | Q(valid_until__gte=now)
+    ).filter(
+        Q(provenance__retention_until__isnull=True)
+        | Q(provenance__retention_until__gte=now)
+    )
     for evidence in evidence_queryset:
         evidence_by_person.setdefault(evidence.person_id, []).append(evidence)
 
@@ -597,10 +934,16 @@ def recompute_opportunity_matches(
             person,
             opportunity,
             evidence_by_person.get(person.id, []),
+            policy=policy,
         )
         defaults = dict(evaluation.defaults)
         if ranking_revision is not None:
             defaults["ranking_revision"] = ranking_revision
+        defaults["scoring_policy_version"] = policy.version
+        defaults["scoring_policy_checksum"] = policy.checksum
+        defaults["projection_state"] = MatchProjectionState.CURRENT
+        defaults["retired_at"] = None
+        defaults["retirement_reason"] = ""
         match, _ = Match.objects.update_or_create(
             org=org,
             person=person,
@@ -618,7 +961,13 @@ def recompute_opportunity_matches(
         evaluations[match.id] = evaluation
 
     globally_ranked = sorted(
-        Match.objects.filter(org=org, opportunity=opportunity).select_related("person"),
+        Match.objects.filter(
+            org=org,
+            opportunity=opportunity,
+            projection_state=MatchProjectionState.CURRENT,
+            person__status=PersonStatus.ACTIVE,
+            person__governance_status=PersonGovernanceStatus.ACTIVE,
+        ).select_related("person"),
         key=lambda item: (
             -item.overall_score,
             -float(item.confidence),
@@ -638,13 +987,18 @@ def recompute_opportunity_matches(
     update_fields = ["rank"]
     if ranking_revision is not None:
         update_fields.append("ranking_revision")
+    # Avoid transient unique-rank collisions during swaps and ensure a stale
+    # current projection for an ineligible Person never retains a global rank.
+    Match.objects.filter(
+        org=org,
+        opportunity=opportunity,
+        projection_state=MatchProjectionState.CURRENT,
+    ).update(rank=None)
     Match.objects.bulk_update(globally_ranked, update_fields)
     refreshed_ranks = {match.id: match.rank for match in globally_ranked}
     for match in matches:
         match.rank = refreshed_ranks[match.id]
     if run is not None:
-        from matching.models import MatchRevision, MatchRevisionKind
-
         reranked_ids = [
             match.id
             for match in revision_matches
@@ -691,22 +1045,13 @@ def recompute_opportunity_matches(
                 run=run,
                 revision=ranking_revision,
                 revision_kind=revision_kind,
-                snapshot={
-                    "status": match.status,
-                    "overall_score": match.overall_score,
-                    "eligibility_score": match.eligibility_score,
-                    "fit_score": match.fit_score,
-                    "trust_score": match.trust_score,
-                    "relationship_score": match.relationship_score,
-                    "availability_score": match.availability_score,
-                    "confidence": str(match.confidence),
-                    "rank": match.rank,
-                    "reasons": match.reasons,
-                    "gaps": match.gaps,
-                    "score_breakdown": match.score_breakdown,
-                },
+                snapshot=_match_revision_snapshot(match),
                 evidence_snapshot=evidence_snapshot,
                 engine_version=match.engine_version,
+                scoring_policy_version=policy.version,
+                scoring_policy_checksum=policy.checksum,
+                dimension_weights=policy.dimension_weights,
+                component_weights=policy.component_weights,
                 evaluated_at=match.evaluated_at,
             )
     return sorted(matches, key=lambda item: item.rank)

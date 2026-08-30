@@ -12,13 +12,30 @@ import pytest
 
 from cases.inbound.parser import ParsedEmail, parse_raw_email
 from cases.inbound.pipeline import ingest
+from cases.inbound.sns import (
+    SNSVerificationError,
+    _fetch_signing_cert,
+    confirm_subscription,
+)
 from cases.inbound.spam import should_drop
 from cases.inbound.threading import find_existing_case, short_case_id
-from cases.models import Case, EmailMessage, InboundMailbox
+from cases.models import (
+    Case,
+    EmailMessage,
+    InboundMailbox,
+    InboundMailboxWebhookRoute,
+)
 from common.models import Profile, User
 from contacts.models import Contact
 
 MAILBOXES_URL = "/api/cases/mailboxes/"
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:sdr-inbound-test"
+SNS_SIGNING_CERT_URL = (
+    "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-test.pem"
+)
+SNS_SUBSCRIBE_URL = (
+    "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&Token=test"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +125,7 @@ class TestParser:
             "Date: Sat, 9 May 2026 12:00:00 +0000\r\n"
             "Message-ID: <bounce@x>\r\n"
             "MIME-Version: 1.0\r\n"
-            'Content-Type: multipart/report; report-type=delivery-status; '
+            "Content-Type: multipart/report; report-type=delivery-status; "
             'boundary="b"\r\n'
             "\r\n"
             "--b\r\n"
@@ -133,7 +150,9 @@ class TestSpam:
         assert drop is False and reason == ""
 
     def test_drops_auto_submitted(self):
-        parsed = parse_raw_email(_raw_email(extra_headers="Auto-Submitted: auto-replied"))
+        parsed = parse_raw_email(
+            _raw_email(extra_headers="Auto-Submitted: auto-replied")
+        )
         drop, reason = should_drop(parsed)
         assert drop is True and reason == "auto_submitted"
 
@@ -186,21 +205,34 @@ class TestSpam:
 class TestThreading:
     def test_in_reply_to_match(self, admin_user, org_a):
         case = Case.objects.create(
-            name="Original", status="New", priority="Normal",
-            org=org_a, created_by=admin_user, external_thread_id="root@x",
+            name="Original",
+            status="New",
+            priority="Normal",
+            org=org_a,
+            created_by=admin_user,
+            external_thread_id="root@x",
         )
         EmailMessage.objects.create(
-            org=org_a, case=case, direction="inbound",
-            message_id="root@x", from_address="user@x.com",
+            org=org_a,
+            case=case,
+            direction="inbound",
+            message_id="root@x",
+            from_address="user@x.com",
             received_at=datetime.now(timezone.utc),
         )
-        parsed = parse_raw_email(_raw_email(message_id="<reply@x>", in_reply_to="<root@x>"))
+        parsed = parse_raw_email(
+            _raw_email(message_id="<reply@x>", in_reply_to="<root@x>")
+        )
         assert find_existing_case(parsed, org_a) == case
 
     def test_references_match(self, admin_user, org_a):
         case = Case.objects.create(
-            name="Original", status="New", priority="Normal",
-            org=org_a, created_by=admin_user, external_thread_id="root@x",
+            name="Original",
+            status="New",
+            priority="Normal",
+            org=org_a,
+            created_by=admin_user,
+            external_thread_id="root@x",
         )
         parsed = parse_raw_email(
             _raw_email(message_id="<reply@x>", references="<root@x> <other@x>")
@@ -213,8 +245,11 @@ class TestThreading:
 
     def test_subject_fallback(self, admin_user, org_a):
         case = Case.objects.create(
-            name="Original", status="New", priority="Normal",
-            org=org_a, created_by=admin_user,
+            name="Original",
+            status="New",
+            priority="Normal",
+            org=org_a,
+            created_by=admin_user,
         )
         prefix = short_case_id(case)
         parsed = parse_raw_email(
@@ -227,8 +262,11 @@ class TestThreading:
 
     def test_subject_only_no_brackets_no_match(self, admin_user, org_a):
         case = Case.objects.create(
-            name="Help", status="New", priority="Normal",
-            org=org_a, created_by=admin_user,
+            name="Help",
+            status="New",
+            priority="Normal",
+            org=org_a,
+            created_by=admin_user,
         )
         # Subject identical but no `[Case #...]` marker — must not match.
         parsed = parse_raw_email(_raw_email(message_id="<reply@x>", subject="Help"))
@@ -236,10 +274,16 @@ class TestThreading:
 
     def test_cross_org_isolation(self, admin_user, org_a, org_b):
         Case.objects.create(
-            name="org-a", status="New", priority="Normal",
-            org=org_a, created_by=admin_user, external_thread_id="x@x",
+            name="org-a",
+            status="New",
+            priority="Normal",
+            org=org_a,
+            created_by=admin_user,
+            external_thread_id="x@x",
         )
-        parsed = parse_raw_email(_raw_email(message_id="<reply@x>", in_reply_to="<x@x>"))
+        parsed = parse_raw_email(
+            _raw_email(message_id="<reply@x>", in_reply_to="<x@x>")
+        )
         # Looking up against org_b should miss
         assert find_existing_case(parsed, org_b) is None
 
@@ -284,7 +328,9 @@ class TestPipeline:
 
     def test_spam_dropped_no_case_created(self, org_a):
         mailbox = _make_mailbox(org_a)
-        parsed = parse_raw_email(_raw_email(extra_headers="Auto-Submitted: auto-replied"))
+        parsed = parse_raw_email(
+            _raw_email(extra_headers="Auto-Submitted: auto-replied")
+        )
         result = ingest(parsed, mailbox)
         assert result.dropped is True
         assert result.drop_reason == "auto_submitted"
@@ -393,9 +439,7 @@ class TestInboundActivityAndReopen:
         assert result.dropped is True
         from common.models import Activity
 
-        assert (
-            Activity.objects.filter(action="EMAIL_RECEIVED", org=org_a).count() == 0
-        )
+        assert Activity.objects.filter(action="EMAIL_RECEIVED", org=org_a).count() == 0
 
     def test_reply_within_window_reopens_closed_case(self, org_a):
         from common.models import Activity
@@ -517,8 +561,104 @@ class TestMailboxAPI:
         assert create.status_code == 201, create.content
         data = create.json()
         assert data["address"] == "support@acme.com"
-        # webhook_secret was auto-generated
-        assert data["webhook_secret"]
+        # Configuration status is visible, but credentials never round-trip.
+        assert data["webhook_secret_configured"] is True
+        assert "webhook_secret" not in data
+        assert "sns_topic_arn" not in data
+        assert data["sns_topic_bound"] is False
+
+    def test_admin_can_bind_valid_sns_topic_without_disclosing_arn(
+        self, admin_client, org_a
+    ):
+        response = admin_client.post(
+            MAILBOXES_URL,
+            {
+                "address": "sns@acme.com",
+                "provider": "ses",
+                "sns_topic_arn": SNS_TOPIC_ARN,
+            },
+            format="json",
+        )
+        assert response.status_code == 201, response.content
+        assert response.json()["sns_topic_bound"] is True
+        assert "sns_topic_arn" not in response.json()
+        assert (
+            InboundMailbox.objects.get(address="sns@acme.com").sns_topic_arn
+            == SNS_TOPIC_ARN
+        )
+
+        listed = admin_client.get(MAILBOXES_URL)
+        assert listed.status_code == 200
+        listed_mailbox = listed.json()["mailboxes"][0]
+        assert listed_mailbox["sns_topic_bound"] is True
+        assert listed_mailbox["webhook_secret_configured"] is True
+        assert "sns_topic_arn" not in listed_mailbox
+        assert "webhook_secret" not in listed_mailbox
+
+    def test_mailbox_update_accepts_secret_without_returning_it(
+        self, admin_client, org_a
+    ):
+        mailbox = _make_mailbox(org_a, webhook_secret="old-secret")
+        response = admin_client.put(
+            f"{MAILBOXES_URL}{mailbox.id}/",
+            {"webhook_secret": "replacement-secret"},
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        assert response.json()["webhook_secret_configured"] is True
+        assert "webhook_secret" not in response.json()
+        assert "sns_topic_arn" not in response.json()
+        mailbox.refresh_from_db()
+        assert mailbox.webhook_secret == "replacement-secret"
+
+    def test_admin_cannot_bind_malformed_sns_topic(self, admin_client, org_a):
+        response = admin_client.post(
+            MAILBOXES_URL,
+            {
+                "address": "bad-sns@acme.com",
+                "provider": "ses",
+                "sns_topic_arn": "arn:aws:s3:us-east-1:123456789012:not-sns",
+            },
+            format="json",
+        )
+        assert response.status_code == 400
+        assert (
+            InboundMailbox.objects.filter(address="bad-sns@acme.com").exists() is False
+        )
+
+    def test_sns_topic_cannot_be_bound_to_two_tenants(
+        self,
+        admin_client,
+        org_b_client,
+        org_a,
+        org_b,
+    ):
+        first = admin_client.post(
+            MAILBOXES_URL,
+            {
+                "address": "first@acme.com",
+                "provider": "ses",
+                "sns_topic_arn": SNS_TOPIC_ARN,
+            },
+            format="json",
+        )
+        assert first.status_code == 201, first.content
+
+        second = org_b_client.post(
+            MAILBOXES_URL,
+            {
+                "address": "second@beta.com",
+                "provider": "ses",
+                "sns_topic_arn": SNS_TOPIC_ARN,
+            },
+            format="json",
+        )
+        assert second.status_code == 400
+
+    def test_mailbox_save_creates_minimal_webhook_route(self, org_a):
+        mailbox = _make_mailbox(org_a)
+        route = InboundMailboxWebhookRoute.objects.get(mailbox_id=mailbox.id)
+        assert route.org_id == org_a.id
 
     def test_user_cannot_create(self, user_client, org_a):
         response = user_client.post(
@@ -528,13 +668,34 @@ class TestMailboxAPI:
         )
         assert response.status_code == 403
 
+    def test_user_cannot_list_or_read_mailbox_configuration(
+        self, user_client, org_a
+    ):
+        mailbox = _make_mailbox(
+            org_a,
+            address="admin-only@acme.com",
+            sns_topic_arn=SNS_TOPIC_ARN,
+        )
+
+        listed = user_client.get(MAILBOXES_URL)
+        detail = user_client.get(f"{MAILBOXES_URL}{mailbox.id}/")
+
+        assert listed.status_code == 403
+        assert detail.status_code == 403
+
     def test_unsupported_provider_returns_501(self, admin_client, org_a):
         # Mailgun isn't yet wired into the webhook, but the model accepts it.
         # Create a mailbox with provider=mailgun and verify the webhook 501s.
         mailbox = _make_mailbox(org_a, provider="mailgun")
         response = admin_client.post(
             f"/api/cases/inbound/{mailbox.id}/",
-            {"Type": "Notification", "Message": "x", "Signature": "x", "SigningCertURL": "x", "SignatureVersion": "1"},
+            {
+                "Type": "Notification",
+                "Message": "x",
+                "Signature": "x",
+                "SigningCertURL": "x",
+                "SignatureVersion": "1",
+            },
             format="json",
         )
         assert response.status_code == 501
@@ -561,34 +722,42 @@ class TestMailboxAPI:
 
 @pytest.mark.django_db
 class TestWebhook:
-    def test_subscription_confirmation_calls_subscribe(self, admin_client, org_a):
-        mailbox = _make_mailbox(org_a)
+    def test_subscription_confirmation_calls_subscribe(
+        self, unauthenticated_client, org_a
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
         with (
             patch("cases.inbound_views.verify_sns_message") as verify,
             patch("cases.inbound_views.confirm_subscription") as confirm,
         ):
             verify.return_value = None
             confirm.return_value = None
-            response = admin_client.post(
+            response = unauthenticated_client.post(
                 f"/api/cases/inbound/{mailbox.id}/",
-                {"Type": "SubscriptionConfirmation", "SubscribeURL": "https://x"},
+                {
+                    "Type": "SubscriptionConfirmation",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SubscribeURL": SNS_SUBSCRIBE_URL,
+                },
                 format="json",
             )
         assert response.status_code == 200
         assert confirm.called is True
 
-    def test_notification_routes_through_pipeline(self, admin_client, org_a):
-        mailbox = _make_mailbox(org_a)
+    def test_notification_routes_through_pipeline(self, unauthenticated_client, org_a):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
         raw = _raw_email()
         with patch("cases.inbound_views.verify_sns_message") as verify:
             verify.return_value = None
-            response = admin_client.post(
+            response = unauthenticated_client.post(
                 f"/api/cases/inbound/{mailbox.id}/",
                 {
                     "Type": "Notification",
+                    "TopicArn": SNS_TOPIC_ARN,
                     "Message": raw,
                     "Signature": "x",
-                    "SigningCertURL": "x",
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
                     "SignatureVersion": "1",
                 },
                 format="json",
@@ -598,15 +767,253 @@ class TestWebhook:
         assert body["created_case"] is True
         assert body["dropped"] is False
 
-    def test_signature_failure_403(self, admin_client, org_a):
-        from cases.inbound.sns import SNSVerificationError
-
-        mailbox = _make_mailbox(org_a)
+    def test_signature_failure_403(self, unauthenticated_client, org_a):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
         with patch("cases.inbound_views.verify_sns_message") as verify:
             verify.side_effect = SNSVerificationError("nope")
-            response = admin_client.post(
+            response = unauthenticated_client.post(
                 f"/api/cases/inbound/{mailbox.id}/",
-                {"Type": "Notification", "Message": "x", "Signature": "x", "SigningCertURL": "x", "SignatureVersion": "1"},
+                {
+                    "Type": "Notification",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "Message": "x",
+                    "Signature": "x",
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SignatureVersion": "1",
+                },
                 format="json",
             )
         assert response.status_code == 403
+
+    def test_verification_failure_does_not_log_topic_url_or_token(
+        self, unauthenticated_client, org_a, caplog
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
+        sensitive = f"{SNS_TOPIC_ARN} {SNS_SUBSCRIBE_URL} private-token"
+        with patch("cases.inbound_views.verify_sns_message") as verify:
+            verify.side_effect = SNSVerificationError(sensitive)
+            response = unauthenticated_client.post(
+                f"/api/cases/inbound/{mailbox.id}/",
+                {
+                    "Type": "SubscriptionConfirmation",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "Message": "confirm",
+                    "MessageId": "message-id",
+                    "Timestamp": "2026-05-09T12:00:00.000Z",
+                    "Token": "private-token",
+                    "Signature": "x",
+                    "SignatureVersion": "1",
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SubscribeURL": SNS_SUBSCRIBE_URL,
+                },
+                format="json",
+            )
+        assert response.status_code == 403
+        assert SNS_TOPIC_ARN not in caplog.text
+        assert SNS_SUBSCRIBE_URL not in caplog.text
+        assert "private-token" not in caplog.text
+
+    def test_unbound_mailbox_never_confirms_subscription(
+        self, unauthenticated_client, org_a
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn="")
+        with (
+            patch("cases.inbound_views.verify_sns_message") as verify,
+            patch("cases.inbound_views.confirm_subscription") as confirm,
+        ):
+            response = unauthenticated_client.post(
+                f"/api/cases/inbound/{mailbox.id}/",
+                {
+                    "Type": "SubscriptionConfirmation",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SubscribeURL": SNS_SUBSCRIBE_URL,
+                },
+                format="json",
+            )
+        assert response.status_code == 403
+        verify.assert_not_called()
+        confirm.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "topic_arn",
+        [
+            "arn:aws:sns:us-east-1:123456789012:other-topic",
+            "arn:aws:sns:us-east-1:999999999999:sdr-inbound-test",
+            "arn:aws:sns:eu-west-1:123456789012:sdr-inbound-test",
+        ],
+    )
+    def test_subscription_topic_account_and_region_must_match_mailbox(
+        self, unauthenticated_client, org_a, topic_arn
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
+        with (
+            patch("cases.inbound_views.verify_sns_message") as verify,
+            patch("cases.inbound_views.confirm_subscription") as confirm,
+        ):
+            response = unauthenticated_client.post(
+                f"/api/cases/inbound/{mailbox.id}/",
+                {
+                    "Type": "SubscriptionConfirmation",
+                    "TopicArn": topic_arn,
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SubscribeURL": SNS_SUBSCRIBE_URL,
+                },
+                format="json",
+            )
+        assert response.status_code == 403
+        verify.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_bound_topic_rejects_signing_host_from_other_region(
+        self, unauthenticated_client, org_a
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
+        with patch("cases.inbound_views.verify_sns_message") as verify:
+            response = unauthenticated_client.post(
+                f"/api/cases/inbound/{mailbox.id}/",
+                {
+                    "Type": "Notification",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "Message": _raw_email(),
+                    "SigningCertURL": (
+                        "https://sns.eu-west-1.amazonaws.com/"
+                        "SimpleNotificationService-test.pem"
+                    ),
+                },
+                format="json",
+            )
+        assert response.status_code == 403
+        verify.assert_not_called()
+
+    def test_subscription_rejects_subscribe_url_from_other_region(
+        self, unauthenticated_client, org_a
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
+        with (
+            patch("cases.inbound_views.verify_sns_message") as verify,
+            patch("cases.inbound_views.confirm_subscription") as confirm,
+        ):
+            response = unauthenticated_client.post(
+                f"/api/cases/inbound/{mailbox.id}/",
+                {
+                    "Type": "SubscriptionConfirmation",
+                    "TopicArn": SNS_TOPIC_ARN,
+                    "SigningCertURL": SNS_SIGNING_CERT_URL,
+                    "SubscribeURL": (
+                        "https://sns.eu-west-1.amazonaws.com/"
+                        "?Action=ConfirmSubscription&Token=private-token"
+                    ),
+                },
+                format="json",
+            )
+        assert response.status_code == 403
+        verify.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_mismatched_bootstrap_org_fails_closed(
+        self, unauthenticated_client, org_a, org_b
+    ):
+        mailbox = _make_mailbox(org_a, sns_topic_arn=SNS_TOPIC_ARN)
+        InboundMailboxWebhookRoute.objects.filter(mailbox_id=mailbox.id).update(
+            org_id=org_b.id
+        )
+        response = unauthenticated_client.post(
+            f"/api/cases/inbound/{mailbox.id}/",
+            {"Type": "Notification"},
+            format="json",
+        )
+        assert response.status_code == 404
+
+
+def test_confirm_subscription_normalizes_fetch_error_without_logging_url(caplog):
+    def failing_fetch(url, *, timeout):
+        raise RuntimeError(url)
+
+    payload = {
+        "Type": "SubscriptionConfirmation",
+        "TopicArn": SNS_TOPIC_ARN,
+        "SigningCertURL": SNS_SIGNING_CERT_URL,
+        "SubscribeURL": SNS_SUBSCRIBE_URL,
+    }
+    with pytest.raises(
+        SNSVerificationError,
+        match="SNS subscription confirmation failed",
+    ):
+        confirm_subscription(
+            payload,
+            expected_topic_arn=SNS_TOPIC_ARN,
+            fetch=failing_fetch,
+        )
+
+    assert SNS_SUBSCRIBE_URL not in caplog.text
+    assert "Token=test" not in caplog.text
+
+
+def test_confirm_subscription_without_expected_topic_fails_closed():
+    payload = {
+        "Type": "SubscriptionConfirmation",
+        "TopicArn": SNS_TOPIC_ARN,
+        "SigningCertURL": SNS_SIGNING_CERT_URL,
+        "SubscribeURL": SNS_SUBSCRIBE_URL,
+    }
+    with pytest.raises(
+        SNSVerificationError,
+        match="Expected SNS topic binding is required",
+    ):
+        confirm_subscription(payload)
+
+
+class _FetchedResponse:
+    def __init__(self, final_url, body=b"response"):
+        self.final_url = final_url
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def geturl(self):
+        return self.final_url
+
+    def read(self):
+        return self.body
+
+
+def test_subscription_confirmation_rejects_redirected_final_url():
+    payload = {
+        "Type": "SubscriptionConfirmation",
+        "TopicArn": SNS_TOPIC_ARN,
+        "SigningCertURL": SNS_SIGNING_CERT_URL,
+        "SubscribeURL": SNS_SUBSCRIBE_URL,
+    }
+
+    with pytest.raises(
+        SNSVerificationError,
+        match="SNS subscription confirmation failed",
+    ):
+        confirm_subscription(
+            payload,
+            expected_topic_arn=SNS_TOPIC_ARN,
+            fetch=lambda *args, **kwargs: _FetchedResponse(
+                "http://127.0.0.1/latest/meta-data/"
+            ),
+        )
+
+
+def test_signing_certificate_rejects_redirected_final_url(monkeypatch):
+    monkeypatch.setattr(
+        "cases.inbound.sns._open_without_redirects",
+        lambda *args, **kwargs: _FetchedResponse(
+            "http://127.0.0.1/latest/meta-data/",
+            body=b"not-a-certificate",
+        ),
+    )
+
+    with pytest.raises(
+        SNSVerificationError,
+        match="Signing certificate URL changed during fetch",
+    ):
+        _fetch_signing_cert(SNS_SIGNING_CERT_URL)

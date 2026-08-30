@@ -1,5 +1,6 @@
 """Django application services for durable SDR intake processing."""
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -12,7 +13,7 @@ from django.utils import timezone
 from sdr.adapters import DjangoCRMWriter, DjangoLeadDeduplicator
 from sdr.application import LeadIntakePipeline
 from sdr.compliance import ensure_intake_provenance, intake_data_restriction
-from sdr.domain import LeadCandidate
+from sdr.domain import LeadCandidate, LeadSource
 from sdr.intelligence.service import LeadInspector
 from sdr.models import LeadIntake, LeadIntakeStatus, LeadLifecycleEventType
 from sdr.nurture import auto_enroll_intake
@@ -286,6 +287,13 @@ def _claim_intake(*, candidate: LeadCandidate, raw_payload: Mapping[str, Any]):
 
 
 def _normalized_payload(lead_id: UUID, candidate: LeadCandidate) -> dict[str, Any]:
+    attributes = dict(candidate.attributes)
+    if candidate.source == LeadSource.EMAIL:
+        message = str(attributes.pop("message", "") or "")
+        attributes["message_summary"] = {
+            "body_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            "body_character_count": len(message),
+        }
     return {
         "lead_id": str(lead_id),
         "source": candidate.source.value,
@@ -303,7 +311,7 @@ def _normalized_payload(lead_id: UUID, candidate: LeadCandidate) -> dict[str, An
             "industry": candidate.company.industry,
             "country": candidate.company.country,
         },
-        "attributes": dict(candidate.attributes),
+        "attributes": attributes,
     }
 
 

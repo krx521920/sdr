@@ -17,6 +17,7 @@ def middleware():
         "/api/sdr/public/nurture/open/signed-token/pixel.gif",
         "/api/sdr/public/nurture/click/signed-token/",
         "/api/sdr/public/nurture/unsubscribe/signed-token/",
+        "/api/cases/inbound/12345678-1234-4234-8234-123456789abc/",
     ],
 )
 def test_signed_public_sdr_routes_are_org_exempt(middleware, path):
@@ -31,6 +32,10 @@ def test_signed_public_sdr_routes_are_org_exempt(middleware, path):
         "/api/sdr/public/nurture/",
         "/api/sdr/public/nurture/open-adjacent/signed-token/",
         "/api/sdr/nurture/sequences/",
+        "/api/cases/inbound/",
+        "/api/cases/inbound/not-a-uuid/",
+        "/api/cases/inbound/12345678-1234-4234-8234-123456789abc/extra/",
+        "/api/cases/inbound-adjacent/12345678-1234-4234-8234-123456789abc/",
     ],
 )
 def test_other_sdr_routes_still_require_org_context(middleware, path):

@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 import pytest
+from django.core.exceptions import ValidationError
 from django.test import override_settings
 from django.utils import timezone
 
@@ -111,6 +112,7 @@ def test_provenance_is_explicit_and_never_infers_a_lawful_basis(org_a):
         "whatsapp",
         "linkedin",
         "phone",
+        "wechat",
     }
     assert SDRComplianceEvent.objects.filter(
         org=org_a, event_type="provenance_recorded"
@@ -360,6 +362,102 @@ def test_deletion_lifecycle_blocks_contact_with_enforcement_disabled(org_a):
     assert provenance.status == SDRProvenanceStatus.ANONYMIZED
     assert decision.allowed is False
     assert decision.code == "data_anonymized"
+
+
+@pytest.mark.django_db
+def test_wechat_identifier_is_normalized_and_dnc_is_enforced(org_a):
+    entry, created = block_contact(
+        org_id=org_a.id,
+        channel="wechat",
+        identifier="  Ada_Lovelace-7  ",
+        reason=SDRDoNotContactReason.DATA_REQUEST,
+        source=SDRDoNotContactSource.DATA_SUBJECT,
+    )
+
+    decision = evaluate_contact(
+        org_id=org_a.id,
+        channel="wechat",
+        identifier="ADA_LOVELACE-7",
+        event_key="wechat:dnc:test",
+    )
+
+    assert created is True
+    assert entry.identifier == "ada_lovelace-7"
+    assert decision.allowed is False
+    assert decision.code == "do_not_contact"
+    event = SDRComplianceEvent.objects.get(
+        event_key="contact:wechat:dnc:test:do_not_contact"
+    )
+    assert "identifier" not in event.snapshot
+    assert event.snapshot["identifier_hash"] == entry.identifier_hash
+
+
+@pytest.mark.django_db
+def test_portable_governance_context_is_fail_closed_and_supports_consent(org_a):
+    SDRComplianceSettings.objects.create(
+        org=org_a,
+        enforcement_enabled=True,
+        require_lawful_basis=True,
+    )
+    SDRChannelComplianceRule.objects.create(
+        org=org_a,
+        country_code="CN",
+        channel="wechat",
+        requires_consent=True,
+    )
+
+    restricted = evaluate_contact(
+        org_id=org_a.id,
+        channel="wechat",
+        identifier="not-valid",
+        governance={
+            "lawful_basis": "consent",
+            "notes": "",
+            "consent": {},
+            "country": "CN",
+            "allowed_channels": ["wechat"],
+            "processing_status": "restricted",
+        },
+        event_key="governance:restricted",
+    )
+    allowed = evaluate_contact(
+        org_id=org_a.id,
+        channel="wechat",
+        identifier="ada_lovelace-7",
+        governance={
+            "lawful_basis": "consent",
+            "notes": "",
+            "consent": {
+                "granted": True,
+                "recorded_at": timezone.now().isoformat(),
+                "evidence_reference": "consent-receipt-42",
+            },
+            "country": "CN",
+            "allowed_channels": ["wechat"],
+            "processing_status": "active",
+        },
+    )
+
+    assert restricted.code == "data_processing_restricted"
+    assert allowed.allowed is True
+
+
+@pytest.mark.django_db
+def test_compliance_events_are_append_only_in_application_code(org_a):
+    event = SDRComplianceEvent.objects.create(
+        org=org_a,
+        event_type="contact_blocked",
+        event_key="append-only:test",
+        reason="Original fact",
+    )
+
+    event.reason = "Mutated fact"
+    with pytest.raises(ValidationError, match="cannot be updated"):
+        event.save()
+    with pytest.raises(ValidationError, match="cannot be updated"):
+        SDRComplianceEvent.objects.filter(id=event.id).update(reason="Mutated")
+    with pytest.raises(ValidationError, match="cannot be deleted"):
+        event.delete()
 
 
 @pytest.mark.django_db

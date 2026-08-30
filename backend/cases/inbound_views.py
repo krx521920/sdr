@@ -1,8 +1,8 @@
 """Inbound email webhook + admin mailbox CRUD endpoints.
 
 The webhook is intentionally public (no auth). All trust is anchored on the
-SNS signature verification: an attacker who can't sign a message with the AWS
-SNS signing cert can't get past `verify_sns_message`.
+minimal mailbox-to-tenant bootstrap, the mailbox's exact SNS Topic ARN, and
+SNS signature verification.
 """
 
 from __future__ import annotations
@@ -11,23 +11,25 @@ import json
 import logging
 import secrets
 
+from django.db import IntegrityError, transaction
 from drf_spectacular.utils import extend_schema, inline_serializer
 from rest_framework import serializers, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from automation.tenant_context import database_org_context
 from cases.inbound.parser import parse_raw_email
 from cases.inbound.pipeline import ingest
 from cases.inbound.sns import (
     SNSVerificationError,
     confirm_subscription,
+    validate_sns_topic_binding,
     verify_sns_message,
 )
-from cases.models import InboundMailbox
+from cases.models import InboundMailbox, InboundMailboxWebhookRoute
 from cases.serializer import InboundMailboxSerializer
 from common.permissions import HasOrgContext
-from common.tasks import set_rls_context
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,10 @@ def _admin_required():
 class InboundMailboxWebhookView(APIView):
     """Public endpoint where AWS SNS POSTs for one configured mailbox.
 
-    URL: `/api/cases/inbound/<mailbox_id>/`. The mailbox lookup also acts as
-    the org boundary — the URL embeds the per-mailbox UUID so the webhook
-    can't be confused for one belonging to a different tenant.
+    URL: `/api/cases/inbound/<mailbox_id>/`. A minimal non-RLS route resolves
+    the opaque mailbox UUID to an org.  The actual mailbox is then reloaded
+    under forced RLS, and its exact SNS topic/account/region binding is checked
+    before any subscription confirmation or message ingestion.
     """
 
     authentication_classes = ()
@@ -65,37 +68,58 @@ class InboundMailboxWebhookView(APIView):
                 "SigningCertURL": serializers.CharField(),
             },
         ),
-        responses={200: inline_serializer(
-            name="InboundWebhookResponse",
-            fields={
-                "ok": serializers.BooleanField(),
-                "case_id": serializers.CharField(allow_null=True, required=False),
-                "dropped": serializers.BooleanField(required=False),
-                "reason": serializers.CharField(required=False),
-            },
-        )},
+        responses={
+            200: inline_serializer(
+                name="InboundWebhookResponse",
+                fields={
+                    "ok": serializers.BooleanField(),
+                    "case_id": serializers.CharField(allow_null=True, required=False),
+                    "dropped": serializers.BooleanField(required=False),
+                    "reason": serializers.CharField(required=False),
+                },
+            )
+        },
     )
     def post(self, request, mailbox_id, *args, **kwargs):
-        mailbox = (
-            InboundMailbox.objects.filter(pk=mailbox_id, is_active=True)
-            .select_related("org")
+        route = (
+            InboundMailboxWebhookRoute.objects.filter(mailbox_id=mailbox_id)
+            .only("mailbox_id", "org_id")
             .first()
         )
-        if mailbox is None:
-            # Don't leak which UUIDs exist; return a generic 404.
-            return Response(
-                {"error": True, "errors": "Mailbox not found"},
-                status=status.HTTP_404_NOT_FOUND,
+        if route is None:
+            return self._mailbox_not_found()
+
+        with database_org_context(route.org_id):
+            mailbox = (
+                InboundMailbox.objects.filter(
+                    pk=route.mailbox_id,
+                    org_id=route.org_id,
+                    is_active=True,
+                )
+                .select_related("org")
+                .first()
             )
+            if mailbox is None:
+                # A missing, inactive, or mismatched scoped row is deliberately
+                # indistinguishable from an unknown opaque mailbox UUID.
+                return self._mailbox_not_found()
+            return self._post_for_mailbox(request, mailbox)
 
-        # The webhook bypasses RLSContextMiddleware, so set it manually before
-        # any ORM read/write touches an org-scoped table.
-        set_rls_context(mailbox.org_id)
+    @staticmethod
+    def _mailbox_not_found():
+        return Response(
+            {"error": True, "errors": "Mailbox not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
+    def _post_for_mailbox(self, request, mailbox):
         if mailbox.provider != "ses":
             # Other providers wired into the same URL space land here.
             return Response(
-                {"error": True, "errors": f"Provider {mailbox.provider!r} not yet supported"},
+                {
+                    "error": True,
+                    "errors": f"Provider {mailbox.provider!r} not yet supported",
+                },
                 status=status.HTTP_501_NOT_IMPLEMENTED,
             )
 
@@ -113,11 +137,17 @@ class InboundMailboxWebhookView(APIView):
             )
 
         try:
+            # A valid AWS signature alone is insufficient: any AWS customer
+            # can create a signed SNS topic.  Bind the signed fields to this
+            # mailbox's configured topic, account, partition, and region before
+            # fetching a certificate or following a confirmation URL.
+            validate_sns_topic_binding(payload, mailbox.sns_topic_arn)
             verify_sns_message(payload)
-        except SNSVerificationError as exc:
-            logger.warning(
-                "SNS verification failed for mailbox=%s: %s", mailbox.id, exc
-            )
+        except SNSVerificationError:
+            # Do not log the exception text: network/parsing exceptions can
+            # contain signed URLs, and subscription URLs contain a bearer-like
+            # confirmation token.
+            logger.warning("SNS verification failed for mailbox=%s", mailbox.id)
             return Response(
                 {"error": True, "errors": "Signature verification failed"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -126,9 +156,17 @@ class InboundMailboxWebhookView(APIView):
         msg_type = payload.get("Type")
         if msg_type == "SubscriptionConfirmation":
             try:
-                confirm_subscription(payload)
-            except Exception:
-                logger.exception("SNS subscription confirmation failed")
+                confirm_subscription(
+                    payload,
+                    expected_topic_arn=mailbox.sns_topic_arn,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "SNS subscription confirmation failed for mailbox=%s "
+                    "error_type=%s",
+                    mailbox.id,
+                    type(exc).__name__,
+                )
                 return Response(
                     {"error": True, "errors": "SubscribeURL fetch failed"},
                     status=status.HTTP_502_BAD_GATEWAY,
@@ -181,8 +219,12 @@ class InboundMailboxWebhookView(APIView):
 class InboundMailboxListCreateView(APIView):
     permission_classes = (IsAuthenticated, HasOrgContext)
 
-    @extend_schema(tags=["InboundEmail"], responses={200: InboundMailboxSerializer(many=True)})
+    @extend_schema(
+        tags=["InboundEmail"], responses={200: InboundMailboxSerializer(many=True)}
+    )
     def get(self, request, *args, **kwargs):
+        if not _is_admin(request.profile):
+            return _admin_required()
         org = request.profile.org
         qs = InboundMailbox.objects.filter(org=org).order_by("address")
         return Response({"mailboxes": InboundMailboxSerializer(qs, many=True).data})
@@ -206,7 +248,17 @@ class InboundMailboxListCreateView(APIView):
                 {"error": True, "errors": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        serializer.save(org=org)
+        try:
+            with transaction.atomic():
+                serializer.save(org=org)
+        except IntegrityError:
+            return Response(
+                {
+                    "error": True,
+                    "errors": "Mailbox address or SNS topic binding already exists",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -218,6 +270,8 @@ class InboundMailboxDetailView(APIView):
 
     @extend_schema(tags=["InboundEmail"], responses={200: InboundMailboxSerializer})
     def get(self, request, pk, *args, **kwargs):
+        if not _is_admin(request.profile):
+            return _admin_required()
         obj = self._get_object(pk, request.profile.org)
         if not obj:
             return Response(
@@ -249,7 +303,17 @@ class InboundMailboxDetailView(APIView):
                 {"error": True, "errors": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        serializer.save()
+        try:
+            with transaction.atomic():
+                serializer.save()
+        except IntegrityError:
+            return Response(
+                {
+                    "error": True,
+                    "errors": "Mailbox address or SNS topic binding already exists",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(serializer.data)
 
     @extend_schema(

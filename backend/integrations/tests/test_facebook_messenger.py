@@ -19,13 +19,16 @@ from integrations.providers.facebook.client import FacebookGraphAPIError
 from integrations.providers.facebook.messenger import (
     FACEBOOK_MESSENGER_JOB,
     FACEBOOK_MESSENGER_REPLY_JOB,
+    FacebookMessengerReplyUnavailable,
     FacebookMessengerUnavailable,
     enqueue_facebook_message_event,
+    enqueue_manual_facebook_reply,
     process_facebook_messenger_job,
     process_facebook_messenger_reply_job,
 )
 from integrations.providers.facebook.service import connect_facebook_page
 from leads.models import Lead
+from sdr.compliance import anonymize_intake, request_intake_deletion
 from sdr.models import LeadIntake, LeadLifecycleEvent
 
 from .test_facebook_service import FakeGraphClient
@@ -109,15 +112,153 @@ def test_first_message_creates_lead_and_follow_up_updates_same_conversation(
     assert intake.source_record_id == "page-42:psid-7"
     assert "enterprise sales workflow" in intake.crm_lead.description
     assert "80 sales representatives" in intake.crm_lead.description
-    assert FacebookMessengerMessage.objects.filter(
-        status=FacebookMessengerMessageStatus.PROCESSED,
-        intake=intake,
-    ).count() == 2
-    assert LeadLifecycleEvent.objects.filter(
-        intake=intake,
-        event_type="channel_message_received",
-    ).count() == 1
+    assert (
+        FacebookMessengerMessage.objects.filter(
+            status=FacebookMessengerMessageStatus.PROCESSED,
+            intake=intake,
+        ).count()
+        == 2
+    )
+    assert (
+        LeadLifecycleEvent.objects.filter(
+            intake=intake,
+            event_type="channel_message_received",
+        ).count()
+        == 1
+    )
     assert FacebookPageConnection.objects.get().last_message_at is not None
+
+
+@pytest.mark.django_db
+@override_settings(ROOT_URLCONF="integrations.tests.urls")
+def test_deletion_blocks_enqueue_worker_and_inbound_follow_up(
+    org_a,
+    admin_client,
+    admin_profile,
+    monkeypatch,
+):
+    enable_messenger(org_a)
+    monkeypatch.setattr(
+        "integrations.providers.facebook.messenger.dispatch_job",
+        lambda job: None,
+    )
+    first = enqueue_facebook_message_event(
+        event("mid.delete-first", "Original request")
+    )
+    process_facebook_messenger_job(
+        {"org_id": str(org_a.id), "message_id": str(first.message_id)}
+    )
+    intake = LeadIntake.objects.get(source="facebook_messenger")
+    queued = enqueue_manual_facebook_reply(
+        intake=intake,
+        body="This was queued before the deletion request.",
+        client_request_id=uuid4(),
+        created_by_id=admin_profile.user_id,
+    )
+    description_before = intake.crm_lead.description
+
+    request_intake_deletion(intake)
+
+    with pytest.raises(FacebookMessengerReplyUnavailable) as exc_info:
+        enqueue_manual_facebook_reply(
+            intake=intake,
+            body="This must never be persisted.",
+            client_request_id=uuid4(),
+            created_by_id=admin_profile.user_id,
+        )
+    assert exc_info.value.code == "data_deletion_requested"
+    assert not FacebookMessengerReply.objects.filter(
+        body="This must never be persisted."
+    ).exists()
+
+    provider_calls = []
+    monkeypatch.setattr(
+        "integrations.providers.facebook.messenger.graph_client",
+        lambda: type(
+            "ForbiddenReplyClient",
+            (),
+            {
+                "send_text_message": lambda self, **kwargs: provider_calls.append(
+                    kwargs
+                ),
+            },
+        )(),
+    )
+    worker_result = process_facebook_messenger_reply_job(
+        {"org_id": str(org_a.id), "reply_id": str(queued.reply_id)}
+    )
+    assert worker_result["status"] == FacebookMessengerReplyStatus.SKIPPED
+    assert provider_calls == []
+
+    follow_up = enqueue_facebook_message_event(
+        event("mid.delete-follow-up", "Private text after deletion")
+    )
+    inbound_result = process_facebook_messenger_job(
+        {"org_id": str(org_a.id), "message_id": str(follow_up.message_id)}
+    )
+    restricted_message = FacebookMessengerMessage.objects.get(id=follow_up.message_id)
+    intake.crm_lead.refresh_from_db()
+    assert inbound_result["status"] == FacebookMessengerMessageStatus.IGNORED
+    assert inbound_result["error_code"] == "data_deletion_requested"
+    assert restricted_message.body == ""
+    assert restricted_message.attachment_types == []
+    assert intake.crm_lead.description == description_before
+
+    conversation = admin_client.get(
+        f"/api/integrations/facebook/conversations/leads/{intake.crm_lead_id}/"
+    )
+    assert conversation.status_code == 200
+    assert conversation.json()["can_reply"] is False
+    assert conversation.json()["reply_unavailable_reason"] == "data_deletion_requested"
+
+
+@pytest.mark.django_db
+def test_anonymize_clears_facebook_messenger_message_and_reply_data(
+    org_a,
+    admin_profile,
+    monkeypatch,
+):
+    enable_messenger(org_a)
+    monkeypatch.setattr(
+        "integrations.providers.facebook.messenger.dispatch_job",
+        lambda job: None,
+    )
+    accepted = enqueue_facebook_message_event(
+        event("mid.erase", "Erase this private conversation")
+    )
+    process_facebook_messenger_job(
+        {"org_id": str(org_a.id), "message_id": str(accepted.message_id)}
+    )
+    intake = LeadIntake.objects.get(source="facebook_messenger")
+    reply_acceptance = enqueue_manual_facebook_reply(
+        intake=intake,
+        body="Erase this private reply",
+        client_request_id=uuid4(),
+        created_by_id=admin_profile.user_id,
+    )
+    reply = FacebookMessengerReply.objects.get(id=reply_acceptance.reply_id)
+    reply.provider_message_id = "mid.provider-private"
+    reply.error_message = "private provider diagnostic"
+    reply.save(update_fields=["provider_message_id", "error_message", "updated_at"])
+    message = FacebookMessengerMessage.objects.get(id=accepted.message_id)
+    message.error_message = "private inbound diagnostic"
+    message.save(update_fields=["error_message", "updated_at"])
+
+    anonymize_intake(intake)
+
+    message.refresh_from_db()
+    reply.refresh_from_db()
+    assert message.page_id == ""
+    assert message.sender_psid.startswith("redacted:")
+    assert message.message_id.startswith("redacted:")
+    assert message.body == ""
+    assert message.attachment_types == []
+    assert message.error_message == ""
+    assert reply.page_id == ""
+    assert reply.recipient_psid.startswith("redacted:")
+    assert reply.body == ""
+    assert reply.provider_message_id == ""
+    assert reply.error_message == ""
 
 
 @pytest.mark.django_db
@@ -281,12 +422,18 @@ def test_assigned_sales_reads_conversation_and_sends_idempotent_manual_reply(
     request_id = uuid4()
     first = user_client.post(
         url,
-        {"client_request_id": str(request_id), "body": "Absolutely. What scale do you need?"},
+        {
+            "client_request_id": str(request_id),
+            "body": "Absolutely. What scale do you need?",
+        },
         format="json",
     )
     replay = user_client.post(
         url,
-        {"client_request_id": str(request_id), "body": "Absolutely. What scale do you need?"},
+        {
+            "client_request_id": str(request_id),
+            "body": "Absolutely. What scale do you need?",
+        },
         format="json",
     )
     conflict = user_client.post(
@@ -300,13 +447,14 @@ def test_assigned_sales_reads_conversation_and_sends_idempotent_manual_reply(
     assert replay.json()["replayed"] is True
     assert conflict.status_code == 400
     assert conflict.json()["code"] == "idempotency_conflict"
-    reply = FacebookMessengerReply.objects.get(
-        kind=FacebookMessengerReplyKind.MANUAL
-    )
+    reply = FacebookMessengerReply.objects.get(kind=FacebookMessengerReplyKind.MANUAL)
     assert reply.created_by_id == user_profile.user_id
-    assert FacebookMessengerReply.objects.filter(
-        kind=FacebookMessengerReplyKind.MANUAL
-    ).count() == 1
+    assert (
+        FacebookMessengerReply.objects.filter(
+            kind=FacebookMessengerReplyKind.MANUAL
+        ).count()
+        == 1
+    )
     assert AutomationJob.objects.filter(name=FACEBOOK_MESSENGER_REPLY_JOB).count() == 1
 
     sent = []
@@ -332,7 +480,9 @@ def test_assigned_sales_reads_conversation_and_sends_idempotent_manual_reply(
     assert len(sent) == 1
     refreshed = admin_client.get(url).json()
     outbound = [
-        message for message in refreshed["messages"] if message["direction"] == "outbound"
+        message
+        for message in refreshed["messages"]
+        if message["direction"] == "outbound"
     ]
     assert outbound[0]["status"] == FacebookMessengerReplyStatus.SENT
     assert outbound[0]["sent_by"] == user_profile.user.email
@@ -466,9 +616,7 @@ def test_admin_configures_validated_messenger_auto_reply(org_a, admin_client):
     assert response.json()["messenger_auto_reply_enabled"] is True
     connection.refresh_from_db()
     assert connection.messenger_auto_reply_enabled is True
-    assert connection.messenger_auto_reply_template.endswith(
-        "{{ organization_name }}."
-    )
+    assert connection.messenger_auto_reply_template.endswith("{{ organization_name }}.")
 
     invalid = admin_client.patch(
         f"/api/integrations/facebook/pages/{connection.id}/",

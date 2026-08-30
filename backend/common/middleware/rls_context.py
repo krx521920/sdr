@@ -20,11 +20,18 @@ Usage in settings.py:
 """
 
 import logging
+import re
 
 from django.db import connection
 from django.http import JsonResponse
 
 logger = logging.getLogger(__name__)
+
+_INBOUND_EMAIL_WEBHOOK_PATH_RE = re.compile(
+    r"^/api/cases/inbound/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/$"
+)
 
 
 class SetOrgContext:
@@ -179,8 +186,10 @@ class RequireOrgContext:
 
     def _is_exempt(self, path):
         """Check if path is exempt from org context requirement."""
-        return path in self.EXACT_EXEMPT_PATHS or any(
-            path.startswith(exempt) for exempt in self.EXEMPT_PATHS
+        return (
+            path in self.EXACT_EXEMPT_PATHS
+            or _INBOUND_EMAIL_WEBHOOK_PATH_RE.fullmatch(path) is not None
+            or any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS)
         )
 
     def _set_org_context(self, request):

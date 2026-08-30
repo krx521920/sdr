@@ -1,8 +1,11 @@
 """Periodic recovery for the SDR response outbox."""
 
 import logging
+from datetime import timedelta
 
 from celery import shared_task
+from django.conf import settings
+from django.utils import timezone
 
 from automation.tenant_context import database_org_context
 from common.models import Org
@@ -10,7 +13,7 @@ from sdr.compliance import scan_retention
 from sdr.nurture import reconcile_nurture_jobs
 from sdr.outbound import reconcile_outbound_campaigns
 from sdr.response import reconcile_recent_response_jobs
-from sdr.sources import reconcile_outbound_sources
+from sdr.sources import reconcile_apollo_candidate_states, reconcile_outbound_sources
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,46 @@ def reconcile_all_outbound_sources():
                     org_id,
                 )
     return {"queued": queued}
+
+
+@shared_task(name="sdr.reconcile_apollo_candidate_states")
+def reconcile_all_apollo_candidate_states():
+    """Recover stale Apollo requests and import projections without network I/O."""
+
+    totals = {
+        "released_requests": 0,
+        "unknown_requests": 0,
+        "candidates_released": 0,
+        "candidates_unknown": 0,
+        "candidates_imported": 0,
+        "candidates_import_review_required": 0,
+        "candidates_import_failed": 0,
+        "candidates_import_retry_required": 0,
+    }
+    now = timezone.now()
+    reserved_before = now - timedelta(
+        seconds=settings.CHANNEL_EXECUTION_RESERVED_TIMEOUT_SECONDS
+    )
+    sending_before = now - timedelta(
+        seconds=settings.CHANNEL_EXECUTION_SENDING_TIMEOUT_SECONDS
+    )
+    for org_id in Org.objects.values_list("id", flat=True).iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                org = Org.objects.get(id=org_id)
+                result = reconcile_apollo_candidate_states(
+                    org=org,
+                    reserved_before=reserved_before,
+                    sending_before=sending_before,
+                )
+                for key in totals:
+                    totals[key] += result[key]
+            except Exception:
+                logger.exception(
+                    "Could not reconcile Apollo candidate states for org %s",
+                    org_id,
+                )
+    return totals
 
 
 @shared_task(name="sdr.scan_compliance_retention")

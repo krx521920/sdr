@@ -30,6 +30,7 @@ from integrations.models import (
 from integrations.providers.facebook.client import FacebookGraphAPIError
 from integrations.providers.facebook.service import graph_client
 from leads.models import Lead
+from sdr.compliance import intake_data_restriction
 from sdr.domain import CompanySnapshot, LeadCandidate, LeadIdentity, LeadSource
 from sdr.models import (
     LeadIntake,
@@ -49,9 +50,7 @@ logger = logging.getLogger(__name__)
 FACEBOOK_MESSENGER_JOB = "facebook.process_messenger_message"
 FACEBOOK_MESSENGER_REPLY_JOB = "facebook.send_messenger_reply"
 AUTO_REPLY_TEMPLATE_VARIABLES = frozenset({"organization_name", "page_name"})
-AUTO_REPLY_TEMPLATE_VARIABLE_PATTERN = re.compile(
-    r"{{\s*([a-z_][a-z0-9_]*)\s*}}"
-)
+AUTO_REPLY_TEMPLATE_VARIABLE_PATTERN = re.compile(r"{{\s*([a-z_][a-z0-9_]*)\s*}}")
 
 
 class FacebookMessengerUnavailable(LookupError):
@@ -114,6 +113,7 @@ def validate_manual_reply_body(value: str) -> str:
     return cleaned
 
 
+@transaction.atomic
 def enqueue_manual_facebook_reply(
     *,
     intake: LeadIntake,
@@ -121,6 +121,16 @@ def enqueue_manual_facebook_reply(
     client_request_id: UUID,
     created_by_id: UUID,
 ) -> FacebookMessengerReplyAcceptance:
+    intake = LeadIntake.objects.select_for_update().get(
+        id=intake.id,
+        org_id=intake.org_id,
+    )
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        raise FacebookMessengerReplyUnavailable(
+            restriction.reason,
+            code=restriction.code,
+        )
     cleaned_body = validate_manual_reply_body(body)
     message = (
         FacebookMessengerMessage.objects.filter(
@@ -216,32 +226,49 @@ def enqueue_facebook_message_event(
         )
 
     with database_org_context(route.org_id):
-        connection = FacebookPageConnection.objects.filter(
-            org_id=route.org_id,
-            route__page_id=page_id,
-            is_active=True,
-            messenger_enabled=True,
-        ).select_related("org").first()
+        connection = (
+            FacebookPageConnection.objects.filter(
+                org_id=route.org_id,
+                route__page_id=page_id,
+                is_active=True,
+                messenger_enabled=True,
+            )
+            .select_related("org")
+            .first()
+        )
         if connection is None:
             raise FacebookMessengerUnavailable(
                 "Messenger intake is not enabled for this Facebook Page"
             )
         occurred_at = _parse_datetime(event_payload.get("occurred_at"))
         attachment_types = _attachment_types(event_payload.get("attachment_types"))
+        conversation_intake = _conversation_intake(
+            org_id=route.org_id,
+            page_id=page_id,
+            sender_psid=sender_psid,
+        )
+        restriction = (
+            intake_data_restriction(conversation_intake)
+            if conversation_intake
+            else None
+        )
         message, created = FacebookMessengerMessage.objects.get_or_create(
             org_id=route.org_id,
             page_id=page_id,
             message_id=provider_message_id[:255],
             defaults={
                 "connection": connection,
+                "intake": conversation_intake,
                 "sender_psid": sender_psid[:128],
-                "body": str(event_payload.get("body", ""))[:10000],
-                "attachment_types": attachment_types,
+                "body": (
+                    "" if restriction else str(event_payload.get("body", ""))[:10000]
+                ),
+                "attachment_types": [] if restriction else attachment_types,
                 "occurred_at": occurred_at,
             },
         )
         reply_job = None
-        if connection.messenger_auto_reply_enabled:
+        if connection.messenger_auto_reply_enabled and not restriction:
             try:
                 reply_job = _schedule_auto_reply(connection=connection, message=message)
             except ValueError:
@@ -302,7 +329,7 @@ def process_facebook_messenger_reply_job(
 
     reply = (
         FacebookMessengerReply.objects.filter(id=reply_id, org_id=org_id)
-        .select_related("connection", "trigger_message")
+        .select_related("connection", "trigger_message__intake")
         .first()
     )
     if reply is None:
@@ -335,31 +362,71 @@ def process_facebook_messenger_reply_job(
         _skip_reply(reply, code="facebook_page_token_expired")
         return _reply_result(reply)
 
-    _start_reply(reply)
-    try:
-        response = graph_client().send_text_message(
-            page_id=reply.page_id,
-            recipient_psid=reply.recipient_psid,
-            access_token=connection.get_access_token(),
-            text=reply.body,
+    pending_error = None
+    pending_cause = None
+    with transaction.atomic():
+        intake = None
+        if reply.trigger_message.intake_id:
+            intake = (
+                LeadIntake.objects.select_for_update()
+                .filter(
+                    id=reply.trigger_message.intake_id,
+                    org_id=org_id,
+                )
+                .first()
+            )
+        if intake is None:
+            intake = _conversation_intake(
+                org_id=org_id,
+                page_id=reply.trigger_message.page_id,
+                sender_psid=reply.trigger_message.sender_psid,
+                for_update=True,
+            )
+        reply = (
+            FacebookMessengerReply.objects.select_for_update()
+            .filter(id=reply.id, org_id=org_id)
+            .select_related("connection", "trigger_message__intake")
+            .get()
         )
-    except FacebookGraphAPIError as exc:
-        _fail_reply(reply, code="facebook_reply_rejected", message=str(exc))
-        error_type = RetryableJobError if exc.retryable else PermanentJobError
-        raise error_type(str(exc), code="facebook_reply_rejected") from exc
-    except Exception as exc:
-        _fail_reply(reply, code="facebook_reply_delivery_failed", message=str(exc))
-        raise RetryableJobError(
-            "The Facebook Messenger reply could not be delivered.",
-            code="facebook_reply_delivery_failed",
-        ) from exc
+        if reply.status in {
+            FacebookMessengerReplyStatus.SENT,
+            FacebookMessengerReplyStatus.SKIPPED,
+        }:
+            return _reply_result(reply)
+        restriction = intake_data_restriction(intake) if intake else None
+        if restriction:
+            _skip_reply(reply, code=restriction.code)
+            return _reply_result(reply)
 
-    provider_message_id = str(response.get("message_id", "")).strip()[:255]
-    _complete_reply(reply, provider_message_id=provider_message_id)
-    FacebookPageConnection.objects.filter(
-        id=connection.id,
-        org_id=org_id,
-    ).update(last_message_reply_at=reply.sent_at)
+        _start_reply(reply)
+        try:
+            response = graph_client().send_text_message(
+                page_id=reply.page_id,
+                recipient_psid=reply.recipient_psid,
+                access_token=reply.connection.get_access_token(),
+                text=reply.body,
+            )
+        except FacebookGraphAPIError as exc:
+            _fail_reply(reply, code="facebook_reply_rejected", message=str(exc))
+            error_type = RetryableJobError if exc.retryable else PermanentJobError
+            pending_error = error_type(str(exc), code="facebook_reply_rejected")
+            pending_cause = exc
+        except Exception as exc:
+            _fail_reply(reply, code="facebook_reply_delivery_failed", message=str(exc))
+            pending_error = RetryableJobError(
+                "The Facebook Messenger reply could not be delivered.",
+                code="facebook_reply_delivery_failed",
+            )
+            pending_cause = exc
+        else:
+            provider_message_id = str(response.get("message_id", "")).strip()[:255]
+            _complete_reply(reply, provider_message_id=provider_message_id)
+            FacebookPageConnection.objects.filter(
+                id=reply.connection_id,
+                org_id=org_id,
+            ).update(last_message_reply_at=reply.sent_at)
+    if pending_error:
+        raise pending_error from pending_cause
     return _reply_result(reply)
 
 
@@ -412,7 +479,46 @@ def process_facebook_messenger_job(payload: Mapping[str, Any]) -> Mapping[str, A
         source_record_id=conversation_id,
     ).first()
     if intake and intake.status == LeadIntakeStatus.COMPLETED:
-        _append_follow_up(intake=intake, message=message)
+        restriction = intake_data_restriction(intake)
+        if restriction:
+            FacebookMessengerMessage.objects.filter(
+                id=message.id,
+                org_id=message.org_id,
+            ).update(body="", attachment_types=[])
+            message.body = ""
+            message.attachment_types = []
+            _finish_message(
+                message,
+                intake=intake,
+                status=FacebookMessengerMessageStatus.IGNORED,
+                error_code=restriction.code,
+            )
+            return {
+                "message_id": str(message.id),
+                "intake_id": str(intake.id),
+                "status": FacebookMessengerMessageStatus.IGNORED,
+                "error_code": restriction.code,
+                "replayed": True,
+            }
+        restriction = _append_follow_up(intake=intake, message=message)
+        if restriction:
+            FacebookMessengerMessage.objects.filter(
+                id=message.id,
+                org_id=message.org_id,
+            ).update(body="", attachment_types=[])
+            _finish_message(
+                message,
+                intake=intake,
+                status=FacebookMessengerMessageStatus.IGNORED,
+                error_code=restriction.code,
+            )
+            return {
+                "message_id": str(message.id),
+                "intake_id": str(intake.id),
+                "status": FacebookMessengerMessageStatus.IGNORED,
+                "error_code": restriction.code,
+                "replayed": True,
+            }
         _finish_message(message, intake=intake)
         return {
             "message_id": str(message.id),
@@ -473,7 +579,14 @@ def _append_follow_up(
     *,
     intake: LeadIntake,
     message: FacebookMessengerMessage,
-) -> None:
+) -> Any:
+    intake = LeadIntake.objects.select_for_update().get(
+        id=intake.id,
+        org_id=intake.org_id,
+    )
+    restriction = intake_data_restriction(intake)
+    if restriction:
+        return restriction
     event_key = f"facebook-message:{message.message_id}"[:120]
     if LeadLifecycleEvent.objects.filter(
         org_id=intake.org_id,
@@ -481,10 +594,14 @@ def _append_follow_up(
         event_key=event_key,
     ).exists():
         return
-    lead = Lead.objects.select_for_update().filter(
-        id=intake.crm_lead_id,
-        org_id=intake.org_id,
-    ).first()
+    lead = (
+        Lead.objects.select_for_update()
+        .filter(
+            id=intake.crm_lead_id,
+            org_id=intake.org_id,
+        )
+        .first()
+    )
     if lead is not None:
         timestamp = message.occurred_at.strftime("%Y-%m-%d %H:%M UTC")
         addition = f"Facebook Messenger ({timestamp}):\n{message.body}"
@@ -502,6 +619,26 @@ def _append_follow_up(
             "attachment_types": list(message.attachment_types),
         },
     )
+    return None
+
+
+def _conversation_intake(
+    *,
+    org_id: UUID,
+    page_id: str,
+    sender_psid: str,
+    for_update: bool = False,
+) -> LeadIntake | None:
+    if not page_id or not sender_psid:
+        return None
+    queryset = LeadIntake.objects.filter(
+        org_id=org_id,
+        source=LeadSource.FACEBOOK_MESSENGER.value,
+        source_record_id=f"{page_id}:{sender_psid}",
+    )
+    if for_update:
+        queryset = queryset.select_for_update()
+    return queryset.first()
 
 
 def _finish_message(
@@ -557,9 +694,7 @@ def _schedule_auto_reply(
     connection: FacebookPageConnection,
     message: FacebookMessengerMessage,
 ):
-    template = validate_auto_reply_template(
-        connection.messenger_auto_reply_template
-    )
+    template = validate_auto_reply_template(connection.messenger_auto_reply_template)
     organization_name = (
         connection.org.company_name or connection.org.name or connection.page_name
     )

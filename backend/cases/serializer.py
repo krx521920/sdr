@@ -430,7 +430,9 @@ class EscalationPolicySerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request") if hasattr(self, "context") else None
-        org = getattr(getattr(request, "profile", None), "org", None) if request else None
+        org = (
+            getattr(getattr(request, "profile", None), "org", None) if request else None
+        )
         if org is None:
             org = self.context.get("org") if hasattr(self, "context") else None
         if org is not None:
@@ -446,7 +448,10 @@ class EscalationPolicySerializer(serializers.ModelSerializer):
         priority = attrs.get("priority", getattr(self.instance, "priority", None))
         if self.instance is None and priority is not None:
             org = self.context.get("org")
-            if org and EscalationPolicy.objects.filter(org=org, priority=priority).exists():
+            if (
+                org
+                and EscalationPolicy.objects.filter(org=org, priority=priority).exists()
+            ):
                 raise serializers.ValidationError(
                     {"priority": f"Policy already exists for priority {priority}."}
                 )
@@ -456,6 +461,24 @@ class EscalationPolicySerializer(serializers.ModelSerializer):
 class InboundMailboxSerializer(serializers.ModelSerializer):
     """Per-org inbound mailbox configuration."""
 
+    # Keep accepting the legacy secret on create/update, but never serialize it
+    # back to an API client.  SES/SNS delivery is authorized by the exact topic
+    # binding below; the boolean is retained only as a migration-safe status for
+    # older mailbox records.
+    webhook_secret = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=128,
+    )
+    webhook_secret_configured = serializers.SerializerMethodField()
+    sns_topic_arn = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=512,
+    )
+    sns_topic_bound = serializers.SerializerMethodField()
     default_assignee = ProfileSerializer(read_only=True)
     default_assignee_id = serializers.PrimaryKeyRelatedField(
         source="default_assignee",
@@ -473,6 +496,9 @@ class InboundMailboxSerializer(serializers.ModelSerializer):
             "provider",
             "route_target",
             "webhook_secret",
+            "webhook_secret_configured",
+            "sns_topic_arn",
+            "sns_topic_bound",
             "default_priority",
             "default_case_type",
             "default_assignee",
@@ -506,6 +532,25 @@ class InboundMailboxSerializer(serializers.ModelSerializer):
                     f"A mailbox with address {value!r} already exists for this org."
                 )
         return value
+
+    def validate_sns_topic_arn(self, value):
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        from cases.inbound.sns import SNSVerificationError, parse_sns_topic_arn
+
+        try:
+            return parse_sns_topic_arn(cleaned).arn
+        except SNSVerificationError as exc:
+            raise serializers.ValidationError(
+                "Enter a valid AWS SNS Topic ARN."
+            ) from exc
+
+    def get_sns_topic_bound(self, obj):
+        return bool(obj.sns_topic_arn)
+
+    def get_webhook_secret_configured(self, obj):
+        return bool(obj.webhook_secret)
 
 
 class EmailMessageSerializer(serializers.ModelSerializer):
@@ -587,16 +632,14 @@ class RoutingRuleSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         request = self.context.get("request") if hasattr(self, "context") else None
         org = (
-            getattr(getattr(request, "profile", None), "org", None)
-            if request
-            else None
+            getattr(getattr(request, "profile", None), "org", None) if request else None
         )
         if org is None:
             org = self.context.get("org") if hasattr(self, "context") else None
         if org is not None:
-            self.fields["target_assignee_ids"].child_relation.queryset = (
-                Profile.objects.filter(org=org)
-            )
+            self.fields[
+                "target_assignee_ids"
+            ].child_relation.queryset = Profile.objects.filter(org=org)
             self.fields["target_team_id"].queryset = Teams.objects.filter(org=org)
 
     def validate_conditions(self, value):
@@ -606,15 +649,11 @@ class RoutingRuleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("conditions must be a list of objects.")
         for i, cond in enumerate(value):
             if not isinstance(cond, dict):
-                raise serializers.ValidationError(
-                    f"conditions[{i}] must be an object."
-                )
+                raise serializers.ValidationError(f"conditions[{i}] must be an object.")
             field = cond.get("field")
             op = cond.get("op", "eq")
             if not isinstance(field, str) or not field:
-                raise serializers.ValidationError(
-                    f"conditions[{i}].field is required."
-                )
+                raise serializers.ValidationError(f"conditions[{i}].field is required.")
             if not (
                 field in self.SUPPORTED_FIELDS or field.startswith("custom_fields.")
             ):
@@ -626,9 +665,7 @@ class RoutingRuleSerializer(serializers.ModelSerializer):
                     f"conditions[{i}].op {op!r} is not supported."
                 )
             if "value" not in cond:
-                raise serializers.ValidationError(
-                    f"conditions[{i}].value is required."
-                )
+                raise serializers.ValidationError(f"conditions[{i}].value is required.")
         return value
 
     def validate(self, attrs):
@@ -753,18 +790,14 @@ class TimeEntryUpdateSerializer(serializers.ModelSerializer):
         # Only blocks explicit attempts to clear the field; PATCH bodies that
         # omit `description` (e.g., toggling billable) skip this entirely.
         if value is not None and not value.strip():
-            raise serializers.ValidationError(
-                "Description cannot be empty."
-            )
+            raise serializers.ValidationError("Description cannot be empty.")
         return value.strip() if value else value
 
     def validate(self, attrs):
         started = attrs.get(
             "started_at", self.instance.started_at if self.instance else None
         )
-        ended = attrs.get(
-            "ended_at", self.instance.ended_at if self.instance else None
-        )
+        ended = attrs.get("ended_at", self.instance.ended_at if self.instance else None)
         if started and ended and ended < started:
             raise serializers.ValidationError(
                 {"ended_at": "ended_at must be on or after started_at."}

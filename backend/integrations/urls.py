@@ -3,6 +3,13 @@ from django.urls import path
 from integrations.api.views import (
     ApolloConnectionTestView,
     ApolloConnectionView,
+    ChannelSafetyApprovalCreateView,
+    ChannelSafetyChannelView,
+    ChannelSafetyOrganizationView,
+    ChannelSafetySummaryView,
+    ChannelSafetyTargetDetailView,
+    ChannelSafetyTargetListCreateView,
+    ChannelSafetyUnknownResolveView,
     FacebookConversionSettingsView,
     FacebookMessengerConversationView,
     FacebookOAuthCallbackView,
@@ -14,16 +21,30 @@ from integrations.api.views import (
     FacebookWebhookView,
     FeishuBaseConnectionTestView,
     FeishuBaseConnectionView,
+    FeishuBasePersonImportDetailView,
+    FeishuBasePersonImportPreviewView,
+    FeishuBaseRemoteDeleteView,
+    FeishuBaseResearchSyncView,
+    FeishuBaseSyncListView,
     LinkedInConnectionTestView,
     LinkedInConnectionView,
     WhatsAppBusinessConnectionTestView,
     WhatsAppBusinessConnectionView,
+    WhatsAppMessageExecutionView,
+    WhatsAppMessageListView,
     WhatsAppWebhookView,
 )
 
 app_name = "api_integrations"
 
 urlpatterns = [
+    path("channel-safety/", ChannelSafetySummaryView.as_view(), name="channel_safety"),
+    path("channel-safety/organization/", ChannelSafetyOrganizationView.as_view(), name="channel_safety_organization"),
+    path("channel-safety/channels/<str:channel>/", ChannelSafetyChannelView.as_view(), name="channel_safety_channel"),
+    path("channel-safety/test-targets/", ChannelSafetyTargetListCreateView.as_view(), name="channel_safety_targets"),
+    path("channel-safety/test-targets/<uuid:target_id>/", ChannelSafetyTargetDetailView.as_view(), name="channel_safety_target_detail"),
+    path("channel-safety/approvals/", ChannelSafetyApprovalCreateView.as_view(), name="channel_safety_approvals"),
+    path("channel-safety/unknown/<uuid:request_id>/resolve/", ChannelSafetyUnknownResolveView.as_view(), name="channel_safety_unknown_resolve"),
     path(
         "feishu-base/connection/",
         FeishuBaseConnectionView.as_view(),
@@ -33,6 +54,31 @@ urlpatterns = [
         "feishu-base/connection/test/",
         FeishuBaseConnectionTestView.as_view(),
         name="feishu_base_connection_test",
+    ),
+    path(
+        "feishu-base/intakes/<uuid:intake_id>/sync/",
+        FeishuBaseResearchSyncView.as_view(),
+        name="feishu_base_research_sync",
+    ),
+    path(
+        "feishu-base/syncs/",
+        FeishuBaseSyncListView.as_view(),
+        name="feishu_base_syncs",
+    ),
+    path(
+        "feishu-base/syncs/<uuid:sync_id>/delete/",
+        FeishuBaseRemoteDeleteView.as_view(),
+        name="feishu_base_remote_delete",
+    ),
+    path(
+        "feishu-base/person-imports/preview/",
+        FeishuBasePersonImportPreviewView.as_view(),
+        name="feishu_base_person_import_preview",
+    ),
+    path(
+        "feishu-base/person-imports/<uuid:import_id>/",
+        FeishuBasePersonImportDetailView.as_view(),
+        name="feishu_base_person_import_detail",
     ),
     path(
         "linkedin/connection/",
@@ -63,6 +109,16 @@ urlpatterns = [
         "whatsapp/connection/test/",
         WhatsAppBusinessConnectionTestView.as_view(),
         name="whatsapp_connection_test",
+    ),
+    path(
+        "whatsapp/messages/",
+        WhatsAppMessageListView.as_view(),
+        name="whatsapp_message_list",
+    ),
+    path(
+        "whatsapp/messages/<uuid:message_id>/execution/",
+        WhatsAppMessageExecutionView.as_view(),
+        name="whatsapp_message_execution",
     ),
     path(
         "whatsapp/webhook/",
