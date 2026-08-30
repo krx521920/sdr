@@ -79,6 +79,9 @@ services:
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
+    environment:
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
       - ./backend:/app
     depends_on:
@@ -101,6 +104,9 @@ services:
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
+    environment:
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
       - ./backend:/app
     depends_on:
