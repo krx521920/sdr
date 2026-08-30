@@ -219,7 +219,7 @@ jobs:
 
       - name: Start production-like runtime
         run: >-
-          docker compose up -d --no-build --wait --wait-timeout 180
+          docker compose up -d --no-build --wait --wait-timeout 300
           db redis backend celery-worker celery-beat
 
       - name: Verify migrations and RLS role

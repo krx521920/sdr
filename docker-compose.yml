@@ -59,8 +59,10 @@ services:
           assert urllib.request.urlopen(request, timeout=5).status == 200
       interval: 10s
       timeout: 6s
-      retries: 5
-      start_period: 20s
+      # A fresh production database can spend more than a minute applying the
+      # full migration history before Gunicorn starts accepting requests.
+      retries: 12
+      start_period: 120s
     depends_on:
       db:
         condition: service_healthy
