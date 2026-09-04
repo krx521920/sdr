@@ -8,11 +8,12 @@ export async function load({ cookies, locals }) {
     throw error(403, 'Only admins can manage the AI lead inspector');
   }
   try {
-    const [configuration, inspections] = await Promise.all([
+    const [configuration, inspections, audits] = await Promise.all([
       apiRequest('/sdr/intelligence/settings/', {}, { cookies, org: locals?.org }),
-      apiRequest('/sdr/intelligence/inspections/?limit=50', {}, { cookies, org: locals?.org })
+      apiRequest('/sdr/intelligence/inspections/?limit=50', {}, { cookies, org: locals?.org }),
+      apiRequest('/sdr/intelligence/ai-audits/?limit=50', {}, { cookies, org: locals?.org })
     ]);
-    return { configuration, inspections };
+    return { configuration, inspections, audits };
   } catch (err) {
     console.error('Failed to load SDR intelligence:', err);
     throw error(500, 'Failed to load the AI lead inspector');
@@ -38,6 +39,12 @@ export const actions = {
       negative_signals: String(formData.get('negative_signals') || '').trim(),
       max_research_pages: Number(formData.get('max_research_pages') || 2),
       website_timeout_seconds: Number(formData.get('website_timeout_seconds') || 5),
+      allowed_ai_providers: formData.getAll('allowed_ai_providers').map(String),
+      allowed_ai_purposes: formData.getAll('allowed_ai_purposes').map(String),
+      pii_handling: String(formData.get('pii_handling') || 'redact'),
+      max_ai_input_chars: Number(formData.get('max_ai_input_chars') || 30000),
+      max_ai_input_tokens: Number(formData.get('max_ai_input_tokens') || 30000),
+      ai_audit_retention_days: Number(formData.get('ai_audit_retention_days') || 90),
       openai_api_key: String(formData.get('openai_api_key') || '').trim(),
       doubao_api_key: String(formData.get('doubao_api_key') || '').trim(),
       deepseek_api_key: String(formData.get('deepseek_api_key') || '').trim(),

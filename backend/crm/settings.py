@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import timedelta
 from math import ceil
@@ -561,6 +562,38 @@ AI_GATEWAY_ALLOWED_REASONING_EFFORTS = tuple(
     ).split(",")
     if value.strip() in {"none", "low", "medium", "high", "xhigh", "max"}
 ) or ("low",)
+_AI_GATEWAY_PROVIDER_VALUES = {"openai", "doubao", "deepseek"}
+_AI_GATEWAY_ALLOWED_PROVIDERS_RAW = os.environ.get("AI_GATEWAY_ALLOWED_PROVIDERS")
+if _AI_GATEWAY_ALLOWED_PROVIDERS_RAW is None:
+    AI_GATEWAY_ALLOWED_PROVIDERS = ("openai", "doubao", "deepseek")
+else:
+    _AI_GATEWAY_ALLOWED_PROVIDER_ITEMS = tuple(
+        value.strip()
+        for value in _AI_GATEWAY_ALLOWED_PROVIDERS_RAW.split(",")
+        if value.strip()
+    )
+    if (
+        not _AI_GATEWAY_ALLOWED_PROVIDER_ITEMS
+        or len(set(_AI_GATEWAY_ALLOWED_PROVIDER_ITEMS))
+        != len(_AI_GATEWAY_ALLOWED_PROVIDER_ITEMS)
+        or any(
+            value not in _AI_GATEWAY_PROVIDER_VALUES
+            for value in _AI_GATEWAY_ALLOWED_PROVIDER_ITEMS
+        )
+    ):
+        raise ImproperlyConfigured(
+            "AI_GATEWAY_ALLOWED_PROVIDERS must contain a unique, non-empty subset "
+            "of openai,doubao,deepseek."
+        )
+    AI_GATEWAY_ALLOWED_PROVIDERS = _AI_GATEWAY_ALLOWED_PROVIDER_ITEMS
+try:
+    AI_GATEWAY_MODEL_PRICING = json.loads(
+        os.environ.get("AI_GATEWAY_MODEL_PRICING", "{}")
+    )
+except json.JSONDecodeError as exc:
+    raise ImproperlyConfigured("AI_GATEWAY_MODEL_PRICING must be valid JSON.") from exc
+if not isinstance(AI_GATEWAY_MODEL_PRICING, dict):
+    raise ImproperlyConfigured("AI_GATEWAY_MODEL_PRICING must be a JSON object.")
 
 # Apollo People Search is tenant-authenticated. The provider URL remains a
 # deployment-owned setting so tenant credentials cannot redirect requests.

@@ -8,6 +8,7 @@ from sdr.api.views import (
     LeadNurtureEnrollmentActionView,
     LeadNurtureEnrollmentListView,
     SDRAcknowledgementEmailExecutionView,
+    SDRAICallAuditListView,
     SDRAnalyticsView,
     SDRApolloCandidateEnrichView,
     SDRComplianceDeletionActionView,
@@ -259,6 +260,11 @@ urlpatterns = [
         "intelligence/settings/",
         SDRIntelligenceSettingsView.as_view(),
         name="intelligence_settings",
+    ),
+    path(
+        "intelligence/ai-audits/",
+        SDRAICallAuditListView.as_view(),
+        name="ai_audit_list",
     ),
     path(
         "intelligence/inspections/",

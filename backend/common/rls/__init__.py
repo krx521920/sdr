@@ -64,6 +64,7 @@ ORG_SCOPED_TABLES = [
     "sdr_routing_rule_state",
     "sdr_intelligence_settings",
     "sdr_model_credential",
+    "sdr_ai_call_audit",
     "sdr_lead_inspection",
     "sdr_response_settings",
     "sdr_lead_lifecycle_event",

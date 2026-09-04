@@ -8,18 +8,16 @@ from uuid import UUID
 
 import requests
 
-from sdr.domain import LeadCandidate, QualificationResult
 from sdr.intelligence.contracts import (
     OUTPUT_SCHEMA,
     AIQualification,
     ModelProviderError,
-    build_lead_context,
     optional_nonnegative_int,
     qualification_instructions,
     response_output_text,
     validate_result,
 )
-from sdr.intelligence.research import ResearchResult
+from sdr.intelligence.safety import PreparedAIContext, prepared_context_json
 
 
 class OpenAIQualificationError(ModelProviderError):
@@ -50,32 +48,20 @@ class OpenAILeadQualifier:
         self,
         *,
         org_id: UUID,
-        candidate: LeadCandidate,
-        baseline: QualificationResult,
-        research: ResearchResult | None,
-        icp_description: str,
-        positive_signals: str,
-        negative_signals: str,
-        sales_feedback_calibration: dict | None = None,
+        context: PreparedAIContext,
     ) -> AIQualification:
         if not self.api_key:
             raise OpenAIQualificationError(
                 "OpenAI API key is not configured.",
                 code="openai_not_configured",
             )
-        context = build_lead_context(
-            candidate=candidate,
-            baseline=baseline,
-            research=research,
-            icp_description=icp_description,
-            positive_signals=positive_signals,
-            negative_signals=negative_signals,
-            sales_feedback_calibration=sales_feedback_calibration,
+        serialized_context = prepared_context_json(
+            context, expected_purpose="lead_qualification"
         )
         payload = {
             "model": self.model,
             "instructions": qualification_instructions(),
-            "input": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+            "input": serialized_context,
             "reasoning": {"effort": self.reasoning_effort},
             "text": {
                 "verbosity": "low",
@@ -101,6 +87,7 @@ class OpenAILeadQualifier:
                 },
                 json=payload,
                 timeout=self.timeout_seconds,
+                allow_redirects=False,
             )
         except requests.RequestException as exc:
             raise OpenAIQualificationError(
@@ -108,6 +95,11 @@ class OpenAILeadQualifier:
                 code="openai_request_failed",
                 retryable=True,
             ) from exc
+        if 300 <= response.status_code < 400:
+            raise OpenAIQualificationError(
+                "OpenAI qualification refused an HTTP redirect.",
+                code="openai_redirect_blocked",
+            )
         if response.status_code >= 400:
             raise OpenAIQualificationError(
                 f"OpenAI qualification returned HTTP {response.status_code}.",

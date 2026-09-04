@@ -23,6 +23,7 @@
   const catalog = $derived(configuration.provider_catalog || {});
   const providerEntries = $derived(Object.entries(catalog));
   const inspections = $derived(data.inspections?.results || []);
+  const audits = $derived(Array.isArray(data.audits) ? data.audits : data.audits?.results || []);
   const completedCount = $derived(inspections.filter((item) => item.status === 'completed').length);
   const fallbackCount = $derived(inspections.filter((item) => item.used_fallback).length);
   const averageScore = $derived(
@@ -75,6 +76,7 @@
   /** @param {string} status */
   function statusClass(status) {
     if (status === 'completed') return 'bg-emerald-100 text-emerald-700';
+    if (status === 'blocked') return 'bg-red-100 text-red-700';
     if (status === 'failed') return 'bg-red-100 text-red-700';
     if (status === 'partial') return 'bg-amber-100 text-amber-700';
     return 'bg-blue-100 text-blue-700';
@@ -105,6 +107,12 @@
     }
     return 'Platform key';
   }
+
+  /** @param {number | null} value */
+  function formatCost(value) {
+    if (value === null || value === undefined) return '-';
+    return `$${(value / 1_000_000).toFixed(6)}`;
+  }
 </script>
 
 <svelte:head>
@@ -112,8 +120,8 @@
 </svelte:head>
 
 <PageHeader
-  title="AI Model Gateway"
-  subtitle="Route lead qualification through OpenAI, Doubao, or DeepSeek with provider failover"
+  title="AI Safety Gateway"
+  subtitle="Control, sanitize, route, and audit every external model request"
 />
 
 <div class="space-y-6 p-6 md:p-8">
@@ -328,6 +336,127 @@
       class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-5"
     >
       <div class="mb-5 flex items-start gap-3">
+        <AlertTriangle class="mt-0.5 size-5 text-amber-500" />
+        <div>
+          <h2 class="font-medium text-[color:var(--text-primary)]">Data safety policy</h2>
+          <p class="text-xs text-[color:var(--text-muted)]">
+            Requests that violate these controls are blocked before any provider connection is
+            opened. Raw prompts and responses are never written to the audit ledger.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid gap-5 lg:grid-cols-2">
+        <div class="space-y-4 rounded-md border border-[color:var(--border-faint)] p-4">
+          <div>
+            <h3 class="text-sm font-medium">Allowed providers</h3>
+            <p class="text-xs text-[color:var(--text-muted)]">
+              At least one provider is required; primary and fallback routes must be selected here.
+            </p>
+          </div>
+          <div class="grid gap-2 sm:grid-cols-3">
+            {#each providerEntries as [provider, item] (provider)}
+              <label class="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  name="allowed_ai_providers"
+                  value={provider}
+                  checked={configuration.allowed_ai_providers?.includes(provider)}
+                />
+                {item.label}
+              </label>
+            {/each}
+          </div>
+        </div>
+
+        <div class="space-y-4 rounded-md border border-[color:var(--border-faint)] p-4">
+          <div>
+            <h3 class="text-sm font-medium">Allowed purposes</h3>
+            <p class="text-xs text-[color:var(--text-muted)]">
+              Clearing every purpose blocks all model calls while preserving deterministic rules.
+            </p>
+          </div>
+          <div class="grid gap-2 sm:grid-cols-2">
+            <label class="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                name="allowed_ai_purposes"
+                value="lead_qualification"
+                checked={configuration.allowed_ai_purposes?.includes('lead_qualification')}
+              />
+              Lead qualification
+            </label>
+            <label class="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                name="allowed_ai_purposes"
+                value="outbound_copy"
+                checked={configuration.allowed_ai_purposes?.includes('outbound_copy')}
+              />
+              Outbound copy
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div>
+          <Label for="pii-handling">PII handling</Label>
+          <select
+            id="pii-handling"
+            name="pii_handling"
+            value={configuration.pii_handling}
+            class="h-9 w-full rounded-md border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] px-3 text-sm"
+          >
+            <option value="redact">Redact before sending</option>
+            <option value="block">Block the request</option>
+            <option value="allow">Allow with tenant approval</option>
+          </select>
+        </div>
+        <div>
+          <Label for="max-ai-input-chars">Maximum input characters</Label>
+          <Input
+            id="max-ai-input-chars"
+            name="max_ai_input_chars"
+            type="number"
+            min="1000"
+            max="200000"
+            value={configuration.max_ai_input_chars}
+          />
+        </div>
+        <div>
+          <Label for="max-ai-input-tokens">Maximum estimated tokens</Label>
+          <Input
+            id="max-ai-input-tokens"
+            name="max_ai_input_tokens"
+            type="number"
+            min="256"
+            max="100000"
+            value={configuration.max_ai_input_tokens}
+          />
+        </div>
+        <div>
+          <Label for="ai-audit-retention-days">Audit retention (days)</Label>
+          <Input
+            id="ai-audit-retention-days"
+            name="ai_audit_retention_days"
+            type="number"
+            min="1"
+            max="3650"
+            value={configuration.ai_audit_retention_days}
+          />
+        </div>
+      </div>
+      <p class="mt-3 text-xs text-[color:var(--text-muted)]">
+        Credential-like secrets, private keys, payment cards, government IDs, and recovery keys are
+        always blocked. This cannot be disabled by a tenant.
+      </p>
+    </section>
+
+    <section
+      class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)] p-5"
+    >
+      <div class="mb-5 flex items-start gap-3">
         <KeyRound class="mt-0.5 size-5 text-blue-500" />
         <div>
           <h2 class="font-medium text-[color:var(--text-primary)]">Provider credentials</h2>
@@ -452,6 +581,109 @@
       </div>
     </section>
   </form>
+
+  <section
+    class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)]"
+  >
+    <div class="flex items-start gap-3 border-b border-[color:var(--border-faint)] p-5">
+      <Network class="mt-0.5 size-5 text-violet-500" />
+      <div>
+        <h2 class="font-medium text-[color:var(--text-primary)]">AI call audit</h2>
+        <p class="text-xs text-[color:var(--text-muted)]">
+          Tenant, purpose, prompt/config version, routing, cost, latency, and safe failure metadata.
+        </p>
+      </div>
+    </div>
+    {#if audits.length}
+      <div class="overflow-x-auto">
+        <table class="w-full min-w-[1200px] text-left text-sm">
+          <thead class="bg-[color:var(--bg-subtle)] text-xs text-[color:var(--text-muted)]">
+            <tr
+              ><th class="px-4 py-3 font-medium">Time / purpose</th><th
+                class="px-4 py-3 font-medium">Status</th
+              ><th class="px-4 py-3 font-medium">Route</th><th class="px-4 py-3 font-medium"
+                >Version / input</th
+              ><th class="px-4 py-3 font-medium">PII policy</th><th class="px-4 py-3 font-medium"
+                >Usage</th
+              ><th class="px-4 py-3 font-medium">Failure</th></tr
+            >
+          </thead>
+          <tbody class="divide-y divide-[color:var(--border-faint)]">
+            {#each audits as item (item.id)}
+              <tr class="align-top">
+                <td class="px-4 py-3">
+                  <p class="font-medium text-[color:var(--text-primary)]">{item.purpose}</p>
+                  <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+                    {formatDate(item.created_at)}
+                  </p>
+                </td>
+                <td class="px-4 py-3">
+                  <span class="rounded-full px-2 py-0.5 text-[11px] {statusClass(item.status)}">
+                    {item.status}
+                  </span>
+                  {#if item.fallback_used}<p class="mt-1 text-xs text-amber-600">
+                      Fallback used
+                    </p>{/if}
+                </td>
+                <td class="px-4 py-3">
+                  <p class="font-medium">{item.provider || '-'}</p>
+                  <p class="text-xs text-[color:var(--text-muted)]">{item.model || '-'}</p>
+                  <p class="text-[10px] text-[color:var(--text-muted)]">
+                    route {item.route_index} · {item.credential_source || 'no credential'}
+                  </p>
+                </td>
+                <td class="px-4 py-3">
+                  <p class="text-xs">{item.prompt_version}</p>
+                  <p class="font-mono text-[10px] text-[color:var(--text-muted)]">
+                    cfg {item.configuration_sha256?.slice(0, 10)} · input {item.input_sha256?.slice(
+                      0,
+                      10
+                    )}
+                  </p>
+                  <p class="text-[10px] text-[color:var(--text-muted)]">
+                    {item.field_paths?.length || 0} approved field(s)
+                  </p>
+                </td>
+                <td class="px-4 py-3">
+                  <p class="text-xs">{item.redaction_count || 0} redaction(s)</p>
+                  <p class="text-[10px] text-[color:var(--text-muted)]">
+                    {Object.entries(item.pii_findings || {})
+                      .map(([kind, count]) => `${kind}:${count}`)
+                      .join(' · ') || 'No PII detected'}
+                  </p>
+                </td>
+                <td class="px-4 py-3">
+                  <p class="text-xs">
+                    {item.input_tokens ?? item.estimated_input_tokens} in / {item.output_tokens ??
+                      '-'} out
+                  </p>
+                  <p class="text-[10px] text-[color:var(--text-muted)]">
+                    {item.latency_ms ?? '-'} ms · {formatCost(item.estimated_cost_microusd)}
+                  </p>
+                </td>
+                <td class="max-w-[260px] px-4 py-3">
+                  <p class="text-xs text-red-600">{item.failure_code || '-'}</p>
+                  {#if item.failure_reason}<p
+                      class="mt-1 line-clamp-2 text-[10px] text-[color:var(--text-muted)]"
+                    >
+                      {item.failure_reason}
+                    </p>{/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {:else}
+      <div class="p-8 text-center">
+        <CheckCircle2 class="mx-auto size-8 text-emerald-500" />
+        <p class="mt-3 text-sm font-medium">No external model calls yet</p>
+        <p class="mt-1 text-xs text-[color:var(--text-muted)]">
+          Blocked, failed, and completed attempts will appear here without raw prompt content.
+        </p>
+      </div>
+    {/if}
+  </section>
 
   <section
     class="rounded-lg border border-[color:var(--border-faint)] bg-[color:var(--bg-elevated)]"

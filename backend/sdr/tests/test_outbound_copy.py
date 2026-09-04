@@ -4,7 +4,13 @@ import pytest
 from django.test import override_settings
 
 from automation.models import AutomationJob
+from sdr.intelligence.outbound_copy_client import OutboundCopyClient
+from sdr.intelligence.outbound_copy_contracts import (
+    OutboundCopyProviderError,
+    OutboundCopyResult,
+)
 from sdr.intelligence.registry import ProviderDefinition
+from sdr.intelligence.safety import prepare_ai_context
 from sdr.models import (
     SDRIntelligenceSettings,
     SDRNurtureSequence,
@@ -12,9 +18,6 @@ from sdr.models import (
     SDROutboundCopyDraft,
 )
 from sdr.outbound_copy import (
-    OutboundCopyClient,
-    OutboundCopyProviderError,
-    OutboundCopyResult,
     process_outbound_copy_job,
     validate_generated_steps,
 )
@@ -84,6 +87,16 @@ class FakeSession:
         return FakeResponse(self.steps, extra_output=self.extra_output)
 
 
+def prepared_copy_context(step_count=2):
+    return prepare_ai_context(
+        purpose="outbound_copy",
+        context={"request": {"step_count": step_count}},
+        pii_handling="redact",
+        max_chars=30000,
+        max_tokens=30000,
+    )
+
+
 def test_openai_copy_client_uses_strict_schema_and_non_stored_response():
     session = FakeSession(copy_steps())
     definition = ProviderDefinition(
@@ -105,12 +118,13 @@ def test_openai_copy_client_uses_strict_schema_and_non_stored_response():
 
     result = client.generate(
         org_id="00000000-0000-0000-0000-000000000001",
-        context={"request": {"step_count": 2}},
+        context=prepared_copy_context(),
     )
 
     url, request = session.request
     payload = request["json"]
     assert url == "https://api.openai.com/v1/responses"
+    assert request["allow_redirects"] is False
     assert payload["store"] is False
     assert payload["text"]["format"]["strict"] is True
     assert payload["text"]["format"]["schema"]["additionalProperties"] is False
@@ -148,7 +162,7 @@ def test_copy_client_rejects_unexpected_root_fields():
     with pytest.raises(OutboundCopyProviderError, match="invalid outbound copy"):
         client.generate(
             org_id="00000000-0000-0000-0000-000000000001",
-            context={"request": {"step_count": 2}},
+            context=prepared_copy_context(),
         )
 
 

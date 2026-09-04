@@ -1,7 +1,5 @@
 """Pipeline adapter coordinating deterministic enrichment, research, and AI scoring."""
 
-import hashlib
-import json
 from dataclasses import replace
 
 from django.utils import timezone
@@ -19,6 +17,7 @@ from sdr.intelligence.research import (
     WebsiteResearcher,
     WebsiteResearchError,
 )
+from sdr.intelligence.safety import configuration_fingerprint
 from sdr.models import (
     LeadInspection,
     LeadInspectionFallbackKind,
@@ -257,29 +256,7 @@ class LeadInspector:
         self.inspection.save()
 
     def _configuration_fingerprint(self) -> str:
-        config = self.configuration
-        payload = {
-            "research_enabled": config.research_enabled,
-            "ai_scoring_enabled": config.ai_scoring_enabled,
-            "provider": config.provider,
-            "model": config.model,
-            "reasoning_effort": config.reasoning_effort,
-            "fallback_provider": config.fallback_provider,
-            "fallback_model": config.fallback_model,
-            "fallback_reasoning_effort": config.fallback_reasoning_effort,
-            "icp_description": config.icp_description,
-            "positive_signals": config.positive_signals,
-            "negative_signals": config.negative_signals,
-            "max_research_pages": config.max_research_pages,
-            "website_timeout_seconds": config.website_timeout_seconds,
-        }
-        serialized = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(serialized.encode()).hexdigest()
+        return configuration_fingerprint(self.configuration)
 
     def fail(self, exc: Exception) -> None:
         if self.inspection is None:

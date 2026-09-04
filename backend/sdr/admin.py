@@ -8,6 +8,7 @@ from sdr.models import (
     LeadNurtureDelivery,
     LeadNurtureEnrollment,
     LeadNurtureInteraction,
+    SDRAICallAudit,
     SDRChannelComplianceRule,
     SDRComplianceEvent,
     SDRComplianceSettings,
@@ -433,6 +434,7 @@ class SDRIntelligenceSettingsAdmin(admin.ModelAdmin):
         "provider",
         "model",
         "fallback_provider",
+        "pii_handling",
     )
     list_filter = (
         "is_enabled",
@@ -440,7 +442,36 @@ class SDRIntelligenceSettingsAdmin(admin.ModelAdmin):
         "ai_scoring_enabled",
         "provider",
         "fallback_provider",
+        "pii_handling",
     )
+
+
+@admin.register(SDRAICallAudit)
+class SDRAICallAuditAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "org",
+        "purpose",
+        "status",
+        "provider",
+        "model",
+        "latency_ms",
+        "estimated_cost_microusd",
+    )
+    list_filter = ("purpose", "status", "provider", "fallback_used")
+    search_fields = ("request_id", "configuration_sha256", "failure_code")
+    readonly_fields = tuple(
+        field.name for field in SDRAICallAudit._meta.get_fields() if field.concrete
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(SDRModelCredential)

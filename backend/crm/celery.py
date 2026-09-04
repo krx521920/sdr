@@ -115,6 +115,10 @@ app.conf.beat_schedule = {
         "task": "sdr.scan_compliance_retention",
         "schedule": crontab(hour=2, minute=15),
     },
+    "purge-expired-ai-call-audits": {
+        "task": "sdr.purge_expired_ai_call_audits",
+        "schedule": crontab(hour=2, minute=45),
+    },
     "scan-matching-governance-retention": {
         "task": "matching.scan_governance_retention",
         "schedule": crontab(hour=2, minute=30),

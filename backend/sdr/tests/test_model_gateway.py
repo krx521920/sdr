@@ -1,4 +1,5 @@
 import json
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -12,11 +13,16 @@ from sdr.domain import (
     QualificationBand,
     QualificationResult,
 )
-from sdr.intelligence.contracts import AIQualification, ModelProviderError
+from sdr.intelligence.contracts import (
+    AIQualification,
+    ModelProviderError,
+    build_lead_context,
+)
 from sdr.intelligence.deepseek_client import DeepSeekLeadQualifier
 from sdr.intelligence.doubao_client import DoubaoLeadQualifier
 from sdr.intelligence.gateway import ModelGateway
-from sdr.models import SDRModelCredential
+from sdr.intelligence.safety import prepare_ai_context
+from sdr.models import SDRAICallAudit, SDRIntelligenceSettings, SDRModelCredential
 
 
 def lead_candidate():
@@ -76,6 +82,24 @@ def qualification_kwargs(candidate):
     }
 
 
+def prepared_qualification_context(candidate):
+    kwargs = qualification_kwargs(candidate)
+    return prepare_ai_context(
+        purpose="lead_qualification",
+        context=build_lead_context(
+            candidate=kwargs["candidate"],
+            baseline=kwargs["baseline"],
+            research=kwargs["research"],
+            icp_description=kwargs["icp_description"],
+            positive_signals=kwargs["positive_signals"],
+            negative_signals=kwargs["negative_signals"],
+        ),
+        pii_handling="redact",
+        max_chars=30000,
+        max_tokens=30000,
+    )
+
+
 def test_deepseek_adapter_uses_chat_completions_json_output():
     session = FakeSession(
         {
@@ -99,12 +123,17 @@ def test_deepseek_adapter_uses_chat_completions_json_output():
         session=session,
     )
 
-    result = client.qualify(**qualification_kwargs(lead_candidate()))
+    item = lead_candidate()
+    result = client.qualify(
+        org_id=item.org_id,
+        context=prepared_qualification_context(item),
+    )
 
     url, request = session.request
     payload = request["json"]
     assert url == "https://api.deepseek.com/chat/completions"
     assert request["headers"]["Authorization"] == "Bearer deepseek-key"
+    assert request["allow_redirects"] is False
     assert payload["response_format"] == {"type": "json_object"}
     assert payload["thinking"] == {"type": "enabled"}
     assert payload["reasoning_effort"] == "low"
@@ -138,11 +167,16 @@ def test_doubao_adapter_uses_responses_strict_schema():
         session=session,
     )
 
-    result = client.qualify(**qualification_kwargs(lead_candidate()))
+    item = lead_candidate()
+    result = client.qualify(
+        org_id=item.org_id,
+        context=prepared_qualification_context(item),
+    )
 
     url, request = session.request
     payload = request["json"]
     assert url == "https://ark.cn-beijing.volces.com/api/v3/responses"
+    assert request["allow_redirects"] is False
     assert payload["text"]["format"]["type"] == "json_schema"
     assert payload["text"]["format"]["strict"] is True
     assert payload["thinking"] == {"type": "disabled"}
@@ -154,6 +188,13 @@ def test_doubao_adapter_uses_responses_strict_schema():
 @pytest.mark.django_db
 @override_settings(OPENAI_API_KEY="primary-key", DEEPSEEK_API_KEY="fallback-key")
 def test_gateway_fails_over_and_records_attempts(org_a):
+    configuration = SDRIntelligenceSettings.objects.create(
+        org=org_a,
+        is_enabled=True,
+        fallback_provider="deepseek",
+        fallback_model="deepseek-v4-flash",
+    )
+
     class PrimaryClient:
         def qualify(self, **kwargs):
             raise ModelProviderError(
@@ -182,10 +223,14 @@ def test_gateway_fails_over_and_records_attempts(org_a):
             ("openai", "gpt-5.6-luna", "low"),
             ("deepseek", "deepseek-v4-flash", "low"),
         ),
-        client_factory=client_factory,
+        configuration=configuration,
     )
 
-    result = gateway.qualify()
+    with patch(
+        "sdr.intelligence.gateway._build_provider_client",
+        side_effect=client_factory,
+    ):
+        result = gateway.qualify(**qualification_kwargs(lead_candidate()))
 
     assert result.provider == "deepseek"
     assert result.gateway_fallback_used is True
@@ -195,11 +240,22 @@ def test_gateway_fails_over_and_records_attempts(org_a):
     ]
     assert result.attempts[0]["error_code"] == "openai_request_failed"
     assert result.attempts[1]["credential_source"] == "platform"
+    audits = list(SDRAICallAudit.objects.filter(org=org_a).order_by("route_index"))
+    assert [audit.status for audit in audits] == ["failed", "completed"]
+    assert audits[0].request_id == audits[1].request_id
+    assert audits[0].fallback_used is False
+    assert audits[1].fallback_used is True
 
 
 @pytest.mark.django_db
 @override_settings(DEEPSEEK_API_KEY="platform-key")
 def test_gateway_prefers_tenant_credential(org_a):
+    configuration = SDRIntelligenceSettings.objects.create(
+        org=org_a,
+        is_enabled=True,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
     credential = SDRModelCredential(org=org_a, provider="deepseek")
     credential.set_api_key("tenant-key")
     credential.save()
@@ -220,11 +276,15 @@ def test_gateway_prefers_tenant_credential(org_a):
         captured.update(kwargs)
         return FakeClient()
 
-    result = ModelGateway(
-        org_id=org_a.id,
-        routes=(("deepseek", "deepseek-v4-flash", "low"),),
-        client_factory=client_factory,
-    ).qualify()
+    with patch(
+        "sdr.intelligence.gateway._build_provider_client",
+        side_effect=client_factory,
+    ):
+        result = ModelGateway(
+            org_id=org_a.id,
+            routes=(("deepseek", "deepseek-v4-flash", "low"),),
+            configuration=configuration,
+        ).qualify(**qualification_kwargs(lead_candidate()))
 
     assert captured["api_key"] == "tenant-key"
     assert result.attempts[0]["credential_source"] == "tenant"

@@ -1,8 +1,10 @@
 """Durable intake records for reliable, tenant-scoped SDR processing."""
 
+import uuid
 from datetime import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
@@ -63,6 +65,14 @@ def default_send_weekdays() -> list[int]:
 
 def default_compliance_channels() -> list[str]:
     return ["email", "whatsapp", "linkedin", "phone", "wechat"]
+
+
+def default_ai_providers() -> list[str]:
+    return list(settings.AI_GATEWAY_ALLOWED_PROVIDERS)
+
+
+def default_ai_purposes() -> list[str]:
+    return ["lead_qualification", "outbound_copy"]
 
 
 class SDRComplianceChannel(models.TextChoices):
@@ -230,6 +240,19 @@ class SDRModelProvider(models.TextChoices):
     DEEPSEEK = "deepseek", "DeepSeek"
 
 
+class SDRPIIHandling(models.TextChoices):
+    REDACT = "redact", "Redact"
+    BLOCK = "block", "Block"
+    ALLOW = "allow", "Allow with tenant approval"
+
+
+class SDRAICallStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+    BLOCKED = "blocked", "Blocked"
+
+
 class LeadInspectionFallbackKind(models.TextChoices):
     NONE = "", "None"
     MODEL = "model", "Model provider"
@@ -294,6 +317,25 @@ class SDRIntelligenceSettings(BaseOrgModel):
         default=5,
         validators=[MinValueValidator(1), MaxValueValidator(15)],
     )
+    allowed_ai_providers = models.JSONField(default=default_ai_providers)
+    allowed_ai_purposes = models.JSONField(default=default_ai_purposes)
+    pii_handling = models.CharField(
+        max_length=12,
+        choices=SDRPIIHandling.choices,
+        default=SDRPIIHandling.REDACT,
+    )
+    max_ai_input_chars = models.PositiveIntegerField(
+        default=30000,
+        validators=[MinValueValidator(1000), MaxValueValidator(200000)],
+    )
+    max_ai_input_tokens = models.PositiveIntegerField(
+        default=30000,
+        validators=[MinValueValidator(256), MaxValueValidator(100000)],
+    )
+    ai_audit_retention_days = models.PositiveSmallIntegerField(
+        default=90,
+        validators=[MinValueValidator(1), MaxValueValidator(3650)],
+    )
 
     class Meta:
         db_table = "sdr_intelligence_settings"
@@ -332,6 +374,53 @@ class SDRModelCredential(BaseOrgModel):
 
     def __str__(self) -> str:
         return f"{self.org_id}:{self.provider}"
+
+
+class SDRAICallAudit(BaseOrgModel):
+    """Metadata-only audit ledger for every attempted external model call."""
+
+    request_id = models.UUIDField(default=uuid.uuid4, db_index=True)
+    purpose = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16,
+        choices=SDRAICallStatus.choices,
+        default=SDRAICallStatus.PENDING,
+    )
+    provider = models.CharField(max_length=24, blank=True)
+    model = models.CharField(max_length=100, blank=True)
+    credential_source = models.CharField(max_length=16, blank=True)
+    route_index = models.PositiveSmallIntegerField(default=0)
+    prompt_version = models.CharField(max_length=100)
+    configuration_sha256 = models.CharField(max_length=64)
+    input_sha256 = models.CharField(max_length=64, blank=True)
+    field_paths = models.JSONField(default=list, blank=True)
+    pii_findings = models.JSONField(default=dict, blank=True)
+    redaction_count = models.PositiveIntegerField(default=0)
+    input_chars = models.PositiveIntegerField(default=0)
+    estimated_input_tokens = models.PositiveIntegerField(default=0)
+    input_tokens = models.PositiveIntegerField(null=True, blank=True)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True)
+    estimated_cost_microusd = models.PositiveBigIntegerField(null=True, blank=True)
+    latency_ms = models.PositiveIntegerField(null=True, blank=True)
+    response_id_sha256 = models.CharField(max_length=64, blank=True)
+    failure_code = models.CharField(max_length=100, blank=True)
+    failure_reason = models.CharField(max_length=500, blank=True)
+    fallback_used = models.BooleanField(default=False)
+    retention_expires_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "sdr_ai_call_audit"
+        ordering = ("-created_at", "id")
+        indexes = [
+            models.Index(
+                fields=["org", "purpose", "-created_at"],
+                name="sdr_ai_audit_purpose_idx",
+            ),
+            models.Index(
+                fields=["org", "status", "-created_at"],
+                name="sdr_ai_audit_status_idx",
+            ),
+        ]
 
 
 class SDRResponseSettings(BaseOrgModel):

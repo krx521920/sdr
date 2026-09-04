@@ -41,11 +41,14 @@ Responses adapters; DeepSeek uses a Chat Completions adapter. Provider output is
 normalized into one qualification contract and validated locally before it can
 affect routing or CRM data.
 
-The model receives no contact name, email address, or phone number. It receives
-the job title, whether contact methods exist, company data, the tenant ICP, the
-baseline reasons, and bounded website text. The prompt explicitly treats all
-website content as untrusted data. Returned scores must be 0-100 and agree with
-the platform's fixed band thresholds or the response is rejected.
+Structured contact name, email, and phone fields are excluded; only booleans
+indicating whether contact methods exist are included. Because submitted
+messages and website text can themselves contain PII, the unified AI gateway
+scans and redacts them before any provider request. Unknown fields, secrets,
+high-risk identifiers, and over-limit input are rejected before transport. The
+prompt also treats website content as untrusted data. Returned scores must be
+0-100 and agree with the platform's fixed band thresholds or the response is
+rejected.
 
 References:
 
@@ -81,7 +84,7 @@ and a safe error code/message.
 
 ## Tenant isolation and administration
 
-`sdr_intelligence_settings`, `sdr_model_credential`, and
+`sdr_intelligence_settings`, `sdr_model_credential`, `sdr_ai_call_audit`, and
 `sdr_lead_inspection` carry `org_id` and are protected by PostgreSQL row-level
 security. The REST endpoints additionally require an organization administrator
 and filter every lookup by the current organization.
@@ -90,13 +93,14 @@ Administration UI: `/settings/sdr-intelligence`
 
 ```text
 GET/PUT/PATCH /api/sdr/intelligence/settings/
+GET           /api/sdr/intelligence/ai-audits/
 GET           /api/sdr/intelligence/inspections/
 GET           /api/sdr/intelligence/inspections/<inspection-id>/
 ```
 
 ## Deployment
 
-Apply `sdr.0004_multi_model_gateway` and configure:
+Apply through `sdr.0025_ai_safety_gateway` and configure:
 
 ```dotenv
 # See model-gateway.md for OpenAI, Doubao, DeepSeek, and BYOK settings.

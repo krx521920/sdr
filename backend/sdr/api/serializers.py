@@ -9,6 +9,7 @@ from common.models import Profile
 from common.utils import COUNTRIES
 from sdr.domain import LeadSource, QualificationBand
 from sdr.intelligence.registry import provider_catalog, provider_registry
+from sdr.intelligence.safety import USE_CASE_CONTRACTS
 from sdr.models import (
     EmailSuppressionReason,
     LeadDelivery,
@@ -27,6 +28,7 @@ from sdr.models import (
     OutboundProspectStatus,
     SalesFeedbackDecision,
     SalesFeedbackReason,
+    SDRAICallAudit,
     SDRApolloCandidate,
     SDRChannelComplianceRule,
     SDRComplianceChannel,
@@ -1170,6 +1172,12 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
             "negative_signals",
             "max_research_pages",
             "website_timeout_seconds",
+            "allowed_ai_providers",
+            "allowed_ai_purposes",
+            "pii_handling",
+            "max_ai_input_chars",
+            "max_ai_input_tokens",
+            "ai_audit_retention_days",
             "openai_configured",
             "allowed_models",
             "allowed_reasoning_efforts",
@@ -1257,6 +1265,41 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
         if provider not in registry or model not in registry[provider].models:
             errors["model"] = "This model is not allowed for the selected provider."
 
+        allowed_providers = attrs.get(
+            "allowed_ai_providers",
+            getattr(current, "allowed_ai_providers", list(registry)),
+        )
+        if (
+            not isinstance(allowed_providers, list)
+            or not allowed_providers
+            or any(
+                not isinstance(item, str) or item not in registry
+                for item in allowed_providers
+            )
+            or len(set(allowed_providers)) != len(allowed_providers)
+        ):
+            errors["allowed_ai_providers"] = (
+                "Select a unique, non-empty subset of deployment-approved providers."
+            )
+        elif provider not in allowed_providers:
+            errors["provider"] = "The primary provider must be tenant-approved."
+
+        allowed_purposes = attrs.get(
+            "allowed_ai_purposes",
+            getattr(current, "allowed_ai_purposes", list(USE_CASE_CONTRACTS)),
+        )
+        if (
+            not isinstance(allowed_purposes, list)
+            or any(
+                not isinstance(item, str) or item not in USE_CASE_CONTRACTS
+                for item in allowed_purposes
+            )
+            or len(set(allowed_purposes)) != len(allowed_purposes)
+        ):
+            errors["allowed_ai_purposes"] = (
+                "Select only registered, unique AI purposes."
+            )
+
         fallback_provider = attrs.get(
             "fallback_provider", getattr(current, "fallback_provider", "")
         )
@@ -1270,6 +1313,10 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
             ):
                 errors["fallback_model"] = (
                     "Select an allowed model for the fallback provider."
+                )
+            elif fallback_provider not in allowed_providers:
+                errors["fallback_provider"] = (
+                    "The fallback provider must be tenant-approved."
                 )
         else:
             attrs["fallback_model"] = ""
@@ -1320,6 +1367,41 @@ class SDRIntelligenceSettingsSerializer(serializers.ModelSerializer):
                     credential.is_active = True
                     credential.save()
         return instance
+
+
+class SDRAICallAuditSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SDRAICallAudit
+        fields = (
+            "id",
+            "request_id",
+            "purpose",
+            "status",
+            "provider",
+            "model",
+            "credential_source",
+            "route_index",
+            "prompt_version",
+            "configuration_sha256",
+            "input_sha256",
+            "field_paths",
+            "pii_findings",
+            "redaction_count",
+            "input_chars",
+            "estimated_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "estimated_cost_microusd",
+            "latency_ms",
+            "response_id_sha256",
+            "failure_code",
+            "failure_reason",
+            "fallback_used",
+            "retention_expires_at",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
 
 
 class LeadInspectionSerializer(serializers.ModelSerializer):

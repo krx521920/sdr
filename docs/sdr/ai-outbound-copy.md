@@ -6,8 +6,11 @@ and never activates or launches a sequence automatically.
 
 ## Safety boundary
 
-- The model receives campaign context plus at most 10 prospect samples. Prospect
-  fields are marked as untrusted data and cannot override the system instructions.
+- The model receives campaign context plus an anonymous aggregation of up to 10
+  prospects' job titles, companies, industries, and countries. Names, addresses,
+  contact methods, and raw prospect notes are never included.
+- The same unified AI preflight used by lead qualification applies recursive
+  field allow-lists, PII redaction, sensitive-content blocking, and input limits.
 - Prompts prohibit invented customers, metrics, integrations, guarantees, and
   other unsupported proof. Operators must supply approved proof points.
 - Provider responses must match the exact versioned JSON shape and use only the
@@ -44,8 +47,9 @@ reviewer, timestamps, and any terminal error for audit and troubleshooting.
 
 ## Provider configuration
 
-Copy generation reuses the organization SDR Intelligence routing and encrypted
-credential resolution. OpenAI and Doubao use Responses structured output;
+Copy generation uses the same `UnifiedAIGateway`, organization policy, audit
+ledger, routing, and encrypted credential resolution as qualification. OpenAI
+and Doubao use Responses structured output;
 DeepSeek uses Chat Completions JSON output followed by the same strict local
 validation. Primary and fallback routes follow the configured provider registry.
 

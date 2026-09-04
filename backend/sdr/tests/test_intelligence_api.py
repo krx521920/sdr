@@ -67,6 +67,29 @@ def test_intelligence_settings_are_admin_only_and_tenant_scoped(
 @pytest.mark.django_db
 @override_settings(
     ROOT_URLCONF="sdr.tests.urls",
+    OPENAI_API_KEY="platform-key",
+    AI_GATEWAY_ALLOWED_REASONING_EFFORTS=("medium",),
+)
+def test_intelligence_defaults_and_updates_stay_inside_reasoning_allowlist(
+    admin_client,
+):
+    initial = admin_client.get("/api/sdr/intelligence/settings/")
+    blocked = admin_client.patch(
+        "/api/sdr/intelligence/settings/",
+        {"reasoning_effort": "low"},
+        format="json",
+    )
+
+    assert initial.status_code == 200
+    assert initial.json()["reasoning_effort"] == "medium"
+    assert initial.json()["allowed_reasoning_efforts"] == ["medium"]
+    assert blocked.status_code == 400
+    assert "reasoning_effort" in blocked.json()
+
+
+@pytest.mark.django_db
+@override_settings(
+    ROOT_URLCONF="sdr.tests.urls",
     DEEPSEEK_API_KEY="",
     AI_GATEWAY_ALLOW_TENANT_KEYS=True,
 )

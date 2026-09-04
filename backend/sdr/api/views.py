@@ -20,6 +20,7 @@ from sdr.api.serializers import (
     LeadIntakeOperationsSerializer,
     LeadNurtureEnrollmentActionSerializer,
     LeadNurtureEnrollmentSerializer,
+    SDRAICallAuditSerializer,
     SDRAnalyticsQuerySerializer,
     SDRApolloCandidateSerializer,
     SDRChannelComplianceRuleSerializer,
@@ -88,6 +89,7 @@ from sdr.models import (
     NurtureReplySentiment,
     OutboundCampaignStatus,
     OutboundProspectStatus,
+    SDRAICallAudit,
     SDRApolloCandidate,
     SDRChannelComplianceRule,
     SDRComplianceChannel,
@@ -1529,6 +1531,30 @@ class SDRIntelligenceSettingsView(APIView):
         serializer.is_valid(raise_exception=True)
         configuration = serializer.save()
         return Response(self._response(configuration))
+
+
+class SDRAICallAuditListView(APIView):
+    permission_classes = (IsAuthenticated, HasOrgContext, IsOrgAdmin)
+
+    @extend_schema(
+        tags=["SDR Intelligence"],
+        responses={200: SDRAICallAuditSerializer(many=True)},
+    )
+    def get(self, request):
+        queryset = SDRAICallAudit.objects.filter(org=request.org)
+        purpose = request.query_params.get("purpose", "").strip()
+        status_filter = request.query_params.get("status", "").strip()
+        if purpose:
+            queryset = queryset.filter(purpose=purpose)
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        try:
+            limit = int(request.query_params.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        records = queryset.order_by("-created_at", "id")[:limit]
+        return Response(SDRAICallAuditSerializer(records, many=True).data)
 
 
 class LeadInspectionListView(APIView):

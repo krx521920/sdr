@@ -10,6 +10,7 @@ from django.utils import timezone
 from automation.tenant_context import database_org_context
 from common.models import Org
 from sdr.compliance import scan_retention
+from sdr.models import SDRAICallAudit, SDRAICallStatus
 from sdr.nurture import reconcile_nurture_jobs
 from sdr.outbound import reconcile_outbound_campaigns
 from sdr.response import reconcile_recent_response_jobs
@@ -132,3 +133,41 @@ def scan_all_compliance_retention():
                     org_id,
                 )
     return {"due": due, "anonymized": anonymized}
+
+
+@shared_task(name="sdr.purge_expired_ai_call_audits")
+def purge_expired_ai_call_audits():
+    """Enforce each invocation's metadata-retention deadline per tenant."""
+
+    deleted = 0
+    abandoned = 0
+    now = timezone.now()
+    abandoned_before = now - timedelta(hours=1)
+    for org_id in Org.objects.values_list("id", flat=True).iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                abandoned += SDRAICallAudit.objects.filter(
+                    org_id=org_id,
+                    status=SDRAICallStatus.PENDING,
+                    created_at__lt=abandoned_before,
+                ).update(
+                    status=SDRAICallStatus.FAILED,
+                    failure_code="ai_attempt_abandoned",
+                    failure_reason="The process ended before the AI attempt completed.",
+                    updated_at=now,
+                )
+                count, _ = (
+                    SDRAICallAudit.objects.filter(
+                        org_id=org_id,
+                        retention_expires_at__lte=now,
+                    )
+                    .exclude(status=SDRAICallStatus.PENDING)
+                    .delete()
+                )
+                deleted += count
+            except Exception:
+                logger.exception(
+                    "Could not purge expired AI call audits for org %s",
+                    org_id,
+                )
+    return {"deleted": deleted, "abandoned": abandoned}

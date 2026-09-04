@@ -5,11 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
-TEST_INTEGRATION_ENCRYPTION_KEY = base64.urlsafe_b64encode(b"k" * 32).decode(
-    "ascii"
-)
+TEST_INTEGRATION_ENCRYPTION_KEY = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")
 
 
 def _production_env(tmp_path):
@@ -79,7 +76,11 @@ def test_production_settings_require_bucket_when_s3_explicitly_enabled(tmp_path)
     env = _production_env(tmp_path)
     env["USE_S3_STORAGE"] = "true"
     result = subprocess.run(
-        [sys.executable, "-c", "from django.conf import settings; print(settings.DEBUG)"],
+        [
+            sys.executable,
+            "-c",
+            "from django.conf import settings; print(settings.DEBUG)",
+        ],
         cwd=BACKEND_ROOT,
         env=env,
         capture_output=True,
@@ -129,3 +130,22 @@ def test_production_settings_reject_invalid_integration_encryption_key(tmp_path)
     assert result.returncode != 0
     assert "INTEGRATION_ENCRYPTION_KEY must be a valid Fernet key" in output
     assert invalid_key not in output
+
+
+def test_settings_reject_invalid_explicit_ai_provider_allowlist(tmp_path):
+    env = _production_env(tmp_path)
+    env["AI_GATEWAY_ALLOWED_PROVIDERS"] = "unknown-provider"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from django.conf import settings; print(settings.DEBUG)",
+        ],
+        cwd=BACKEND_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "AI_GATEWAY_ALLOWED_PROVIDERS must contain" in result.stderr

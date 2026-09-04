@@ -7,17 +7,15 @@ from uuid import UUID
 
 import requests
 
-from sdr.domain import LeadCandidate, QualificationResult
 from sdr.intelligence.contracts import (
     AIQualification,
     ModelProviderError,
-    build_lead_context,
     json_schema_prompt,
     optional_nonnegative_int,
     qualification_instructions,
     validate_result,
 )
-from sdr.intelligence.research import ResearchResult
+from sdr.intelligence.safety import PreparedAIContext, prepared_context_json
 
 
 class DeepSeekQualificationError(ModelProviderError):
@@ -48,27 +46,15 @@ class DeepSeekLeadQualifier:
         self,
         *,
         org_id: UUID,
-        candidate: LeadCandidate,
-        baseline: QualificationResult,
-        research: ResearchResult | None,
-        icp_description: str,
-        positive_signals: str,
-        negative_signals: str,
-        sales_feedback_calibration: dict | None = None,
+        context: PreparedAIContext,
     ) -> AIQualification:
         if not self.api_key:
             raise DeepSeekQualificationError(
                 "DeepSeek API key is not configured.",
                 code="deepseek_not_configured",
             )
-        context = build_lead_context(
-            candidate=candidate,
-            baseline=baseline,
-            research=research,
-            icp_description=icp_description,
-            positive_signals=positive_signals,
-            negative_signals=negative_signals,
-            sales_feedback_calibration=sales_feedback_calibration,
+        serialized_context = prepared_context_json(
+            context, expected_purpose="lead_qualification"
         )
         payload = {
             "model": self.model,
@@ -79,11 +65,7 @@ class DeepSeekLeadQualifier:
                 },
                 {
                     "role": "user",
-                    "content": json.dumps(
-                        context,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                    "content": serialized_context,
                 },
             ],
             "response_format": {"type": "json_object"},
@@ -104,6 +86,7 @@ class DeepSeekLeadQualifier:
                 },
                 json=payload,
                 timeout=self.timeout_seconds,
+                allow_redirects=False,
             )
         except requests.RequestException as exc:
             raise DeepSeekQualificationError(
@@ -111,6 +94,11 @@ class DeepSeekLeadQualifier:
                 code="deepseek_request_failed",
                 retryable=True,
             ) from exc
+        if 300 <= response.status_code < 400:
+            raise DeepSeekQualificationError(
+                "DeepSeek qualification refused an HTTP redirect.",
+                code="deepseek_redirect_blocked",
+            )
         if response.status_code >= 400:
             raise DeepSeekQualificationError(
                 f"DeepSeek qualification returned HTTP {response.status_code}.",

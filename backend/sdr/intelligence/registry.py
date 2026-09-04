@@ -17,7 +17,7 @@ class ProviderDefinition:
 
 
 def provider_registry() -> dict[str, ProviderDefinition]:
-    return {
+    registry = {
         "openai": ProviderDefinition(
             provider="openai",
             label="OpenAI",
@@ -45,6 +45,11 @@ def provider_registry() -> dict[str, ProviderDefinition]:
             models=tuple(settings.DEEPSEEK_ALLOWED_MODELS),
             timeout_seconds=settings.DEEPSEEK_API_TIMEOUT_SECONDS,
         ),
+    }
+    return {
+        provider: definition
+        for provider, definition in registry.items()
+        if provider in settings.AI_GATEWAY_ALLOWED_PROVIDERS
     }
 
 
