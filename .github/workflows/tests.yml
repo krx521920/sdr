@@ -3,32 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'mcp_server/**'
-      - 'docker/**'
-      - 'Dockerfile'
-      - 'docker-compose.yml'
-      - '.dockerignore'
-      - '.env.docker'
-      - '.gitignore'
-      - '.coveragerc'
-      - '.github/workflows/tests.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'mcp_server/**'
-      - 'docker/**'
-      - 'Dockerfile'
-      - 'docker-compose.yml'
-      - '.dockerignore'
-      - '.env.docker'
-      - '.gitignore'
-      - '.coveragerc'
-      - '.github/workflows/tests.yml'
 
 permissions:
   contents: read
@@ -44,7 +20,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_DB: crm_ci
           POSTGRES_USER: postgres
@@ -83,8 +59,7 @@ jobs:
         working-directory: backend
         run: uv sync --frozen
 
-      # The suite runs with --no-migrations for speed, so nothing else would
-      # catch a model change that is missing its migration.
+      # Keep model state and the committed migration graph in sync.
       - name: Check for missing migrations
         working-directory: backend
         env:
@@ -127,13 +102,10 @@ jobs:
           uv run python manage.py migrate --check
           uv run python manage.py manage_rls --verify-user --no-color
 
-          rls_status="$(uv run python manage.py manage_rls --status --no-color)"
+          rls_status="$(uv run python manage.py manage_rls --status --strict --no-color)"
           printf '%s\n' "$rls_status"
-          if printf '%s\n' "$rls_status" | grep -Eqi 'TABLE NOT FOUND|: disabled$'; then
-            echo 'RLS status contains an unsafe or incomplete table state.' >&2
-            exit 1
-          fi
-          printf '%s\n' "$rls_status" | grep -Eq 'Enabled: [1-9][0-9]*, Disabled: 0'
+          printf '%s\n' "$rls_status" | grep -Eq \
+            'Enabled: [1-9][0-9]*, Forced: [1-9][0-9]*, Disabled: 0, Missing: 0'
 
           role_flags="$(psql -h 127.0.0.1 -U crm_ci -d crm_acceptance -At \
             -c "SELECT rolsuper::int || '|' || rolbypassrls::int FROM pg_roles WHERE rolname = current_user;")"
@@ -152,20 +124,6 @@ jobs:
           DBPORT: '5432'
         run: uv run pytest -m postgres_only --no-cov --tb=short -v
 
-      - name: Generate coverage badge
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        working-directory: backend
-        run: uvx --from "genbadge[coverage]" genbadge coverage -i coverage.xml -o ../coverage-badge.svg
-
-      - name: Upload coverage badge
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-badge
-          path: coverage-badge.svg
-          if-no-files-found: error
-          retention-days: 1
-
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -176,13 +134,14 @@ jobs:
 
   docker-runtime-acceptance:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       COMPOSE_PROJECT_NAME: sdr-ci-${{ github.run_id }}-${{ github.run_attempt }}
       POSTGRES_HOST_PORT: '15432'
       REDIS_HOST_PORT: '16379'
       BACKEND_HOST_PORT: '18000'
       CELERY_WORKER_CONCURRENCY: '2'
+      SDR_BACKEND_IMAGE: sdr-backend-ci-${{ github.run_id }}-${{ github.run_attempt }}:acceptance
 
     steps:
       - uses: actions/checkout@v4
@@ -215,7 +174,7 @@ jobs:
             > .env.docker.local
 
       - name: Build backend runtime images
-        run: docker compose build --pull backend celery-worker celery-beat
+        run: docker compose build --pull --no-cache backend
 
       - name: Start production-like runtime
         run: >-
@@ -225,7 +184,8 @@ jobs:
       - name: Verify migrations and RLS role
         run: |
           docker compose exec -T backend python manage.py migrate --check
-          docker compose exec -T backend python manage.py manage_rls --verify-user --no-color
+          docker compose exec -T backend python manage.py manage_rls --verify-user --strict --no-color
+          docker compose exec -T backend python manage.py manage_rls --status --strict --no-color
 
       - name: Verify backend health loop
         run: |
@@ -235,7 +195,7 @@ jobs:
 
           for _ in range(20):
               request = urllib.request.Request(
-                  'http://127.0.0.1:8000/healthz/',
+                  'http://127.0.0.1:8000/readyz/',
                   headers={'X-Forwarded-Proto': 'https'},
               )
               with urllib.request.urlopen(request, timeout=5) as response:
@@ -246,10 +206,45 @@ jobs:
 
       - name: Verify Celery worker and beat
         run: |
+          docker compose exec -T backend python -c "from crm.celery import app; legacy = {'generate-recurring-invoices', 'process-payment-reminders', 'check-stale-opportunities', 'check-goal-milestones', 'scan-for-breached-cases'}; active = legacy.intersection(app.conf.beat_schedule); assert not active, active; print('legacy_non_durable_beat_tasks=disabled')"
           docker compose exec -T backend python -c "from crm.celery import app; replies = app.control.inspect(timeout=10).ping(); assert replies and any(value.get('ok') == 'pong' for value in replies.values()), replies; print('celery_ping=ok')"
-          docker compose ps --status running --services | grep -qx celery-beat
+          docker compose exec -T celery-beat python manage.py check_celery_beat --max-age 120
 
       - name: Verify real matching through Celery
+        timeout-minutes: 4
+        run: >-
+          docker compose exec -T backend python manage.py verify_matching_celery
+          --confirm-live-celery --timeout 120 --poll-interval 1
+
+      - name: Verify service restart recovery
+        run: |
+          recovery_token="$(docker compose exec -T backend python -c 'import uuid; print(uuid.uuid4())')"
+          docker compose stop celery-worker celery-beat
+          docker compose exec -T redis redis-cli DEL crm:celery:beat:heartbeat
+          docker compose exec -T backend python manage.py verify_matching_recovery \
+            --prepare "$recovery_token" --confirm-workers-stopped
+          sleep 2
+          docker compose restart db redis backend celery-worker celery-beat
+          docker compose up -d --no-build --wait --wait-timeout 300 \
+            db redis backend celery-worker celery-beat
+          docker inspect \
+            --format '{{.Name}} restart={{.HostConfig.RestartPolicy.Name}}' \
+            "${COMPOSE_PROJECT_NAME}-db-1" \
+            "${COMPOSE_PROJECT_NAME}-redis-1" \
+            "${COMPOSE_PROJECT_NAME}-backend-1" \
+            "${COMPOSE_PROJECT_NAME}-celery-worker-1" \
+            "${COMPOSE_PROJECT_NAME}-celery-beat-1" \
+            | tee /tmp/sdr-restart-policies.txt
+          test "$(grep -c 'restart=unless-stopped' /tmp/sdr-restart-policies.txt)" -eq 5
+          docker compose exec -T backend python manage.py migrate --check
+          docker compose exec -T backend python manage.py manage_rls --verify-user --strict --no-color
+          docker compose exec -T backend python manage.py manage_rls --status --strict --no-color
+          docker compose exec -T backend python -c "from crm.celery import app; replies = app.control.inspect(timeout=10).ping(); assert replies and any(value.get('ok') == 'pong' for value in replies.values()), replies; print('celery_ping_after_restart=ok')"
+          docker compose exec -T celery-beat python manage.py check_celery_beat --max-age 120
+          docker compose exec -T backend python manage.py verify_matching_recovery \
+            --verify "$recovery_token" --timeout 120
+
+      - name: Verify matching after restart
         timeout-minutes: 4
         run: >-
           docker compose exec -T backend python manage.py verify_matching_celery
@@ -280,7 +275,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 11.17.0
 
       - name: Install dependencies
         working-directory: frontend
@@ -292,11 +287,11 @@ jobs:
 
       - name: Prettier format check
         working-directory: frontend
-        run: pnpm prettier --check .
+        run: pnpm exec prettier --check .
 
       - name: ESLint
         working-directory: frontend
-        run: pnpm eslint .
+        run: pnpm exec eslint .
 
       - name: Type check (svelte-check)
         working-directory: frontend
@@ -328,36 +323,3 @@ jobs:
       - name: Run MCP tests
         working-directory: mcp_server
         run: uv run pytest --tb=short -v
-
-  coverage-badge:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs:
-      - backend-tests
-      - docker-runtime-acceptance
-      - frontend-checks
-      - mcp-tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download coverage badge
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-badge
-          path: .
-
-      - name: Commit coverage badge
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add -f coverage-badge.svg
-          if git diff --staged --quiet; then
-            echo 'Coverage badge is unchanged.'
-            exit 0
-          fi
-          git commit -m "Update coverage badge [skip ci]"
-          git push origin HEAD:main

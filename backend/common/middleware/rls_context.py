@@ -116,6 +116,7 @@ class RequireOrgContext:
     # an appended or adjacent route cannot inherit the exemption.
     EXACT_EXEMPT_PATHS = {
         "/api/sdr/public/ses-feedback/",
+        "/readyz/",
     }
 
     # Path prefixes that don't require org context.

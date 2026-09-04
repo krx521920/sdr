@@ -1,6 +1,7 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    restart: unless-stopped
     env_file:
       - .env.docker
       # Optional local overrides (gitignored); values here win over .env.docker.
@@ -8,9 +9,11 @@ services:
         required: false
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init-rls-user.sql:/docker-entrypoint-initdb.d/init-rls-user.sql:ro
+      - ./docker/postgres/init-rls-user.sh:/docker-entrypoint-initdb.d/10-init-rls-user.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
       interval: 5s
       timeout: 3s
       retries: 5
@@ -18,7 +21,11 @@ services:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -27,23 +34,50 @@ services:
     ports:
       - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
 
-  backend:
+  migrate:
+    image: ${SDR_BACKEND_IMAGE:-sdr-backend:local}
     build:
       context: .
       dockerfile: Dockerfile
+    restart: "no"
+    env_file:
+      - .env.docker
+      - path: .env.docker.local
+        required: false
+    environment:
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
+    depends_on:
+      db:
+        condition: service_healthy
+    # This is the only service that receives bootstrap database/admin secrets.
+    # It exits after migrations and the optional administrator bootstrap.  The
+    # DBUSER/DBPASSWORD prefix applies only to migrate; create_default_admin
+    # reconnects with the least-privileged application role from env_file.
+    command: >-
+      /bin/sh -c 'DBUSER="$$POSTGRES_USER" DBPASSWORD="$$POSTGRES_PASSWORD"
+      python manage.py migrate --noinput && exec python manage.py create_default_admin'
+
+  backend:
+    image: ${SDR_BACKEND_IMAGE:-sdr-backend:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
     env_file:
       - .env.docker
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
     environment:
+      # Long-running processes do not receive bootstrap database/admin secrets.
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+      ADMIN_PASSWORD: ""
       STATIC_ROOT: /tmp/staticfiles
       MEDIA_ROOT: /tmp/media
       SERVER_LOG_PATH: /tmp/server.log
       SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
-    volumes:
-      - ./backend:/app
-      - ./docker/backend/entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
     healthcheck:
@@ -54,13 +88,13 @@ services:
         - >-
           import urllib.request;
           request = urllib.request.Request(
-          'http://127.0.0.1:8000/healthz/',
+          'http://127.0.0.1:8000/readyz/',
           headers={'X-Forwarded-Proto': 'https'});
           assert urllib.request.urlopen(request, timeout=5).status == 200
       interval: 10s
       timeout: 6s
-      # A fresh production database can spend more than a minute applying the
-      # full migration history before Gunicorn starts accepting requests.
+      # The one-shot migration dependency can take more than a minute before
+      # this container is allowed to start Gunicorn.
       retries: 12
       start_period: 120s
     depends_on:
@@ -68,22 +102,67 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command: /bin/bash /entrypoint.sh
 
   celery-worker:
+    image: ${SDR_BACKEND_IMAGE:-sdr-backend:local}
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     env_file:
       - .env.docker
       # Optional local overrides (gitignored); values here win over .env.docker.
       - path: .env.docker.local
         required: false
     environment:
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+      ADMIN_PASSWORD: ""
+      SERVER_LOG_PATH: /tmp/server.log
+      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy
+    command: >-
+      celery -A crm worker --loglevel=info --queues=celery,default
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - celery -A crm inspect ping -d "celery@$$HOSTNAME" --timeout=5 | grep -q pong
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  celery-beat:
+    image: ${SDR_BACKEND_IMAGE:-sdr-backend:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+      # Optional local overrides (gitignored); values here win over .env.docker.
+      - path: .env.docker.local
+        required: false
+    environment:
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+      ADMIN_PASSWORD: ""
       SERVER_LOG_PATH: /tmp/server.log
       SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
     volumes:
-      - ./backend:/app
+      - celery_beat_data:/var/lib/celery
     depends_on:
       db:
         condition: service_healthy
@@ -92,41 +171,22 @@ services:
       backend:
         condition: service_healthy
     command: >-
-      celery -A crm worker --loglevel=info --queues=celery,default
-      --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
-
-  celery-beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file:
-      - .env.docker
-      # Optional local overrides (gitignored); values here win over .env.docker.
-      - path: .env.docker.local
-        required: false
-    environment:
-      SERVER_LOG_PATH: /tmp/server.log
-      SECURITY_AUDIT_LOG_PATH: /tmp/security_audit.log
-    volumes:
-      - ./backend:/app
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    command: celery -A crm beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+      celery -A crm beat --loglevel=info
+      --schedule=/var/lib/celery/celerybeat-schedule
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "check_celery_beat", "--max-age", "120"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    env_file:
-      - .env.docker
-      # Optional local overrides (gitignored); values here win over .env.docker.
-      - path: .env.docker.local
-        required: false
+    restart: unless-stopped
+    environment:
+      PUBLIC_DJANGO_API_URL: ${PUBLIC_DJANGO_API_URL:-http://localhost:8000}
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -135,4 +195,6 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
+  celery_beat_data:
   frontend_node_modules:

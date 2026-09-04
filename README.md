@@ -7,7 +7,7 @@ A modern, open-source CRM platform built with Django REST Framework and SvelteKi
 ![Django](https://img.shields.io/badge/django-5.x-green.svg)
 ![SvelteKit](https://img.shields.io/badge/sveltekit-2.x-orange.svg)
 ![Svelte](https://img.shields.io/badge/svelte-5-orange.svg)
-![Coverage](./coverage-badge.svg)
+[![CI](https://github.com/krx521920/sdr/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/krx521920/sdr/actions/workflows/tests.yml)
 
 https://github.com/user-attachments/assets/f384f25e-ab52-4069-afaf-f8e2f1f3f0e7
 
@@ -156,12 +156,18 @@ Run the full stack (backend, frontend, PostgreSQL, Redis, Celery) with a single 
 
 ```bash
 # Start all services (first run will build images)
-# An admin user (admin@localhost / admin) is created automatically
 docker compose up --build
 
 # (Optional) Load sample data
 docker compose exec backend python manage.py seed_data --email admin@example.com
 ```
+
+Automatic administrator creation is disabled by default in every environment. Set
+`CREATE_DEFAULT_ADMIN=True` only for an explicitly controlled bootstrap and
+replace the default credentials in `.env.docker.local` first. Migrations and
+the optional administrator bootstrap run in the one-shot `migrate` service;
+the backend, worker, and beat containers never receive those bootstrap
+passwords.
 
 Once running:
 - **Frontend**: http://localhost:5173
@@ -172,18 +178,61 @@ Once running:
 ### Daily workflow
 
 ```bash
-docker compose up           # start all services (code changes auto-reload)
+docker compose up --build   # rebuild immutable backend images and start services
 docker compose down         # stop all services
 docker compose down -v      # stop and delete all data (full reset)
 ```
 
+The backend and Celery services run the source copied into their images. Source
+changes therefore require a rebuild; production acceptance never overlays the
+image with a host bind mount. Database migrations run in the one-shot
+`migrate` service before the web process starts; the runtime application role
+does not own schema migration privileges.
+
 ### Running commands inside containers
 
 ```bash
-docker compose exec backend python manage.py migrate
+docker compose run --rm migrate
 docker compose exec backend python -m pytest
-docker compose exec backend python manage.py manage_rls --status
+docker compose exec backend python manage.py manage_rls --status --strict
+docker compose exec backend python manage.py check_celery_beat --max-age 120
 ```
+
+`/healthz/` is the process liveness probe. `/readyz/` additionally requires a
+working PostgreSQL query and Redis broker ping.
+
+### Production acceptance gate
+
+Run the gate with production-safe values in `.env.docker.local` and real
+channel execution disabled:
+
+```bash
+docker compose build --pull --no-cache backend
+docker compose up -d --no-build --wait --wait-timeout 300 db redis backend celery-worker celery-beat
+docker compose exec backend python manage.py migrate --check
+docker compose exec backend python manage.py manage_rls --verify-user --strict
+docker compose exec backend python manage.py manage_rls --status --strict
+docker compose exec backend python manage.py verify_matching_celery --confirm-live-celery
+docker compose stop celery-worker celery-beat
+# While workers are stopped, prepare a UUID-scoped recovery fixture, wait at
+# least two seconds for Redis AOF fsync, then restart db/redis/backend/worker/beat.
+docker compose exec backend python manage.py verify_matching_recovery --prepare <uuid> --confirm-workers-stopped
+docker compose restart db redis backend celery-worker celery-beat
+docker compose up -d --no-build --wait --wait-timeout 300 db redis backend celery-worker celery-beat
+docker compose exec backend python manage.py verify_matching_recovery --verify <same-uuid>
+```
+
+The recovery check proves that durable `AutomationJob` work survives a Redis
+and worker restart, that an abandoned running lease is recovered, and that a
+duplicate terminal delivery creates no additional matching projections.
+Legacy CRM email tasks are not covered by this exactly-once-side-effect claim;
+production therefore excludes the inherited CRM beat schedule by default.
+Keep `ENABLE_LEGACY_CRM_BEAT_TASKS=False` and real outbound channel execution
+disabled until each such workflow is migrated to the durable job ledger.
+
+Use a separate Compose project name or a disposable, backed-up volume when
+verifying migrations from an empty database. Never delete a volume that may
+contain useful customer or development data.
 
 ### Custom environment overrides
 
@@ -194,6 +243,8 @@ The default env vars live in `.env.docker` (committed). To override locally with
    For local production acceptance, initialize the dedicated Fernet key once
    with `.\docker\initialize-integration-encryption-key.ps1`. Real deployments
    should store the same value in their secret manager and keep it stable.
+   Production acceptance must also set `CORS_ALLOW_ALL=False` and
+   `REAL_CHANNEL_EXECUTION_ENABLED=False`.
 3. Rebuild/restart: `docker compose up --build`
 
 Every service loads `.env.docker` first and then `.env.docker.local` if it exists, so
@@ -225,9 +276,9 @@ Django-CRM/
 │   └── src/bcrm_mcp/      # FastMCP tools over the REST API (stdio transport)
 ├── docker/                 # Docker support files
 │   ├── backend/
-│   │   └── entrypoint.sh  # DB wait + migrate + runserver
+│   │   └── entrypoint.sh  # DB wait + static collection + ASGI server
 │   └── postgres/
-│       └── init-rls-user.sql # Creates non-superuser for RLS
+│       └── init-rls-user.sh # Creates least-privileged RLS application role
 ├── Dockerfile              # Backend / Celery image
 ├── docker-compose.yml      # Full-stack dev environment
 └── .env.docker             # Docker env vars (dev defaults)

@@ -12,11 +12,15 @@ from contacts.models import Contact
 def send_email_to_assigned_user(recipients, contact_id, org_id):
     """Send Mail To Users When they are assigned to a contact"""
     set_rls_context(org_id)
-    contact = Contact.objects.get(id=contact_id)
+    contact = Contact.objects.filter(id=contact_id, org_id=org_id).first()
+    if not contact:
+        return
     created_by = contact.created_by
     for profile_id in recipients:
         recipients_list = []
-        profile = Profile.objects.filter(id=profile_id, is_active=True).first()
+        profile = Profile.objects.filter(
+            id=profile_id, org_id=org_id, is_active=True
+        ).first()
         if profile:
             recipients_list.append(profile.user.email)
             context = {}

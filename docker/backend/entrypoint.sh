@@ -20,19 +20,6 @@ s.close()
 done
 echo "PostgreSQL is ready."
 
-echo "Running migrations..."
-python manage.py migrate --noinput
-
-case "${CREATE_DEFAULT_ADMIN:-false}" in
-    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])
-        echo "Applying default admin bootstrap policy..."
-        python manage.py create_default_admin
-        ;;
-    *)
-        echo "Default admin bootstrap is disabled; skipping."
-        ;;
-esac
-
 echo "Collecting static files..."
 python manage.py collectstatic --noinput
 

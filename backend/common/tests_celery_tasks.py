@@ -1,268 +1,109 @@
-from django.test import TestCase
+import pytest
+from django.core import mail
 from django.test.utils import override_settings
 
-from accounts.tests import AccountCreateTest
-from cases.tests import CaseCreation
-from common.models import User
+from accounts.models import Account
+from cases.models import Case
+from common.models import Comment
 from common.tasks import (
     send_email_user_delete,
     send_email_user_mentions,
     send_email_user_status,
 )
-from common.tests import ObjectsCreation
-from contacts.tests import ContactObjectsCreation
-from invoices.tests import InvoiceCreateTest
-from leads.tests import TestLeadModel
-from opportunity.tests import OpportunityModel
-from tasks.tests import TaskCreateTest
+from contacts.models import Contact
+from invoices.models import Invoice
+from leads.models import Lead
+from opportunity.models import Opportunity
+from tasks.models import Task
 
 
-class TestCeleryTasks(ObjectsCreation, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
+CELERY_TEST_SETTINGS = {
+    "CELERY_TASK_ALWAYS_EAGER": True,
+    "CELERY_TASK_EAGER_PROPAGATES": True,
+    "CELERY_BROKER_URL": "memory://",
+    "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend",
+}
+
+
+def _create_comment_target(target_type, admin_user, org):
+    factories = {
+        "accounts": lambda: Account.objects.create(
+            name="Celery comment account", created_by=admin_user, org=org
+        ),
+        "contacts": lambda: Contact.objects.create(
+            first_name="Celery",
+            last_name="Contact",
+            created_by=admin_user,
+            org=org,
+        ),
+        "leads": lambda: Lead.objects.create(
+            title="Celery comment lead", created_by=admin_user, org=org
+        ),
+        "opportunity": lambda: Opportunity.objects.create(
+            name="Celery comment opportunity",
+            stage="QUALIFICATION",
+            created_by=admin_user,
+            org=org,
+        ),
+        "cases": lambda: Case.objects.create(
+            name="Celery comment case",
+            status="New",
+            priority="High",
+            created_by=admin_user,
+            org=org,
+        ),
+        "tasks": lambda: Task.objects.create(
+            title="Celery comment task",
+            status="New",
+            priority="High",
+            created_by=admin_user,
+            org=org,
+        ),
+        "invoices": lambda: Invoice.objects.create(
+            invoice_title="Celery comment invoice", org=org
+        ),
+    }
+    return factories[target_type]()
+
+
+@pytest.mark.django_db
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_user_status_and_delete_email_tasks(admin_user):
+    status_result = send_email_user_status.apply(args=(admin_user.id,))
+    delete_result = send_email_user_delete.apply(args=(admin_user.email,))
+
+    assert status_result.successful(), status_result.result
+    assert delete_result.successful(), delete_result.result
+    assert len(mail.outbox) == 2
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "target_type",
+    [
+        "accounts",
+        "contacts",
+        "leads",
+        "opportunity",
+        "cases",
+        "tasks",
+        "invoices",
+    ],
+)
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_user_mention_email_task(
+    target_type, admin_user, admin_profile, regular_user, user_profile, org_a
+):
+    target = _create_comment_target(target_type, admin_user, org_a)
+    comment = Comment.objects.create(
+        content_object=target,
+        comment="Please review @user",
+        commented_by=admin_profile,
+        org=org_a,
     )
-    def test_celery_tasks(self):
-        task = send_email_user_status.apply(
-            (
-                self.user1.id,
-                self.user.id,
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-        self.user1.is_active = False
-        self.user1.has_sales_access = False
-        self.user1.has_marketing_access = True
-        self.user1.save()
-
-        task = send_email_user_status.apply(
-            (self.user1.id,),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-        self.user1.is_active = True
-        self.user1.has_sales_access = False
-        self.user1.has_marketing_access = False
-        self.user1.save()
-
-        task = send_email_user_status.apply(
-            (self.user1.id,),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-        task = send_email_user_delete.apply(
-            (self.user1.email,),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForAccountComments(AccountCreateTest, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
+    result = send_email_user_mentions.apply(
+        args=(comment.id, target_type, str(org_a.id))
     )
-    def test_user_mentions_for_account_comment(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
 
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.account = self.account
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "accounts",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForContactsComments(ContactObjectsCreation, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_contacts_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.contact = self.contact
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "contacts",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForLeadsComments(TestLeadModel, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_leads_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.lead = self.lead
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "leads",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForOpportunityComments(OpportunityModel, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_opportunity_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.opportunity = self.opportunity
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "opportunity",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForCasesComments(CaseCreation, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_cases_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.case = self.case
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "cases",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForTasksComments(TaskCreateTest, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_tasks_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.task = self.task
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "tasks",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
-
-
-class TestUserMentionsForInvoiceComments(InvoiceCreateTest, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
-    )
-    def test_user_mentions_for_invoice_comments(self):
-        self.user_comment = User.objects.create(
-            first_name="johnComment",
-            username="johnDoeComment",
-            email="johnDoeComment@example.com",
-            role="ADMIN",
-        )
-        self.user_comment.set_password("password")
-        self.user_comment.save()
-
-        self.comment.comment = f"content @{self.user_comment.username}"
-        self.comment.invoice = self.invoice
-        self.comment.save()
-
-        task = send_email_user_mentions.apply(
-            (
-                self.comment.id,
-                "invoices",
-                str(self.comment.org.id),
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
+    assert result.successful(), result.result
+    assert len(mail.outbox) == 1

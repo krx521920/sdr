@@ -23,7 +23,12 @@ from common.models import Org
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, name="automation.run_job")
+@shared_task(
+    bind=True,
+    name="automation.run_job",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def run_automation_job(self, job_id: str, org_id: str):
     parsed_job_id = UUID(job_id)
     parsed_org_id = UUID(org_id)

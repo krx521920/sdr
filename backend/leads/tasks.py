@@ -2,17 +2,18 @@ import logging
 import re
 
 from celery import shared_task
+from crum import impersonate
 from django.conf import settings
 from django.core.mail import EmailMessage, EmailMultiAlternatives
 from django.db.models import Q
 from django.template.loader import render_to_string
 
-logger = logging.getLogger(__name__)
-
 from accounts.models import Account
 from common.models import Org, Profile
 from common.tasks import set_rls_context
 from leads.models import Lead
+
+logger = logging.getLogger(__name__)
 
 
 def get_rendered_html(template_name, context=None):
@@ -60,12 +61,14 @@ def send_email(
 def send_lead_assigned_emails(lead_id, new_assigned_to_list, site_address, org_id):
     set_rls_context(org_id)
     lead_instance = Lead.objects.filter(
-        ~Q(status="converted"), pk=lead_id, is_active=True
+        ~Q(status="converted"), pk=lead_id, org_id=org_id, is_active=True
     ).first()
     if not (lead_instance and new_assigned_to_list):
         return False
 
-    users = Profile.objects.filter(id__in=new_assigned_to_list).distinct()
+    users = Profile.objects.filter(
+        id__in=new_assigned_to_list, org_id=org_id
+    ).distinct()
     subject = f"Lead '{lead_instance}' has been assigned to you"
     from_email = settings.DEFAULT_FROM_EMAIL
     template_name = "assigned_to/leads_assigned.html"
@@ -92,11 +95,15 @@ def send_lead_assigned_emails(lead_id, new_assigned_to_list, site_address, org_i
 def send_email_to_assigned_user(recipients, lead_id, org_id, source=""):
     """Send Mail To Users When they are assigned to a lead"""
     set_rls_context(org_id)
-    lead = Lead.objects.get(id=lead_id)
+    lead = Lead.objects.filter(id=lead_id, org_id=org_id).first()
+    if not lead:
+        return
     created_by = lead.created_by
     for user in recipients:
         recipients_list = []
-        profile = Profile.objects.filter(id=user, is_active=True).first()
+        profile = Profile.objects.filter(
+            id=user, org_id=org_id, is_active=True
+        ).first()
         if profile:
             recipients_list.append(profile.user.email)
             context = {}
@@ -128,10 +135,10 @@ def create_lead_from_file(validated_rows, invalid_rows, user_id, source, company
     """
     set_rls_context(company_id)
     email_regex = r"^[_a-zA-Z0-9-]+(\.[_a-zA-Z0-9-]+)*@[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*(\.[a-zA-Z]{2,4})$"
-    profile = Profile.objects.get(id=user_id)
+    profile = Profile.objects.get(id=user_id, org_id=company_id)
     org = Org.objects.filter(id=company_id).first()
     for row in validated_rows:
-        if not Lead.objects.filter(title=row.get("title")).exists():
+        if not Lead.objects.filter(title=row.get("title"), org=org).exists():
             if re.match(email_regex, row.get("email")) is not None:
                 try:
                     lead = Lead()
@@ -156,8 +163,8 @@ def create_lead_from_file(validated_rows, invalid_rows, user_id, source, company
                         ).first()
                         if company:
                             lead.company = company
-                    lead.created_by = profile
                     lead.org = org
-                    lead.save()
+                    with impersonate(profile.user):
+                        lead.save()
                 except Exception:
                     pass

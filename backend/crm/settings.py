@@ -224,6 +224,22 @@ CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/
 CELERY_RESULT_BACKEND = os.environ.get(
     "CELERY_RESULT_BACKEND", "redis://localhost:6379/0"
 )
+CELERY_BEAT_HEARTBEAT_KEY = os.environ.get(
+    "CELERY_BEAT_HEARTBEAT_KEY", "crm:celery:beat:heartbeat"
+)
+CELERY_BEAT_HEARTBEAT_TTL_SECONDS = max(
+    1, int(os.environ.get("CELERY_BEAT_HEARTBEAT_TTL_SECONDS", "120"))
+)
+CELERY_BEAT_HEARTBEAT_MAX_AGE_SECONDS = max(
+    1.0, float(os.environ.get("CELERY_BEAT_HEARTBEAT_MAX_AGE_SECONDS", "90"))
+)
+ENABLE_LEGACY_CRM_BEAT_TASKS = (
+    os.environ.get(
+        "ENABLE_LEGACY_CRM_BEAT_TASKS",
+        "False" if IS_PRODUCTION else "True",
+    ).lower()
+    == "true"
+)
 
 
 LOGGING = {

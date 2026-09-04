@@ -9,6 +9,7 @@ from django.db import connection
 from django.template.loader import render_to_string
 from django.utils import timezone
 
+from automation.tenant_context import database_org_context
 from common.models import Org, Profile
 from opportunity.models import Opportunity, SalesGoal, StageAgingConfig
 
@@ -27,11 +28,17 @@ def _set_rls_context_safe(org_id):
 def send_email_to_assigned_user(recipients, opportunity_id, org_id):
     """Send Mail To Users When they are assigned to an opportunity"""
     _set_rls_context_safe(org_id)
-    opportunity = Opportunity.objects.get(id=opportunity_id)
+    opportunity = Opportunity.objects.filter(
+        id=opportunity_id, org_id=org_id
+    ).first()
+    if not opportunity:
+        return
     created_by = opportunity.created_by
     for user in recipients:
         recipients_list = []
-        profile = Profile.objects.filter(id=user, is_active=True).first()
+        profile = Profile.objects.filter(
+            id=user, org_id=org_id, is_active=True
+        ).first()
         if profile:
             recipients_list.append(profile.user.email)
             context = {}
@@ -52,43 +59,49 @@ def send_email_to_assigned_user(recipients, opportunity_id, org_id):
 @shared_task
 def check_stale_opportunities():
     """Daily task: find rotten deals across all orgs and send email alerts."""
-    from opportunity.workflow import CLOSED_STAGES, DEFAULT_STAGE_EXPECTED_DAYS, ROTTEN_MULTIPLIER
+    from opportunity.workflow import (
+        CLOSED_STAGES,
+        DEFAULT_STAGE_EXPECTED_DAYS,
+        ROTTEN_MULTIPLIER,
+    )
 
     now = timezone.now()
-    orgs = Org.objects.filter(is_active=True)
+    org_ids = Org.objects.filter(is_active=True).values_list("id", flat=True)
 
-    for org in orgs:
-        try:
-            _set_rls_context_safe(str(org.id))
+    for org_id in org_ids.iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                org = Org.objects.get(id=org_id)
+                aging_configs = {
+                    c.stage: c for c in StageAgingConfig.objects.filter(org=org)
+                }
 
-            aging_configs = {
-                c.stage: c for c in StageAgingConfig.objects.filter(org=org)
-            }
-
-            open_opps = Opportunity.objects.filter(
-                org=org, is_active=True
-            ).exclude(stage__in=CLOSED_STAGES).select_related("org")
-
-            stale_opps = []
-            for opp in open_opps:
-                if not opp.stage_changed_at:
-                    continue
-                config = aging_configs.get(opp.stage)
-                expected = (
-                    config.expected_days
-                    if config
-                    else DEFAULT_STAGE_EXPECTED_DAYS.get(opp.stage)
+                open_opps = (
+                    Opportunity.objects.filter(org=org, is_active=True)
+                    .exclude(stage__in=CLOSED_STAGES)
+                    .select_related("org")
                 )
-                if expected is None:
-                    continue
-                days = (now - opp.stage_changed_at).days
-                if days >= expected * ROTTEN_MULTIPLIER:
-                    stale_opps.append((opp, days, expected))
 
-            if stale_opps:
-                send_stale_deals_alert(org, stale_opps)
-        except Exception:
-            logger.exception("Error processing stale deals for org %s", org.id)
+                stale_opps = []
+                for opp in open_opps:
+                    if not opp.stage_changed_at:
+                        continue
+                    config = aging_configs.get(opp.stage)
+                    expected = (
+                        config.expected_days
+                        if config
+                        else DEFAULT_STAGE_EXPECTED_DAYS.get(opp.stage)
+                    )
+                    if expected is None:
+                        continue
+                    days = (now - opp.stage_changed_at).days
+                    if days >= expected * ROTTEN_MULTIPLIER:
+                        stale_opps.append((opp, days, expected))
+
+                if stale_opps:
+                    send_stale_deals_alert(org, stale_opps)
+            except Exception:
+                logger.exception("Error processing stale deals for org %s", org_id)
 
 
 def send_stale_deals_alert(org, stale_opps):
@@ -99,7 +112,7 @@ def send_stale_deals_alert(org, stale_opps):
     # Group by assigned users
     user_deals = defaultdict(list)
     for opp, days, expected in stale_opps:
-        assigned = list(opp.assigned_to.filter(is_active=True))
+        assigned = list(opp.assigned_to.filter(org=org, is_active=True))
         if assigned:
             for profile in assigned:
                 user_deals[profile].append((opp, days, expected))
@@ -146,76 +159,82 @@ def send_stale_deals_alert(org, stale_opps):
 def check_goal_milestones():
     """Daily: check goal progress milestones and send notifications."""
     today = date.today()
-    orgs = Org.objects.filter(is_active=True)
+    org_ids = Org.objects.filter(is_active=True).values_list("id", flat=True)
 
-    for org in orgs:
-        try:
-            _set_rls_context_safe(str(org.id))
+    for org_id in org_ids.iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                org = Org.objects.get(id=org_id)
+                goals = SalesGoal.objects.filter(
+                    org=org,
+                    is_active=True,
+                    period_start__lte=today,
+                    period_end__gte=today,
+                )
 
-            goals = SalesGoal.objects.filter(
-                org=org,
-                is_active=True,
-                period_start__lte=today,
-                period_end__gte=today,
-            )
-
-            for goal in goals:
-                progress_value = goal.compute_progress()
-                if goal.target_value and goal.target_value != 0:
-                    percent = min(
-                        int(progress_value / goal.target_value * 100), 100
-                    )
-                else:
-                    percent = 0
-                notifications = []
-
-                if percent >= 100 and not goal.milestone_100_notified:
-                    goal.milestone_100_notified = True
-                    goal.milestone_90_notified = True
-                    goal.milestone_50_notified = True
-                    notifications.append(("100%", percent, progress_value))
-                elif percent >= 90 and not goal.milestone_90_notified:
-                    goal.milestone_90_notified = True
-                    goal.milestone_50_notified = True
-                    notifications.append(("90%", percent, progress_value))
-                elif percent >= 50 and not goal.milestone_50_notified:
-                    goal.milestone_50_notified = True
-                    notifications.append(("50%", percent, progress_value))
-
-                if notifications:
-                    goal.save(
-                        update_fields=[
-                            "milestone_50_notified",
-                            "milestone_90_notified",
-                            "milestone_100_notified",
-                        ]
-                    )
-
-                    recipients = []
-                    if goal.assigned_to:
-                        recipients.append(goal.assigned_to)
-                    elif goal.team:
-                        recipients.extend(
-                            Profile.objects.filter(
-                                user_teams=goal.team, is_active=True
-                            )
+                for goal in goals:
+                    progress_value = goal.compute_progress()
+                    if goal.target_value and goal.target_value != 0:
+                        percent = min(
+                            int(progress_value / goal.target_value * 100), 100
                         )
                     else:
-                        recipients.extend(
-                            Profile.objects.filter(
-                                org=org, role="ADMIN", is_active=True
-                            )
+                        percent = 0
+                    notifications = []
+
+                    if percent >= 100 and not goal.milestone_100_notified:
+                        goal.milestone_100_notified = True
+                        goal.milestone_90_notified = True
+                        goal.milestone_50_notified = True
+                        notifications.append(("100%", percent, progress_value))
+                    elif percent >= 90 and not goal.milestone_90_notified:
+                        goal.milestone_90_notified = True
+                        goal.milestone_50_notified = True
+                        notifications.append(("90%", percent, progress_value))
+                    elif percent >= 50 and not goal.milestone_50_notified:
+                        goal.milestone_50_notified = True
+                        notifications.append(("50%", percent, progress_value))
+
+                    if notifications:
+                        goal.save(
+                            update_fields=[
+                                "milestone_50_notified",
+                                "milestone_90_notified",
+                                "milestone_100_notified",
+                            ]
                         )
 
-                    for milestone_label, pct, achieved in notifications:
-                        for profile in recipients:
-                            _send_goal_milestone_email(
-                                profile, goal, milestone_label, pct, achieved
+                        recipients = []
+                        if (
+                            goal.assigned_to
+                            and goal.assigned_to.org_id == org.id
+                            and goal.assigned_to.is_active
+                        ):
+                            recipients.append(goal.assigned_to)
+                        elif goal.team:
+                            recipients.extend(
+                                Profile.objects.filter(
+                                    user_teams=goal.team,
+                                    org=org,
+                                    is_active=True,
+                                )
                             )
-        except Exception:
-            logger.exception(
-                "Error processing goal milestones for org %s", org.id
-            )
+                        else:
+                            recipients.extend(
+                                Profile.objects.filter(
+                                    org=org, role="ADMIN", is_active=True
+                                )
+                            )
+
+                        for milestone_label, pct, achieved in notifications:
+                            for profile in recipients:
+                                _send_goal_milestone_email(
+                                    profile, goal, milestone_label, pct, achieved
+                                )
+            except Exception:
+                logger.exception(
+                    "Error processing goal milestones for org %s", org_id
+                )
 
 
 def _send_goal_milestone_email(profile, goal, milestone_label, percent, achieved):

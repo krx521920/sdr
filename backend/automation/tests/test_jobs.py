@@ -18,6 +18,11 @@ TEST_HANDLERS = {
 }
 
 
+def test_durable_runner_acknowledges_only_after_ledger_completion():
+    assert run_automation_job.acks_late is True
+    assert run_automation_job.reject_on_worker_lost is True
+
+
 @pytest.mark.django_db
 def test_enqueue_job_is_idempotent_per_tenant(org_a, org_b):
     first = enqueue_job(

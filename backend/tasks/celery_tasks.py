@@ -2,7 +2,7 @@ from celery import shared_task
 from django.core.mail import EmailMessage
 from django.template.loader import render_to_string
 
-from common.models import User
+from common.models import Profile
 from common.tasks import set_rls_context
 from tasks.models import Task
 
@@ -12,11 +12,23 @@ def send_email(
     task_id, recipients, org_id, domain="demo.django-crm.io", protocol="http"
 ):
     set_rls_context(org_id)
-    task = Task.objects.filter(id=task_id).first()
-    for user in recipients:
+    task = Task.objects.filter(id=task_id, org_id=org_id).first()
+    if not task:
+        return
+    for user_id in recipients:
         recipients_list = []
-        user = User.objects.filter(id=user, is_active=True).first()
-        if user:
+        profile = (
+            Profile.objects.select_related("user")
+            .filter(
+                user_id=user_id,
+                org_id=org_id,
+                is_active=True,
+                user__is_active=True,
+            )
+            .first()
+        )
+        if profile:
+            user = profile.user
             recipients_list.append(user.email)
             subject = " Assigned a task for you ."
             context = {}

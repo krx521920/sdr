@@ -115,6 +115,11 @@ class Command(BaseCommand):
                 poll_interval=poll_interval,
             )
             counts = self._validate_runs(org.id, expected_runs)
+            self._verify_duplicate_deliveries(
+                org_id=org.id,
+                expected_runs=expected_runs,
+                timeout=timeout,
+            )
             self.stdout.write(
                 self.style.SUCCESS(
                     "verification_status=succeeded "
@@ -305,6 +310,84 @@ class Command(BaseCommand):
                 counts[expected.label] = run.processed_count
                 counts["matches"] += match_count
         return counts
+
+    def _capture_run_state(
+        self,
+        org_id: uuid.UUID,
+        expected_runs: tuple[ExpectedRun, ...],
+    ) -> dict[str, tuple]:
+        state = {}
+        with database_org_context(org_id):
+            for expected in expected_runs:
+                run = MatchRun.objects.select_related(
+                    "automation_job", "opportunity"
+                ).get(org_id=org_id, id=expected.run_id)
+                state[expected.label] = (
+                    run.automation_job.attempt_count,
+                    run.opportunity.ranking_revision,
+                    run.processed_count,
+                    run.result_count,
+                    run.completed_at,
+                    Match.objects.filter(
+                        org_id=org_id,
+                        opportunity_id=run.opportunity_id,
+                        projection_state=MatchProjectionState.CURRENT,
+                    ).count(),
+                )
+        return state
+
+    def _verify_duplicate_deliveries(
+        self,
+        *,
+        org_id: uuid.UUID,
+        expected_runs: tuple[ExpectedRun, ...],
+        timeout: float,
+    ) -> None:
+        """Republish terminal jobs and prove the durable ledger blocks side effects."""
+
+        from automation.tasks import run_automation_job
+
+        before = self._capture_run_state(org_id, expected_runs)
+        pending_results = []
+        with database_org_context(org_id):
+            for expected in expected_runs:
+                run = MatchRun.objects.select_related("automation_job").get(
+                    org_id=org_id,
+                    id=expected.run_id,
+                )
+                pending_results.append(
+                    (
+                        expected,
+                        run_automation_job.apply_async(
+                            args=[str(run.automation_job_id), str(org_id)],
+                            queue=run.automation_job.queue,
+                        ),
+                    )
+                )
+
+        for expected, result in pending_results:
+            try:
+                payload = result.get(timeout=timeout, propagate=True)
+            except Exception as exc:
+                raise CommandError(
+                    "verification_status=failed stage=duplicate_delivery_timeout "
+                    f"fixture_org_id={org_id} run_id={expected.run_id}"
+                ) from exc
+            if not isinstance(payload, dict) or payload.get("status") != "skipped":
+                raise CommandError(
+                    "verification_status=failed stage=duplicate_delivery_claimed "
+                    f"fixture_org_id={org_id} run_id={expected.run_id}"
+                )
+
+        after = self._capture_run_state(org_id, expected_runs)
+        if after != before:
+            raise CommandError(
+                "verification_status=failed stage=duplicate_delivery_side_effect "
+                f"fixture_org_id={org_id}"
+            )
+        self.stdout.write(
+            "duplicate_delivery_status=safe skipped=2 side_effects=0"
+        )
 
     def _retain_fixture_inactive(self, org_id: uuid.UUID) -> CommandError | None:
         try:

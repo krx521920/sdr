@@ -1,19 +1,54 @@
 import logging
+import re
+import time
 from datetime import timedelta
 
 from botocore.exceptions import ClientError
 from celery import shared_task
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.mail import EmailMessage
 from django.core.validators import validate_email
-from django.core.exceptions import ValidationError
 from django.db import connection
 from django.template.loader import render_to_string
 from django.utils import timezone
 
-from common.models import Comment, MagicLinkToken, Notification, Profile, Teams, User
+from automation.tenant_context import database_org_context
+from common.celery_health import heartbeat_key, heartbeat_ttl_seconds, redis_client
+from common.models import (
+    Comment,
+    MagicLinkToken,
+    Notification,
+    Org,
+    Profile,
+    Teams,
+    User,
+)
 
 logger = logging.getLogger(__name__)
+
+MENTION_RE = re.compile(r"(?<![A-Za-z0-9])@([A-Za-z0-9._-]+)")
+
+
+@shared_task(name="common.tasks.celery_beat_heartbeat", ignore_result=True)
+def celery_beat_heartbeat():
+    """Record proof that a beat message reached and ran on a worker.
+
+    The value is deliberately limited to a Unix timestamp: it contains no
+    tenant identifier or PII. Redis expiry makes a stopped beat/worker become
+    unhealthy without a cleanup job.
+    """
+    written_at = time.time()
+    client = redis_client()
+    try:
+        client.set(
+            heartbeat_key(),
+            format(written_at, ".6f"),
+            ex=heartbeat_ttl_seconds(),
+        )
+    finally:
+        client.close()
+    return written_at
 
 
 def set_rls_context(org_id):
@@ -126,28 +161,39 @@ def send_email_user_mentions(
     org_id=None,
 ):
     """Send Mail To Mentioned Users In The Comment"""
+    if not org_id:
+        logger.warning(
+            "Mention email skipped for comment %s: organization is required",
+            comment_id,
+        )
+        return
+
     # Set RLS context for org-scoped queries
     set_rls_context(org_id)
 
-    comment = Comment.objects.filter(id=comment_id).first()
+    comment = Comment.objects.filter(id=comment_id, org_id=org_id).first()
     if comment:
-        comment_text = comment.comment
-        comment_text_list = comment_text.split()
-        recipients = []
-        for comment_text in comment_text_list:
-            if comment_text.startswith("@"):
-                if comment_text.strip("@").strip(",") not in recipients:
-                    if User.objects.filter(
-                        username=comment_text.strip("@").strip(","), is_active=True
-                    ).exists():
-                        email = (
-                            User.objects.filter(
-                                username=comment_text.strip("@").strip(",")
-                            )
-                            .first()
-                            .email
-                        )
-                        recipients.append(email)
+        mentioned_names = list(dict.fromkeys(MENTION_RE.findall(comment.comment.lower())))
+        active_profiles = (
+            Profile.objects.filter(
+                org_id=org_id,
+                is_active=True,
+                user__is_active=True,
+            )
+            .select_related("user")
+            .order_by("created_at")
+        )
+        email_by_local_part = {}
+        for profile in active_profiles:
+            email = (profile.user.email or "").strip()
+            local_part = email.partition("@")[0].lower()
+            if local_part:
+                email_by_local_part.setdefault(local_part, email)
+        recipients = [
+            email_by_local_part[name]
+            for name in mentioned_names
+            if name in email_by_local_part
+        ]
 
         context = {}
         context["commented_by"] = comment.commented_by
@@ -201,7 +247,9 @@ def send_email_user_status(
         context["message"] = "deactivated"
         context["email"] = user.email
         context["url"] = settings.DOMAIN_NAME
-        if user.has_marketing_access:
+        if user.profiles.filter(
+            is_active=True, has_marketing_access=True
+        ).exists():
             context["url"] = context["url"] + "/marketing"
         if user.is_active:
             context["message"] = "activated"
@@ -382,14 +430,19 @@ NOTIFICATION_PURGE_DAYS = 90
 def purge_read_notifications(days=NOTIFICATION_PURGE_DAYS):
     """Delete already-read notifications older than ``days`` days.
 
-    Schedule via celery-beat (recommended cadence: nightly). Runs once across
-    all orgs — RLS does not need a per-org context here because the query
-    targets `read_at`, which is intrinsic to the row, not org-scoped logic.
+    Schedule via celery-beat (recommended cadence: nightly). The notification
+    table is protected by tenant RLS, so purge each organization independently.
     """
     cutoff = timezone.now() - timedelta(days=days)
-    deleted, _ = Notification.objects.filter(
-        read_at__isnull=False, read_at__lt=cutoff
-    ).delete()
+    deleted = 0
+    for org_id in Org.objects.values_list("id", flat=True).iterator(chunk_size=100):
+        with database_org_context(org_id):
+            org_deleted, _ = Notification.objects.filter(
+                org_id=org_id,
+                read_at__isnull=False,
+                read_at__lt=cutoff,
+            ).delete()
+            deleted += org_deleted
     if deleted:
         logger.info(
             "Purged %s read notifications older than %s days", deleted, days

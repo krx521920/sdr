@@ -12,7 +12,7 @@ from common.tasks import set_rls_context
 @shared_task
 def send_email(email_obj_id, org_id):
     set_rls_context(org_id)
-    email_obj = AccountEmail.objects.filter(id=email_obj_id).first()
+    email_obj = AccountEmail.objects.filter(id=email_obj_id, org_id=org_id).first()
     if email_obj:
         from_email = email_obj.from_email
         contacts = email_obj.recipients.all()
@@ -60,14 +60,16 @@ def send_email(email_obj_id, org_id):
 def send_email_to_assigned_user(recipients, account_id, org_id):
     """Send Mail To Users When they are assigned to an account"""
     set_rls_context(org_id)
-    account = Account.objects.filter(id=account_id).first()
+    account = Account.objects.filter(id=account_id, org_id=org_id).first()
     if not account:
         return
     created_by = account.created_by
 
     for profile_id in recipients:
         recipients_list = []
-        profile = Profile.objects.filter(id=profile_id, is_active=True).first()
+        profile = Profile.objects.filter(
+            id=profile_id, org_id=org_id, is_active=True
+        ).first()
         if profile:
             recipients_list.append(profile.user.email)
             context = {}

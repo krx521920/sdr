@@ -1,138 +1,85 @@
-from django.test import TestCase
+from unittest.mock import patch
+
+import pytest
+from django.core import mail
 from django.test.utils import override_settings
 
+from leads.models import Lead
 from leads.tasks import (
     create_lead_from_file,
     send_email,
     send_email_to_assigned_user,
     send_lead_assigned_emails,
 )
-from leads.tests import TestLeadModel
+
+CELERY_TEST_SETTINGS = {
+    "CELERY_TASK_ALWAYS_EAGER": True,
+    "CELERY_TASK_EAGER_PROPAGATES": True,
+    "CELERY_BROKER_URL": "memory://",
+    "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend",
+}
 
 
-class TestCeleryTasks(TestLeadModel, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
+@pytest.mark.django_db
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_lead_email_tasks(
+    admin_user, admin_profile, user_profile, profile_b, org_a
+):
+    lead = Lead.objects.create(
+        title="Celery lead",
+        first_name="Celery",
+        last_name="Lead",
+        email="celery-lead@example.com",
+        status="assigned",
+        created_by=admin_user,
+        org=org_a,
     )
-    def test_celery_tasks(self):
-        org_id = str(self.lead.org.id)
-        task = send_email_to_assigned_user.apply(
-            (
-                [
-                    self.user.id,
-                    self.user1.id,
-                ],
-                self.lead.id,
-                org_id,
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
 
-        task = send_lead_assigned_emails.apply(
-            (
-                self.lead.id,
-                [
-                    self.user.id,
-                    self.user1.id,
-                    self.user2.id,
-                ],
-                "https://www.example.com",
-                org_id,
-            ),
+    assignment = send_email_to_assigned_user.apply(
+        args=(
+            [admin_profile.id, user_profile.id, profile_b.id],
+            lead.id,
+            str(org_a.id),
         )
-        self.assertEqual("SUCCESS", task.state)
+    )
+    direct_email = send_email.apply(
+        args=("Celery subject", "<p>Celery body</p>"),
+        kwargs={"recipients": [admin_user.email, user_profile.user.email]},
+    )
 
-        task = send_email.apply(
-            (
-                "mail subject",
-                "html content",
-            ),
-            {
-                "recipients": [
-                    self.user.id,
-                    self.user1.id,
-                    self.user2.id,
-                ],
-            },
+    with patch("leads.tasks.send_email.delay") as dispatch_email:
+        assigned_emails = send_lead_assigned_emails.apply(
+            args=(
+                lead.id,
+                [admin_profile.id, user_profile.id, profile_b.id],
+                "https://example.com",
+                str(org_a.id),
+            )
         )
-        self.assertEqual("SUCCESS", task.state)
 
-        org_id1 = str(self.lead1.org.id)
-        task = send_lead_assigned_emails.apply(
-            (
-                self.lead1.id,
-                [
-                    self.user.id,
-                    self.user1.id,
-                    self.user2.id,
-                ],
-                "https://www.example.com",
-                org_id1,
-            ),
-        )
-        self.assertEqual("SUCCESS", task.state)
+    assert assignment.successful(), assignment.result
+    assert direct_email.successful(), direct_email.result
+    assert assigned_emails.successful(), assigned_emails.result
+    assert dispatch_email.call_count == 2
+    assert len(mail.outbox) == 3
+    assert profile_b.user.email not in {
+        recipient for message in mail.outbox for recipient in message.to
+    }
 
-        valid_rows = [
-            {
-                "title": "lead1 csv",
-                "first name": "john",
-                "last name": "doe",
-                "website": "www.example.com",
-                "phone": "911234567890",
-                "email": "user1@email.com",
-                "address": "address for lead1",
-            },
-            {
-                "title": "lead2 csv",
-                "first name": "jane",
-                "last name": "doe",
-                "website": "www.website.com",
-                "phone": "911234567891",
-                "email": "user2@email.com",
-                "address": "address for lead2",
-            },
-            {
-                "title": "lead3 csv",
-                "first name": "joe",
-                "last name": "doe",
-                "website": "www.test.com",
-                "phone": "911234567892",
-                "email": "user3@email.com",
-                "address": "address for lead3",
-            },
-            {
-                "title": "lead4 csv",
-                "first name": "john",
-                "last name": "doe",
-                "website": "www.sample.com",
-                "phone": "911234567893",
-                "email": "user4@email.com",
-                "address": "address for lead4",
-            },
-        ]
-        invalid_rows = [
-            {
-                "title": "lead5 csv",
-                "first name": "joe",
-                "last name": "doe",
-                "website": "www.test.com",
-                "phone": "911234567892",
-                "email": "useremail.com",
-                "address": "address for lead3",
-            },
-            {
-                "title": "lead6 csv",
-                "first name": "john",
-                "last name": "doe",
-                "website": "www.sample.com",
-                "phone": "911234567893",
-                "email": "user4@email",
-                "address": "address for lead4",
-            },
-        ]
-        task = create_lead_from_file.apply(
-            (valid_rows, invalid_rows, self.user.id, "example.com", org_id),
-        )
-        self.assertEqual("SUCCESS", task.state)
+
+@pytest.mark.django_db
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_create_lead_from_file_task_accepts_current_profile_id(admin_profile, org_a):
+    row = {
+        "title": "Imported tenant lead",
+        "first name": "Import",
+        "last name": "Owner",
+        "email": "imported@example.com",
+    }
+    result = create_lead_from_file.apply(
+        args=([row], [], admin_profile.id, "csv", str(org_a.id))
+    )
+
+    assert result.successful(), result.result
+    lead = Lead.objects.get(title=row["title"], org=org_a)
+    assert lead.created_by == admin_profile.user

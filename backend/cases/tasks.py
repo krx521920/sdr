@@ -10,6 +10,7 @@ from django.db.models import Q
 from django.template.loader import render_to_string
 from django.utils import timezone
 
+from automation.tenant_context import database_org_context
 from cases.models import Case, CsatSurvey, EscalationPolicy, TimeEntry
 from cases.workflow import TERMINAL_STATUSES
 from common.models import Activity, Org, Profile
@@ -37,11 +38,15 @@ ESCALATION_COOLDOWN_MINUTES = 60
 def send_email_to_assigned_user(recipients, case_id, org_id):
     """Send Mail To Users When they are assigned to a case"""
     set_rls_context(org_id)
-    case = Case.objects.get(id=case_id)
+    case = Case.objects.filter(id=case_id, org_id=org_id).first()
+    if not case:
+        return
     created_by = case.created_by
     for profile_id in recipients:
         recipients_list = []
-        profile = Profile.objects.filter(id=profile_id, is_active=True).first()
+        profile = Profile.objects.filter(
+            id=profile_id, org_id=org_id, is_active=True
+        ).first()
         if profile:
             recipients_list.append(profile.user.email)
             context = {}
@@ -197,25 +202,13 @@ def scan_for_breached_cases():
     Activity(action='ESCALATED').
     """
     total = 0
-    org_ids = (
-        EscalationPolicy.objects.filter(is_active=True)
-        .values_list("org_id", flat=True)
-        .distinct()
-    )
-    for org in Org.objects.filter(id__in=list(org_ids)):
-        set_rls_context(org.id)
-        try:
-            total += _scan_org(org)
-        except Exception:  # pragma: no cover
-            logger.exception("Escalation scan failed for org=%s", org.id)
-    # Reset RLS context so the worker doesn't leak the last org's context to
-    # whatever task runs next on the same connection. set_rls_context() no-ops
-    # on falsy values, so clear the session variable directly.
-    from django.db import connection
-
-    if connection.vendor == "postgresql":
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT set_config('app.current_org', '', false)")
+    for org_id in Org.objects.values_list("id", flat=True).iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                org = Org.objects.get(id=org_id)
+                total += _scan_org(org)
+            except Exception:  # pragma: no cover
+                logger.exception("Escalation scan failed for org=%s", org_id)
     return total
 
 
@@ -354,35 +347,24 @@ def auto_stop_stale_timers(threshold_hours=TIME_ENTRY_AUTO_STOP_HOURS):
     now = timezone.now()
     cutoff = now - timedelta(hours=threshold_hours)
 
-    org_ids = list(
-        TimeEntry.objects.filter(
-            ended_at__isnull=True, started_at__lt=cutoff
-        )
-        .values_list("org_id", flat=True)
-        .distinct()
-    )
     stopped = 0
-    for org_id in org_ids:
-        set_rls_context(org_id)
-        try:
-            stale = list(
-                TimeEntry.objects.filter(
-                    org_id=org_id, ended_at__isnull=True, started_at__lt=cutoff
+    for org_id in Org.objects.values_list("id", flat=True).iterator(chunk_size=100):
+        with database_org_context(org_id):
+            try:
+                stale = list(
+                    TimeEntry.objects.filter(
+                        org_id=org_id,
+                        ended_at__isnull=True,
+                        started_at__lt=cutoff,
+                    )
                 )
-            )
-            for entry in stale:
-                entry.ended_at = now
-                entry.auto_stopped = True
-                entry.save()
-                stopped += 1
-        except Exception:  # pragma: no cover
-            logger.exception(
-                "auto_stop_stale_timers failed for org=%s", org_id
-            )
-    # Reset RLS context (same idiom as scan_for_breached_cases).
-    from django.db import connection
-
-    if connection.vendor == "postgresql":
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT set_config('app.current_org', '', false)")
+                for entry in stale:
+                    entry.ended_at = now
+                    entry.auto_stopped = True
+                    entry.save()
+                    stopped += 1
+            except Exception:  # pragma: no cover
+                logger.exception(
+                    "auto_stop_stale_timers failed for org=%s", org_id
+                )
     return stopped

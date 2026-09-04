@@ -6,8 +6,11 @@
 
 # Python
 __pycache__
+**/__pycache__/
 *.pyc
+**/*.pyc
 *.pyo
+**/*.pyo
 venv/
 env/
 .venv/
@@ -19,7 +22,10 @@ env/
 .mypy_cache/
 **/.mypy_cache/
 .coverage
+**/.coverage
+**/coverage.xml
 htmlcov/
+**/htmlcov/
 
 # Node / Frontend (built separately)
 frontend/node_modules/

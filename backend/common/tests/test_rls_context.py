@@ -13,6 +13,7 @@ def middleware():
 @pytest.mark.parametrize(
     "path",
     [
+        "/readyz/",
         "/api/sdr/public/ses-feedback/",
         "/api/sdr/public/nurture/open/signed-token/pixel.gif",
         "/api/sdr/public/nurture/click/signed-token/",
@@ -27,6 +28,7 @@ def test_signed_public_sdr_routes_are_org_exempt(middleware, path):
 @pytest.mark.parametrize(
     "path",
     [
+        "/readyz/extra/",
         "/api/sdr/public/",
         "/api/sdr/public/ses-feedback/extra/",
         "/api/sdr/public/nurture/",

@@ -4,6 +4,7 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
+from django.conf import settings
 
 # set the default Django settings module for the 'celery' program.
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "crm.settings")
@@ -24,6 +25,14 @@ app.autodiscover_tasks(related_name="celery_tasks")  # tasks app uses celery_tas
 
 # Celery Beat Schedule for recurring tasks
 app.conf.beat_schedule = {
+    # Prove that beat can publish to the broker and a worker can consume the
+    # message. Expire delayed deliveries before they can create a false-fresh
+    # heartbeat after a queue backlog.
+    "celery-beat-heartbeat": {
+        "task": "common.tasks.celery_beat_heartbeat",
+        "schedule": 30.0,
+        "options": {"expires": 25.0},
+    },
     # Generate invoices from recurring invoice templates - daily at midnight
     "generate-recurring-invoices": {
         "task": "invoices.tasks.generate_recurring_invoices",
@@ -118,3 +127,21 @@ app.conf.beat_schedule = {
         "schedule": crontab(minute=45),
     },
 }
+
+# These inherited CRM jobs predate the durable AutomationJob ledger. Keep them
+# available in development, but fail closed in production until each workflow
+# has idempotent side-effect records and crash-safe retry semantics.
+if not settings.ENABLE_LEGACY_CRM_BEAT_TASKS:
+    for legacy_task_name in (
+        "generate-recurring-invoices",
+        "check-overdue-invoices",
+        "process-payment-reminders",
+        "check-expired-estimates",
+        "check-stale-opportunities",
+        "check-goal-milestones",
+        "scan-for-breached-cases",
+        "purge-read-notifications",
+        "auto-stop-stale-timers",
+        "flush-expired-refresh-tokens",
+    ):
+        app.conf.beat_schedule.pop(legacy_task_name, None)

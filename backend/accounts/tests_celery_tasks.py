@@ -1,50 +1,60 @@
-from datetime import datetime, timedelta
-
-from django.test import TestCase
+import pytest
+from django.core import mail
 from django.test.utils import override_settings
 
-from accounts.models import AccountEmail
-from accounts.tasks import (
-    send_email,
-    send_email_to_assigned_user,
-    send_scheduled_emails,
-)
-from accounts.tests import AccountCreateTest
+from accounts.models import Account, AccountEmail, AccountEmailLog
+from accounts.tasks import send_email, send_email_to_assigned_user
+from contacts.models import Contact
+
+CELERY_TEST_SETTINGS = {
+    "CELERY_TASK_ALWAYS_EAGER": True,
+    "CELERY_TASK_EAGER_PROPAGATES": True,
+    "CELERY_BROKER_URL": "memory://",
+    "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend",
+}
 
 
-class TestCeleryTasks(AccountCreateTest, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
+@pytest.mark.django_db
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_account_email_tasks(
+    admin_user, admin_profile, user_profile, profile_b, org_a
+):
+    account = Account.objects.create(
+        name="Celery account",
+        created_by=admin_user,
+        org=org_a,
     )
-    def test_celery_tasks(self):
-        org_id = str(self.account.org.id)
-        email_scheduled = AccountEmail.objects.create(
-            message_subject="message subject",
-            message_body="message body",
-            scheduled_later=True,
-            timezone="Asia/Kolkata",
-            from_account=self.account,
-            scheduled_date_time=(datetime.now() - timedelta(minutes=5)),
-            from_email="from@email.com",
-            org=self.account.org,
-        )
-        email_scheduled.recipients.add(self.contact.id, self.contact_user1.id)
-        task = send_scheduled_emails.apply((org_id,))
-        self.assertEqual("SUCCESS", task.state)
+    contact = Contact.objects.create(
+        first_name="Celery",
+        last_name="Recipient",
+        email="celery-recipient@example.com",
+        created_by=admin_user,
+        org=org_a,
+    )
+    account_email = AccountEmail.objects.create(
+        message_subject="Celery account message",
+        message_body="Hello {{ name }}",
+        from_account=account,
+        from_email="sender@example.com",
+        org=org_a,
+    )
+    account_email.recipients.add(contact)
 
-        task = send_email.apply((email_scheduled.id, org_id))
-        self.assertEqual("SUCCESS", task.state)
-
-        task = send_email_to_assigned_user.apply(
-            (
-                [
-                    self.user.id,
-                    self.user1.id,
-                ],
-                self.account.id,
-                org_id,
-            ),
+    delivery = send_email.apply(args=(account_email.id, str(org_a.id)))
+    assignment = send_email_to_assigned_user.apply(
+        args=(
+            [admin_profile.id, user_profile.id, profile_b.id],
+            account.id,
+            str(org_a.id),
         )
-        self.assertEqual("SUCCESS", task.state)
+    )
+
+    assert delivery.successful(), delivery.result
+    assert assignment.successful(), assignment.result
+    assert AccountEmailLog.objects.filter(
+        email=account_email, contact=contact, is_sent=True
+    ).exists()
+    assert len(mail.outbox) == 3
+    assert profile_b.user.email not in {
+        recipient for message in mail.outbox for recipient in message.to
+    }

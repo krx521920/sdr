@@ -1,26 +1,41 @@
-from django.test import TestCase
+import pytest
+from django.core import mail
 from django.test.utils import override_settings
 
+from cases.models import Case
 from cases.tasks import send_email_to_assigned_user
-from cases.tests import CaseCreation
+
+CELERY_TEST_SETTINGS = {
+    "CELERY_TASK_ALWAYS_EAGER": True,
+    "CELERY_TASK_EAGER_PROPAGATES": True,
+    "CELERY_BROKER_URL": "memory://",
+    "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend",
+}
 
 
-class TestCeleryTasks(CaseCreation, TestCase):
-    @override_settings(
-        CELERY_EAGER_PROPAGATES_EXCEPTIONS=True,
-        CELERY_ALWAYS_EAGER=True,
-        BROKER_BACKEND="memory",
+@pytest.mark.django_db
+@override_settings(**CELERY_TEST_SETTINGS)
+def test_send_email_to_assigned_user(
+    admin_user, admin_profile, user_profile, profile_b, org_a
+):
+    case = Case.objects.create(
+        name="Celery case",
+        status="New",
+        priority="High",
+        created_by=admin_user,
+        org=org_a,
     )
-    def test_celery_tasks(self):
-        org_id = str(self.case.org.id)
-        task = send_email_to_assigned_user.apply(
-            (
-                [
-                    self.user.id,
-                    self.user1.id,
-                ],
-                self.case.id,
-                org_id,
-            ),
+
+    result = send_email_to_assigned_user.apply(
+        args=(
+            [admin_profile.id, user_profile.id, profile_b.id],
+            case.id,
+            str(org_a.id),
         )
-        self.assertEqual("SUCCESS", task.state)
+    )
+
+    assert result.successful(), result.result
+    assert len(mail.outbox) == 2
+    assert profile_b.user.email not in {
+        recipient for message in mail.outbox for recipient in message.to
+    }

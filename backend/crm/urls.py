@@ -10,6 +10,8 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
+from common.views.health_views import readyz
+
 app_name = "crm"
 
 urlpatterns = [
@@ -18,6 +20,7 @@ urlpatterns = [
         TemplateView.as_view(template_name="healthz.html"),
         name="healthz",
     ),
+    path("readyz/", readyz, name="readyz"),
     path("api/", include("common.app_urls", namespace="common_urls")),
     # Public portal endpoints (no auth required)
     path("api/public/", include("invoices.public_urls", namespace="public_invoices")),
